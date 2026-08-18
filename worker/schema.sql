@@ -1,4 +1,4 @@
--- X2Y beacon store (D1). Four tables plus one counter row per day.
+-- Toolshed beacon store (D1). Four tables plus one counter row per day.
 --
 -- Retention is an operator chore, not a cron (the Worker exports no `scheduled`
 -- handler by design). The queries that enforce the published retention promises

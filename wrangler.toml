@@ -1,4 +1,4 @@
-name = "lemon-x2y-beacon"
+name = "lemon-toolshed-beacon"
 main = "worker/beacon.js"
 compatibility_date = "2026-08-01"
 
@@ -13,12 +13,12 @@ compatibility_date = "2026-08-01"
 # rung-0 rate-limiting rule lives.
 #
 # routes = [
-#   { pattern = "x2y.lemon-agent.dev/b", zone_name = "lemon-agent.dev" }
+#   { pattern = "toolshed.lemon-agent.dev/b", zone_name = "lemon-agent.dev" }
 # ]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "lemon_x2y"
+database_name = "lemon_toolshed"
 # Placeholder — local dev only. REPLACE at deploy with the id printed by
-# `wrangler d1 create lemon_x2y`.
+# `wrangler d1 create lemon_toolshed`.
 database_id = "00000000-0000-0000-0000-000000000000"

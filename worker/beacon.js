@@ -1,4 +1,4 @@
-// X2Y beacon Worker.
+// Toolshed beacon Worker.
 //
 // One route: POST /b on the directory hostname. Two event types, rows ~200 bytes.
 // The pathgrip pattern is adopted here and nowhere else in this repo — the read

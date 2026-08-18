@@ -1,12 +1,12 @@
 {
-  "name": "lemon-x2y",
+  "name": "lemon-toolshed",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "X2Y — a curated conversion-tool directory at the use-case layer, under the Lemon house brand. Static read surface plus a beacon Worker.",
+  "description": "Toolshed — a curated conversion-tool directory at the use-case layer, under the Lemon house brand. Static read surface plus a beacon Worker.",
   "scripts": {
     "build": "node build.mjs",
-    "build:demo": "BEACON_URL=http://localhost:8787/b node build.mjs",
+    "build:demo": "BEACON_URL=${BEACON_URL:-http://localhost:8787/b} SITE_HOST=${SITE_HOST:-localhost:4173} node build.mjs",
     "db:local": "wrangler d1 execute DB --local --file worker/schema.sql -y",
     "dev:worker": "wrangler dev --local --port 8787",
     "serve": "serve dist -l 4173"

@@ -1,19 +1,24 @@
-# X2Y
+# Toolshed
 
-**X2Y** is a curated conversion-tool directory at the use-case layer: *which
-converter, when.* The unit is the **pair** — what you have, what you need — not
+**Toolshed** is a curated conversion-tool directory at the use-case layer: *which
+tool, when.* The unit is the **pair** — what you have, what you need — not
 the tool, which is the layer neither the awesome-lists (keyed by tool) nor the
 per-tool review sites occupy. Each entry names one tool worth reaching for, an
 install one-liner, the caveats that actually bite, and an `escalate` line saying
 where a model is honestly warranted. The editorial stance is the deterministic
 tool wherever it suffices, and a model only where the target is judgment-defined.
-There are two surfaces: a human page, and a machine surface (`catalog.json` +
-`llms.txt`) for an agent arriving on a *have X, need Y* query.
+There are two surfaces: a human page — a have/need picker over a grid of shelved
+verdict cards — and a machine surface (`catalog.json` + `llms.txt` +
+`llms-full.txt`) for an agent arriving on a *have X, need Y* query.
+
+Repo: `~/git/lemon-toolshed` (`chronick/lemon-toolshed`). It ships under the
+**Lemon** house brand; the site name is **Toolshed**, and it lives at
+`toolshed.lemon-agent.dev` on the measured zone.
 
 Two honest caveats. **The curation is an owner-taste surface** — the 30 entries
 in `entries.yaml` are drafts for review, not a finished list, and every verdict is
 engineering judgment rather than measurement. **The instrument has a hole**: the
-beacon counts script-executing clients, so `catalog.json` and `llms.txt` — the
+beacon counts script-executing clients, so the three machine files — the
 differentiator — are fetched by clients that execute nothing and are invisible to
 it. The available cross-check is zone-analytics request counts; whether a Free
 zone breaks those out per path is unread. Serving the machine files through the
@@ -28,7 +33,7 @@ dossier wins.
 
 ```text
 entries.yaml       content tier — 30 draft entries, in git; review is a diff
-build.mjs          build step — emits dist/{index.html,catalog.json,llms.txt}
+build.mjs          build step — emits dist/{index.html,catalog.json,llms.txt,llms-full.txt}
 worker/beacon.js   beacon Worker — POST /b, rungs 1 and 2, D1 write
 worker/schema.sql  D1 schema — events / daily_aggregates / blocklist / salt / counters
 wrangler.toml      Worker config; route and database_id filled in at deploy
@@ -42,10 +47,15 @@ only metered path in the system.
 ```bash
 npm install
 npm run db:local                 # apply worker/schema.sql to the local D1
-npm run build:demo               # build with BEACON_URL=http://localhost:8787/b
+npm run build:demo               # BEACON_URL=http://localhost:8787/b SITE_HOST=localhost:4173
 npm run dev:worker &             # beacon Worker on :8787 (miniflare, local D1)
 npx serve dist -l 4173           # the page on :4173
 ```
+
+Both build constants are env-overridable: `BEACON_URL` is what the inline beacon
+posts to, and `SITE_HOST` is the hostname printed in the page's *For agents*
+`curl` lines. `build:demo` defaults them to the local pair; either can be
+overridden on the command line.
 
 Open <http://localhost:4173>, click an outbound link, then read the events back:
 
@@ -65,12 +75,14 @@ been created, nothing is deployed, no Cloudflare login has happened.
 ```text
 DEPLOY, in order:
  1. Create repo. Entries file (30 draft entries for owner review) + build
-    step emitting page, catalog.json, llms.txt, how-we-count note, privacy
-    note. Every entry carries a `verified` date.
- 2. Pages project from the repo — STATIC ASSETS ONLY, ZERO FUNCTIONS. A
-    Function re-opens the pages.dev twin's metered path.
- 3. Custom hostname on the lemon-agent.dev zone (e.g. x2y.lemon-agent.dev).
-    An off-zone deploy re-fails checklist item 2.
+    step emitting page, catalog.json, llms.txt, llms-full.txt, how-we-count
+    note, privacy note. Every entry carries a `verified` date.
+ 2. Pages project from the repo, named `lemon-toolshed` — STATIC ASSETS
+    ONLY, ZERO FUNCTIONS. A Function re-opens the pages.dev twin's metered
+    path.
+ 3. Custom hostname on the lemon-agent.dev zone: toolshed.lemon-agent.dev.
+    An off-zone deploy re-fails checklist item 2. The same hostname is the
+    `SITE_HOST` build constant, so the *For agents* curl lines match it.
  4. D1: events / daily_aggregates / blocklist / salt.
  5. Beacon Worker, route POST <host>/b on the zone, D1 binding; the page
     addresses it by RELATIVE URL.
@@ -87,7 +99,7 @@ DEPLOY, in order:
 Commands for steps 4–5, once the owner has picked the hostname:
 
 ```bash
-npx wrangler d1 create lemon_x2y                        # copy the id into wrangler.toml
+npx wrangler d1 create lemon_toolshed                   # copy the id into wrangler.toml
 npx wrangler d1 execute DB --remote --file worker/schema.sql
 # uncomment the routes = [...] block in wrangler.toml, then:
 npx wrangler deploy
@@ -109,9 +121,9 @@ stays up and the links keep working.
 npx wrangler deploy
 
 # Option B — delete the Worker outright (fastest, loses nothing but the beacon)
-npx wrangler delete --name lemon-x2y-beacon
+npx wrangler delete --name lemon-toolshed-beacon
 
-# Option C — dashboard: Workers & Pages → lemon-x2y-beacon → Settings →
+# Option C — dashboard: Workers & Pages → lemon-toolshed-beacon → Settings →
 # Domains & Routes → remove the /b route.
 ```
 
