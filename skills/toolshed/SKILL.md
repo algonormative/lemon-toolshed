@@ -5,10 +5,16 @@ description: Convert files/data between formats using Lemon Toolshed's hosted co
 
 # Toolshed
 
-Server-hosted conversion endpoints. No account, no key. Some are free; priced
-ones take payment per call with x402.
+Conversion tools you call over HTTP with nothing installed. No login, no
+account, no key. Most are free; a priced one answers `402` with an x402
+envelope and is paid per call in USDC on Base — see [Paying (x402)](#3-paying-x402).
 
 Base URL: `https://toolshed.lemon-agent.dev`
+
+Install this skill: `npx skills add chronick/lemon-toolshed`. There is also an
+MCP server in the same repo (`claude mcp add toolshed -- npx -y
+github:chronick/lemon-toolshed`) exposing `toolshed_check`, `toolshed_convert`
+and `toolshed_catalog` — use whichever surface your harness already has.
 
 ## 1. Check availability first
 
@@ -73,11 +79,14 @@ A `402` answer means the tool is priced. The body is an x402 v1 envelope:
 
 - `asset` is USDC on Base. `maxAmountRequired` is atomic units — 6 decimals, so
   `"1000"` is $0.001.
-- Retry with an `X-PAYMENT` header built by your x402 client.
+- Paying needs two things: an x402-capable HTTP client (`x402-fetch`, the x402
+  SDK, or Coinbase AgentKit) and a wallet key holding USDC on Base. The client
+  reads the envelope, signs, and retries with an `X-PAYMENT` header. No login,
+  no card, no account — the payment is the auth.
 - Never ask the user to paste a private key or a seed phrase. If you have no
   x402 client wired up, say so and offer the local tool from `/check` instead.
-- A `x-pricing: pending` response header means the endpoint is priced on paper
-  but is being served free right now. Do not pay it.
+- **Not enforced yet.** A `x-pricing: pending` response header means the
+  endpoint is priced on paper but is being served free right now. Do not pay it.
 
 ## 4. The whole catalog
 

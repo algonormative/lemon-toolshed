@@ -1,21 +1,27 @@
 # Toolshed
 
-**Toolshed** is a collection of server-hosted conversion tools. An agent posts a
-file to an HTTP endpoint and gets the converted file back — no install, no
-account, no key. Some tools are free. Priced ones take payment per call with
-x402 (USDC on Base).
+**A collection of tools for agents — no install required.** Privacy-first: no
+login, no credit card. Pay per call with USDC; many tools are free.
+
+An agent posts a file to an HTTP endpoint and gets the converted file back.
+Priced tools answer HTTP 402 with an x402 envelope (USDC on Base); everything
+else just answers.
 
 Not everything is hosted. Where we do not run the conversion ourselves, the
-entry is a **reference**: it names the tool worth reaching for, the install
-one-liner, the caveats that actually bite, and an `escalate` line saying where a
-model is honestly warranted. So the catalog has two kinds of entry, and each one
-says which it is.
+entry is a **reference**: it names the tool worth reaching for, the caveats that
+actually bite, and an `escalate` line saying where a model is honestly
+warranted. So the catalog has two kinds of entry, and each one says which it is.
+The install one-liner for a reference tool lives in `entries.yaml`,
+`catalog.json` and `llms-full.txt` — deliberately **not** on the page, which is
+about tools you do not have to install.
 
-The unit is the **pair** — what you have, what you need. There are three ways in:
+The unit is the **pair** — what you have, what you need. There are four ways in:
 
-- **Agents** install the skill (`skills/toolshed/SKILL.md`) or call the HTTP
-  endpoints directly: `GET /check` to see what exists, `POST /convert/<id>` to
-  run it.
+- **HTTP, first and always**: `GET /check` to see what exists,
+  `POST /convert/<id>` to run it. This is the whole API.
+- **Agents** install the skill (`npx skills add chronick/lemon-toolshed`) or add
+  the MCP server (`claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed`).
+  Both are conveniences over the same HTTP surface.
 - **Machines without an agent** fetch `catalog.json`, `llms.txt` or
   `llms-full.txt` — the whole catalog in one request.
 - **People** get a page: pick what you have and what you need from two
@@ -52,8 +58,10 @@ build.mjs                   build step — emits dist/ and worker/catalog.genera
 worker/beacon.js            the API Worker — /b, /check, /convert/*
 worker/catalog.generated.js GENERATED from entries.yaml; committed, because deploy reads it
 worker/schema.sql           D1 schema — events / daily_aggregates / blocklist / salt / counters
+mcp/server.mjs              the MCP server — thin stdio wrapper over the HTTP API
 skills/toolshed/SKILL.md    the agent skill — check availability, convert, x402
-wrangler.toml               Worker config; routes and database_id filled in at deploy
+scripts/test-live.mjs       live smoke test + cost estimate; zero deps
+wrangler.toml               Worker config; routes are live, database_id filled in at deploy
 ```
 
 The read surface is still **static assets only, zero Functions**. The Worker is
@@ -113,6 +121,8 @@ Exercise the API:
 curl "http://localhost:8787/check?from=markdown&to=html"
 curl -X POST "http://localhost:8787/convert/md-html" --data-binary @README.md
 curl -sD- -o/dev/null -X POST http://localhost:8787/convert/html-markdown --data-binary '<h1>hi</h1>'
+
+node scripts/test-live.mjs http://localhost:8787   # the whole surface at once
 ```
 
 Open <http://localhost:4173>, click an outbound link, then read the events back:
@@ -176,30 +186,88 @@ npm ci                                                  # wrangler bundles the W
 npm run build                                           # regenerates worker/catalog.generated.js
 npx wrangler d1 create lemon_toolshed                   # copy the id into wrangler.toml
 npx wrangler d1 execute DB --remote --file worker/schema.sql
-# uncomment the routes = [...] block in wrangler.toml, then:
-npx wrangler deploy
+npx wrangler deploy                                     # routes are live in wrangler.toml
+node scripts/test-live.mjs                              # smoke-test the deployed API
 ```
+
+**The routes, and the one counter-intuitive bit.** `wrangler.toml` carries them
+live:
+
+```toml
+routes = [
+  { pattern = "toolshed.lemon-agent.dev/b", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/check*", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/convert/*", zone_name = "lemon-agent.dev" }
+]
+```
+
+`/check*` carries a wildcard and `/b` does not, on purpose. Per the Workers
+routing docs, *"route pattern matching considers the entire request URL,
+including the query parameter string"*, and *"route patterns may not contain
+query parameters"* — so a bare `toolshed.lemon-agent.dev/check` would match
+`/check` and **miss** `/check?from=markdown&to=html`, which is every real call.
+A `/check?*` pattern is not the fix either; it is invalid. A terminal wildcard
+is the only form that catches both. `/convert/*` already ends in one; `/b` is
+POSTed with no query string, so it stays exact.
 
 Build output for step 2 is `dist/`, produced by `npm run build`. Pages build
 command: `npm ci && npm run build`; output directory: `dist`.
 
-### Installing the skill
+## Installing it in an agent
 
-`skills/toolshed/SKILL.md` ships in the repo. Once the repo is published:
+Plain HTTP needs no install at all — `curl` the two endpoints. The two surfaces
+below are conveniences over exactly that API, and neither adds a capability the
+HTTP surface lacks.
+
+### The skill
 
 ```bash
-npx skills add <repo-url>          # TODO: no URL until the repo exists
+npx skills add chronick/lemon-toolshed
 ```
 
-Until then — and as the always-works fallback — copy the file into the agent's
-skills directory:
+`skills/toolshed/SKILL.md` follows the `skills/<name>/` convention, so the repo
+slug is the whole argument. Always-works fallback — copy the directory in:
 
 ```bash
 cp -r skills/toolshed ~/.claude/skills/
 ```
 
-The page says the same thing, with the same TODO, rather than printing a command
-that does not work yet.
+### The MCP server
+
+```bash
+claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed
+
+# or from a local clone, no network fetch:
+claude mcp add toolshed -- node /path/to/lemon-toolshed/mcp/server.mjs
+```
+
+`mcp/server.mjs` is a thin stdio wrapper: every tool is one `fetch` against the
+public API, and it holds no state, no key and no wallet. Three tools:
+
+| tool | arguments | does |
+| --- | --- | --- |
+| `toolshed_check` | `from?`, `to?` | `GET {BASE}/check` |
+| `toolshed_convert` | `tool_id`, `input` | `POST {BASE}/convert/{tool_id}`, returns the converted text |
+| `toolshed_catalog` | — | `GET {BASE}/llms.txt` |
+
+`BASE` is `TOOLSHED_URL`, defaulting to `https://toolshed.lemon-agent.dev`. On a
+`402`, `toolshed_convert` does not swallow the envelope: it returns a readable
+explanation quoting the price, the asset and the `payTo` address, says what an
+x402 client would do with it, and states that settlement is not switched on yet.
+
+Dependencies: `@modelcontextprotocol/sdk` (exact-pinned) and Node 18+ for global
+`fetch`. The `bin` entry plus the shebang are what make
+`npx -y github:chronick/lemon-toolshed` run the server directly.
+
+Smoke-test it with no network — initialize, then list the tools:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | node mcp/server.mjs
+```
 
 ## Payment (x402)
 
@@ -227,6 +295,13 @@ isn't one wired up, and the Worker will not pretend to have checked something it
 cannot check. It says so in a header rather than silently accepting the call as
 paid. **Full enforcement lands with the facilitator** — until then, treat
 `PAYTO` as a way to exercise the 402 flow, not as revenue.
+
+The page publishes the same thing in plain language under **How to get my agent
+to pay with USDC?** — what the 402 carries, the two things an agent needs (an
+x402-capable HTTP client and a wallet key holding USDC on Base), a copy-able
+`x402-fetch` example, and an honest-status box saying pricing is not enforced
+yet. The MCP server's `toolshed_convert` says the same on a 402 rather than
+returning a bare error.
 
 The envelope (`x402Version: 1`) advertises `scheme: exact`, `network: base` and
 `asset` = USDC on Base (`0x8335…2913`). `maxAmountRequired` is in atomic units,
@@ -440,12 +515,35 @@ a PR. `build.mjs` prints a `STALE` warning for any entry whose `verified` date i
 more than 35 days old and marks it *review due* on the page, so staleness is
 visible in the build rather than discovered by a reader.
 
-Two pieces of that automation are **not built yet**: a CI link-check over every
-`url`, and a smoke test that posts a known payload to each hosted endpoint and
-diffs the output. The second one matters more now — a local reference entry that
-rots is a stale opinion, but a hosted endpoint that rots is a broken product.
-Until it exists, the hosted endpoints are exercised by hand against
-`wrangler dev --local`; the commands are in [Local demo](#local-demo).
+The smoke test now exists: `scripts/test-live.mjs` posts a known payload to
+every hosted endpoint and asserts a distinctive substring came back, so a rotted
+converter shows up as a red row rather than as a broken product.
+
+```bash
+node scripts/test-live.mjs                        # production
+node scripts/test-live.mjs http://localhost:8787  # against wrangler dev --local
+```
+
+It covers `GET /check` with and without parameters, all five happy-path
+conversions, a malformed-input `400`, a `413` at 300 KB, and a `POST /b` visit —
+then prints a PASS/FAIL table and exits non-zero on any failure. Zero
+dependencies; Node 18+ for global `fetch`. A run writes ~8 event rows against
+the caller's rung-1 budget of 100/day.
+
+A priced endpoint answering `402` is reported as a pass, not a failure: once
+`PAYTO` is set, the envelope *is* the correct response.
+
+After the table it prints a **cost estimate** from named constants with the
+arithmetic shown — Workers requests and CPU, D1 rows written, the assumed 2 ms
+per conversion — the cost of the run just made (≈ $0, every meter inside its
+allowance), and a table of monthly cost at 1k / 10k / 100k / 1M calls a day.
+Requests are the allowance that cracks first, at roughly 333k calls/day
+(10M req/mo); at 1M calls/day the metered charge is about $16.60/month on top of
+the flat plan fee. Everything there is labelled *list prices as of 2026-08-18*
+and needs re-reading, not trusting, after any Cloudflare repricing.
+
+One piece of automation is still **not built**: a CI link-check over every
+`url`.
 
 Adding a hosted tool is four steps: add the `hosted:` block in `entries.yaml`,
 add the matching entry to `CONVERTERS` in `worker/beacon.js`, run `npm run build`

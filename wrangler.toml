@@ -14,11 +14,29 @@ compatibility_date = "2026-08-01"
 # serving dist/ as static assets with ZERO Functions — adding a Function
 # re-opens the pages.dev twin's metered path (dossier § Limits, "The twin").
 
-# The routes, added at deploy. The page addresses the beacon by RELATIVE URL,
-# so a page served from the pages.dev twin resolves /b against the twin, where
-# no Worker route and no Function exist, and the request lands on static
-# handling. Traffic reaches this Worker only through the zone, where the rung-0
-# rate-limiting rule lives.
+# The routes. The page addresses the beacon by RELATIVE URL, so a page served
+# from the pages.dev twin resolves /b against the twin, where no Worker route and
+# no Function exist, and the request lands on static handling. Traffic reaches
+# this Worker only through the zone, where the rung-0 rate-limiting rule lives.
+#
+# WHY `/check*` AND NOT `/check` — verified against the Workers routing docs
+# 2026-08-18, and it is the opposite of the intuitive reading:
+#
+#   "Route pattern matching considers the entire request URL, including the query
+#    parameter string. Since route patterns may not contain query parameters, the
+#    only way to have a route pattern match URLs with query parameters is to
+#    terminate it with a wildcard, *."
+#
+# So the query string is NOT ignored. A bare `toolshed.lemon-agent.dev/check`
+# would match `/check` and MISS `/check?from=markdown&to=html` — which is every
+# real call. And a `/check?*` pattern is not a fix, it is invalid: patterns may
+# not contain query parameters at all. The trailing wildcard is the only form
+# that catches both. `/convert/*` already ends in one, so it is unaffected;
+# `/b` is POSTed with no query string, so it stays exact.
+#
+# `/check*` also matches `/checkfoo`; the Worker routes on `path === '/check'`
+# and everything else falls through to the beacon handler's 404/405, so the
+# wider pattern costs nothing.
 #
 # The rung-0 rule must be WIDENED to cover the conversion endpoints as well as
 # the beacon — rungs 1 and 2 execute inside the Worker, so a request they reject
@@ -30,12 +48,12 @@ compatibility_date = "2026-08-01"
 #
 # GET /check is deliberately NOT in the rule: it touches no D1 and does no work,
 # so it is left cheap and open.
-#
-# routes = [
-#   { pattern = "toolshed.lemon-agent.dev/b", zone_name = "lemon-agent.dev" },
-#   { pattern = "toolshed.lemon-agent.dev/check", zone_name = "lemon-agent.dev" },
-#   { pattern = "toolshed.lemon-agent.dev/convert/*", zone_name = "lemon-agent.dev" }
-# ]
+
+routes = [
+  { pattern = "toolshed.lemon-agent.dev/b", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/check*", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/convert/*", zone_name = "lemon-agent.dev" }
+]
 
 # Payment configuration. Both are UNSET by default, and unset is a working
 # state: the priced conversion is served free with `x-pricing: pending` until

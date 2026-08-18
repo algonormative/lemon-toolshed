@@ -3,16 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Toolshed — server-hosted conversion tools with an x402 payment path and a free tier, under the Lemon house brand. Static read surface plus an API Worker.",
+  "description": "Toolshed — tools for agents, no install required. Hosted conversion endpoints with an x402 payment path and a free tier, under the Lemon house brand. Static read surface, an API Worker, and an MCP server.",
+  "bin": {
+    "lemon-toolshed": "mcp/server.mjs"
+  },
   "scripts": {
     "build": "node build.mjs",
     "build:demo": "BEACON_URL=${BEACON_URL:-http://localhost:8787/b} SITE_HOST=${SITE_HOST:-localhost:4173} API_HOST=${API_HOST:-localhost:8787} node build.mjs",
     "db:local": "wrangler d1 execute DB --local --file worker/schema.sql -y",
     "dev:worker": "wrangler dev --local --port 8787",
-    "serve": "serve dist -l 4173"
+    "mcp": "node mcp/server.mjs",
+    "serve": "serve dist -l 4173",
+    "test:live": "node scripts/test-live.mjs"
   },
   "dependencies": {
     "@mixmark-io/domino": "^2.2.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "js-yaml": "^4.1.0",
     "marked": "^18.0.10",
     "turndown": "^7.2.4"

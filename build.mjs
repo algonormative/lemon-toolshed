@@ -50,8 +50,13 @@ const API_BASE = `${API_SCHEME}://${API_HOST}`;
 const SITE_NAME = 'Toolshed';
 const HOUSE = 'Lemon';
 const KICKER = 'the Lemon';
-const STRAPLINE = 'Server-hosted conversion tools. Agents pay per call with x402 — some tools are free.';
-const TITLE = `${SITE_NAME} — hosted conversion tools · ${HOUSE}`;
+const STRAPLINE =
+  'A collection of tools for agents — no install required. Privacy-first: no login, no credit card. ' +
+  'Pay per call with USDC; many tools are free.';
+const TITLE = `${SITE_NAME} — tools for agents · ${HOUSE}`;
+const META_DESCRIPTION =
+  'Conversion tools an agent can call over HTTP with nothing installed. No login, no credit card. ' +
+  'Many tools are free; priced ones take USDC per call with x402.';
 
 // Refresh cadence is monthly (~4 h/month, dossier § Estimates). Entries whose
 // `verified` date predates it are flagged in the build (dossier § Components 7).
@@ -63,14 +68,13 @@ const KIND_SET = new Set(KINDS);
 const REQUIRED = ['id', 'x', 'y', 'tool', 'kind', 'verdict', 'url', 'caveats', 'escalate', 'verified'];
 
 // The editorial stance. Plain sentences, published on the page and in the
-// machine surfaces.
+// machine surfaces. Short on purpose — the page leads with what the thing is,
+// not with an essay about it.
 const STANCE =
-  'Each entry says which tool does the job, what it costs, and how to call it. ' +
-  'Some conversions run on our server and answer over HTTP; the rest are pointers ' +
-  'to a tool you install and run yourself. The preference is the plain deterministic ' +
-  'tool wherever one works, and a model only where the answer is a judgment call — ' +
-  'the escalate line on each entry says where that line falls. Every verdict is ' +
-  'engineering judgment, not measurement.';
+  'Post a file to a hosted tool and read the converted file back — nothing to install. ' +
+  'Where we do not host the job, the entry names the tool worth reaching for and what ' +
+  'bites about it. We prefer the plain deterministic tool wherever one works, and a ' +
+  'model only where the answer is a judgment call.';
 
 // Bot policy, verbatim from KC-CUR (dossier § Limits, "Count integrity").
 const BOT_POLICY =
@@ -612,6 +616,10 @@ details[open].more .lbl-less { display: inline; }
 }
 .cmd-sm { padding: 0.3rem 0.4rem 0.3rem 0.6rem; margin-bottom: 0.4rem; }
 .cmd-sm code { font-size: 0.74rem; }
+/* Multi-line snippets: the copy button rides at the top rather than floating in
+   the vertical middle of eight lines of code. */
+.cmd-block { align-items: flex-start; }
+.cmd-block code { white-space: pre; line-height: 1.55; }
 .copy {
   flex: 0 0 auto; cursor: pointer;
   font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
@@ -624,15 +632,10 @@ details[open].more .lbl-less { display: inline; }
 .copy.copied { background: var(--accent); color: var(--chip-ink); border-color: var(--accent); }
 .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* ---- the local fallback block, pushed to the card's bottom ------------ */
-.localblock { margin-top: auto; padding-top: 0.5rem; }
-.local-label {
-  margin: 0 0 0.3rem; color: var(--muted); font-size: 0.78rem;
-}
-.local-label .tool { font-size: 0.82rem; }
-
+/* The verified line is pushed to the card's bottom, so a grid row of cards
+   lines its footers up regardless of how long each verdict runs. */
 .cardfoot {
-  margin: 0; padding-top: 0.6rem; border-top: 1px solid var(--border);
+  margin: auto 0 0; padding-top: 0.6rem; border-top: 1px solid var(--border);
   font-size: 0.85rem;
 }
 .verified { color: var(--muted); font-family: ui-monospace, Menlo, Monaco, Consolas, monospace; font-size: 0.74rem; }
@@ -641,6 +644,23 @@ details[open].more .lbl-less { display: inline; }
 /* ---- for agents ------------------------------------------------------ */
 .agent-row { margin: 0 0 1.1rem; }
 .agent-row .note { margin: -0.35rem 0 0; }
+
+/* ---- honest-status box ----------------------------------------------- */
+/* Reserved for statements about what is NOT built. Dashed, not filled — it is
+   a caveat, not a feature callout. */
+.status-box {
+  margin: 1.4rem 0 0; padding: 0.85rem 1rem;
+  border: 1px dashed var(--accent-hover); border-radius: 8px;
+  background: var(--accent-soft);
+  font-size: 0.94rem;
+}
+.status-box p { margin: 0; }
+.status-box .status-label {
+  display: block; margin-bottom: 0.25rem;
+  color: var(--accent-ink);
+  font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700;
+}
 
 /* ---- footer ---------------------------------------------------------- */
 footer { margin-top: 4rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.9rem; }
@@ -804,33 +824,48 @@ function cmdRow(command, label, extraClass = '') {
   return `<div class="${cls}"><code>${esc(command)}</code><button type="button" class="copy js-only" aria-label="${esc(label)}">copy</button></div>`;
 }
 
+// The worked example in "How to get my agent to pay with USDC?". Deliberately
+// short: two imports, an account, the wrapper, one call. The priced endpoint is
+// the one real priced tool in the shed, so the snippet is runnable rather than
+// illustrative — modulo settlement, which is not switched on yet.
+const X402_SNIPPET = [
+  'import { wrapFetchWithPayment } from "x402-fetch";',
+  'import { privateKeyToAccount } from "viem/accounts";',
+  '',
+  'const account = privateKeyToAccount(process.env.WALLET_PRIVATE_KEY);',
+  'const pay = wrapFetchWithPayment(fetch, account);   // handles the 402 + retry',
+  '',
+  `const res = await pay("${API_BASE}/convert/html-markdown",`,
+  '  { method: "POST", body: "<h1>Hello</h1>" });',
+  'console.log(await res.text());',
+].join('\n');
+
 function hostedBlock(e) {
   const h = e._hosted;
   if (!h) return '';
   const planned = h.status === 'planned';
   const pillClass = planned ? 'pill-planned' : isFree(h) ? 'pill-free' : 'pill-paid';
   const pillText = planned ? 'planned' : `hosted · ${priceLabel(h.price)}`;
+  // The kind chip is NOT repeated here — the tool row below carries it on every
+  // card, hosted or not.
   const row = `          <p class="hostedrow">
             <span class="pill ${pillClass}">${esc(pillText)}</span>
-            <span class="kind kind-${esc(e.kind)}">${esc(e.kind)}</span>
           </p>`;
-  if (planned) return `${row}\n          <p class="note">Not live yet — run it locally for now.</p>`;
+  if (planned) return `${row}\n          <p class="note">Not live yet — the tool below is the one to reach for meanwhile.</p>`;
   return `${row}\n          ${cmdRow(convertCurl(e), `Copy the convert command for ${oneLine(e.x)} to ${oneLine(e.y)}`)}`;
 }
 
-function localBlock(e) {
-  if (!e._local) return '';
-  const toolLink = `<a class="tool" href="${esc(e.url)}" data-entry="${esc(e.id)}" rel="noopener">${esc(e._local.tool)}</a>`;
-  if (e._hosted) {
-    return `          <div class="localblock">
-            <p class="local-label">Run it locally — ${toolLink}</p>
-            ${cmdRow(e._local.install, `Copy install command for ${e._local.tool}`, 'cmd-sm')}
-          </div>`;
-  }
-  return `          <div class="localblock">
-            <p class="local-label">local install</p>
-            ${cmdRow(e._local.install, `Copy install command for ${e._local.tool}`)}
-          </div>`;
+// The base tool behind the entry: its name, linked to its own site. This is the
+// page's ONLY outbound link per card, and the only [data-entry] element — which
+// is exactly what the beacon's delegated click listener counts. No install
+// command is printed anywhere on the page; the strings live on in catalog.json
+// and llms-full.txt for machines that want them.
+function toolRow(e) {
+  const label = e._local ? e._local.tool : e.tool;
+  return `          <p class="toolrow">
+            <a class="tool" href="${esc(e.url)}" data-entry="${esc(e.id)}" rel="noopener">${esc(label)}</a>
+            <span class="kind kind-${esc(e.kind)}">${esc(e.kind)}</span>
+          </p>`;
 }
 
 function renderCard(e, shelfSlug) {
@@ -839,16 +874,6 @@ function renderCard(e, shelfSlug) {
   const staleNote = isStale(e) ? ' · review due' : '';
   const hostedState = e._hosted ? e._hosted.status : 'no';
   const cardClass = e._hosted && e._hosted.status === 'live' ? 'card is-hosted' : 'card';
-  // Local-only cards keep the tool link and kind chip at the top, as before.
-  // Hosted cards lead with the hosted offer and carry the tool link in the
-  // secondary "Run it locally" block — every card still has exactly one
-  // [data-entry] link, which is what the beacon's click listener counts.
-  const topRow = e._hosted
-    ? ''
-    : `          <p class="toolrow">
-            <a class="tool" href="${esc(e.url)}" data-entry="${esc(e.id)}" rel="noopener">${esc(e.tool)}</a>
-            <span class="kind kind-${esc(e.kind)}">${esc(e.kind)}</span>
-          </p>\n`;
   return `        <article class="${cardClass}" id="${esc(e.id)}"
           data-x="${esc(oneLine(e.x).toLowerCase())}"
           data-y="${esc(oneLine(e.y).toLowerCase())}"
@@ -861,13 +886,13 @@ function renderCard(e, shelfSlug) {
           data-search="${search}">
           <h3 class="pair">${esc(oneLine(e.x))}<span class="arrow">&rarr;</span>${esc(oneLine(e.y))}</h3>
 ${hostedBlock(e)}
-${topRow}          <p class="verdict">${inline(e.verdict)}</p>
+${toolRow(e)}
+          <p class="verdict">${inline(e.verdict)}</p>
           <details class="more">
             <summary><span class="lbl-more">more</span><span class="lbl-less">less</span></summary>
             <p class="meta"><span class="label">Caveats</span>${inline(e.caveats)}</p>
             <p class="meta"><span class="label">Escalate</span>${inline(e.escalate)}</p>
           </details>
-${localBlock(e)}
           <p class="cardfoot"><span class="verified${staleMark}">verified ${esc(e.verified)}${staleNote}</span></p>
         </article>`;
 }
@@ -901,6 +926,7 @@ const kindChips = KINDS.map(
 const NAV = [
   ['#shelves', 'Shelves'],
   ['#for-agents', 'For agents'],
+  ['#pay-with-usdc', 'Pay with USDC'],
   ['#how-we-count', 'How we count'],
   ['#privacy', 'Privacy'],
   ['catalog.json', 'catalog.json'],
@@ -920,7 +946,7 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(TITLE)}</title>
-<meta name="description" content="Server-hosted file and data conversion tools an agent can call over HTTP. Some are free; priced ones take payment per call with x402. Everything else is a pointer to a tool you install yourself.">
+<meta name="description" content="${esc(META_DESCRIPTION)}">
 <link rel="icon" href="${FAVICON}">
 <style>
 ${CSS}
@@ -979,26 +1005,17 @@ ${NAV.map(([href, label]) => `      <a href="${href}">${esc(label)}</a>`).join('
       </div>
       <p class="summary">${esc(SUMMARY)}</p>
     </div>
-    <p class="note">Hosted tools need nothing installed — post the file and read the answer. Local install lines assume <code>brew</code>, <code>npm</code>, <code>pip</code> or <code>uv</code> on your PATH; every copy button hands you the exact command, and <a href="catalog.json">catalog.json</a> carries the same strings machine-readable.</p>
+    <p class="note">Hosted tools need nothing installed — post the file, read the answer. <a href="catalog.json">catalog.json</a> carries every entry machine-readable.</p>
     <p class="empty js-only" id="no-matches" hidden>Nothing matches that pair. Try a broader option, or clear the filters.</p>
   </div>
 
 ${sections.map(renderShelf).join('\n')}
 
   <section class="prose" id="for-agents">
-    <h2>For agents — install &amp; call</h2>
-    <p>There are two ways in. Install the skill so your agent knows these tools exist, or call the HTTP endpoints directly. Nothing here needs an account or a key.</p>
+    <h2>For agents — call it</h2>
+    <p>Plain HTTP is the whole API; the skill and the MCP server are conveniences on top of it. Nothing here needs an account or a key.</p>
 
-    <h4>1. Install the skill</h4>
-    <div class="agent-row">
-      ${cmdRow('npx skills add <repo-url>', 'Copy the skill install command')}
-      <p class="note">TODO: the repo is not published yet, so there is no URL to paste here. Until it is, copy <code>skills/toolshed/SKILL.md</code> from the repo into your agent's skills directory.</p>
-    </div>
-
-    <h4>2. MCP</h4>
-    <p>No MCP server yet; the HTTP surface below is the whole API. If you want MCP, say so — the catalog is small on purpose.</p>
-
-    <h4>3. Check what is available, then convert</h4>
+    <h4>1. Check what is available, then convert</h4>
     <div class="agent-row">
       ${cmdRow(`curl "${API_BASE}/check?from=markdown&to=html"`, 'Copy the availability check command')}
       <p class="note">Returns the matching pairs with their endpoint, price and status. <code>from</code> is matched against what you have, <code>to</code> against what you need. No parameters returns every hosted tool.</p>
@@ -1008,10 +1025,10 @@ ${sections.map(renderShelf).join('\n')}
       <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB.</p>
     </div>
 
-    <h4>4. The whole catalog as files</h4>
+    <h4>2. The whole catalog as files</h4>
     <div class="agent-row">
       ${cmdRow(`curl ${BASE}/catalog.json`, 'Copy catalog.json fetch command')}
-      <p class="note">Structured entries — every field, including the hosted endpoint and the local install line.</p>
+      <p class="note">Structured entries — every field, including the hosted endpoint.</p>
     </div>
     <div class="agent-row">
       ${cmdRow(`curl ${BASE}/llms.txt`, 'Copy llms.txt fetch command')}
@@ -1022,10 +1039,44 @@ ${sections.map(renderShelf).join('\n')}
       <p class="note">Full verdicts, with caveats and escalate lines.</p>
     </div>
 
-    <h4>5. Paying for a call</h4>
-    <p>Priced tools answer HTTP 402 with an x402 payment envelope (USDC on Base). Free-tier tools just answer. Pricing is per call; no accounts.</p>
+    <h4>3. Install the skill</h4>
+    <div class="agent-row">
+      ${cmdRow('npx skills add chronick/lemon-toolshed', 'Copy the skill install command')}
+      <p class="note">Teaches an agent the check-then-convert habit, the 256 KB cap and the paid flow. Always-works fallback: copy <code>skills/toolshed/</code> from the repo into your agent's skills directory.</p>
+    </div>
+
+    <h4>4. MCP</h4>
+    <div class="agent-row">
+      ${cmdRow('claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed', 'Copy the MCP install command')}
+      <p class="note">Three tools over stdio: <code>toolshed_check</code>, <code>toolshed_convert</code>, <code>toolshed_catalog</code>. From a local clone instead:</p>
+      ${cmdRow('claude mcp add toolshed -- node /path/to/lemon-toolshed/mcp/server.mjs', 'Copy the local-clone MCP install command', 'cmd-sm')}
+      <p class="note">Point it somewhere else with <code>TOOLSHED_URL</code>.</p>
+    </div>
 
     <p>Links on this page are plain <code>href</code>s to the tool, with no redirect and no interstitial.</p>
+  </section>
+
+  <section class="prose" id="pay-with-usdc">
+    <h2>How to get my agent to pay with USDC?</h2>
+    <p>Most tools here are free and just answer. A priced tool answers <strong>HTTP 402</strong> instead, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation.</p>
+
+    <p>Your agent needs two things to answer it:</p>
+    <ol>
+      <li>An <strong>x402-capable HTTP client</strong> — <code>x402-fetch</code>, the x402 SDK, or <a href="https://docs.cdp.coinbase.com/x402/welcome" rel="noopener">Coinbase AgentKit</a>.</li>
+      <li>A <strong>wallet key holding USDC on Base</strong>, which the client signs with.</li>
+    </ol>
+
+    <p>The client reads the envelope, signs a payment for the named amount, and retries the same request with an <code>X-PAYMENT</code> header. No login, no card, no account — the payment <em>is</em> the auth.</p>
+
+    <h4>Example — JavaScript, with <code>x402-fetch</code></h4>
+    <div class="agent-row">
+      ${cmdRow(X402_SNIPPET, 'Copy the x402-fetch example', 'cmd-block')}
+      <p class="note">The wrapper does the 402 handling and the retry; your code just awaits a response. Never paste a private key or a seed phrase into a chat — the key belongs in the environment your client runs in.</p>
+    </div>
+
+    <div class="status-box">
+      <p><span class="status-label">Honest status</span>Pricing is <strong>not enforced yet</strong> — priced tools currently answer free with an <code>x-pricing: pending</code> header. When settlement goes live, the 402 above is the only gate.</p>
+    </div>
   </section>
 
   <section class="prose" id="how-we-count">
@@ -1103,13 +1154,18 @@ const API_HEADER = [
   `Convert: POST ${API_BASE}/convert/<id> with the raw file as the body (256 KB cap).`,
   `  The converted file comes back as the body, with the right Content-Type.`,
   `Payment: priced tools answer HTTP 402 with an x402 envelope (USDC on Base). Free tools just answer.`,
-  `  No accounts, no keys, per-call pricing.`,
+  `  No accounts, no keys, per-call pricing. Pay with an x402-capable client (x402-fetch, the x402`,
+  `  SDK, Coinbase AgentKit) holding a wallet key with USDC on Base; it signs and retries with an`,
+  `  X-PAYMENT header. NOT ENFORCED YET: priced tools currently answer free with x-pricing: pending.`,
+  `Skill: npx skills add chronick/lemon-toolshed`,
+  `MCP: claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed`,
+  `  Tools: toolshed_check, toolshed_convert, toolshed_catalog. Base URL via TOOLSHED_URL.`,
 ];
 
 const llms = [
-  `# ${SITE_NAME} — hosted conversion tools · a ${HOUSE} field directory`,
+  `# ${SITE_NAME} — tools for agents · a ${HOUSE} field directory`,
   '',
-  `Server-hosted conversion tools an agent can call over HTTP, plus local-only references for the jobs we do not host. ${SUMMARY} The unit is the pair — what you have, what you need. Structured fields are in catalog.json alongside this file; the full verdicts, caveats and escalate lines are in llms-full.txt.`,
+  `Tools an agent can call over HTTP with nothing installed, plus local-only references for the jobs we do not host. ${SUMMARY} The unit is the pair — what you have, what you need. Structured fields are in catalog.json alongside this file; the full verdicts, caveats and escalate lines are in llms-full.txt.`,
   '',
   ...API_HEADER,
   '',
@@ -1128,7 +1184,7 @@ const llms = [
 // ---------------------------------------------------------------- llms-full.txt
 
 const llmsFull = [
-  `# ${SITE_NAME} — hosted conversion tools · a ${HOUSE} field directory`,
+  `# ${SITE_NAME} — tools for agents · a ${HOUSE} field directory`,
   '',
   `Site: ${BASE}`,
   `API: ${API_BASE}`,
