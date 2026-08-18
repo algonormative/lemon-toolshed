@@ -480,6 +480,18 @@ const turndown = new TurndownService({
   bulletListMarker: '-',
 });
 
+// Drop the non-prose elements and their CONTENT. Turndown's default rule emits
+// the text of any element it has no rule for, so without this a saved page —
+// which is exactly this entry's stated input — came back with its analytics
+// snippet, its JSON-LD block and its inline CSS sitting in the prose:
+//
+//   "# Post\n\nText.\n\nwindow.ga=function(){};ga(\"send\");\n\nMore."
+//
+// It only ever showed up for tags INSIDE the body: a leading <script> is
+// hoisted into <head> by the parser and never reaches doc.body, which is why a
+// one-tag spot check looks clean. `remove` takes the node and its subtree.
+turndown.remove(['script', 'style', 'noscript']);
+
 // RFC 4180: quoted fields, doubled quotes inside them, commas and CRLF or LF
 // line endings. A leading BOM is stripped. Values stay strings — guessing types
 // is where leading zeros and long ids get destroyed.
@@ -544,7 +556,15 @@ function csvToRecords(input) {
         `row ${r + 1} has ${cells.length} fields but the header has ${header.length}`
       );
     }
-    const record = {};
+    // Object.create(null), NOT {}. On a plain object, `record['__proto__'] = v`
+    // hits Object.prototype's `__proto__` setter instead of creating an own
+    // property, and for a string value that setter is a silent no-op — so a CSV
+    // column headed `__proto__` used to vanish from a 200 response, value and
+    // all. Losing a column outright is worse than any type-guessing mistake this
+    // parser refuses to make. A null-prototype record inherits no such accessor,
+    // so every header becomes an own property and JSON.stringify emits it.
+    // (yaml-json never had the bug; js-yaml builds its own keys correctly.)
+    const record = Object.create(null);
     for (let c = 0; c < header.length; c++) record[header[c]] = cells[c] ?? '';
     records.push(record);
   }

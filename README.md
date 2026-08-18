@@ -68,7 +68,8 @@ worker/catalog.generated.js GENERATED from entries.yaml; committed, because depl
 worker/schema.sql           D1 schema — events / daily_aggregates / blocklist / salt / counters / convert_quota
 mcp/server.mjs              the MCP server — thin stdio wrapper over the HTTP API
 skills/toolshed/SKILL.md    the agent skill — check availability, convert, x402
-scripts/test-live.mjs       live smoke test + cost estimate; zero deps
+test/                       the e2e suite — `npm test`, local only; see § Testing
+scripts/test-live.mjs       the older live probe + cost estimate; spends 6 free calls a run
 wrangler.toml               Worker config; routes are live, database_id filled in at deploy
 ```
 
@@ -115,6 +116,15 @@ that workerd does not have. `worker/beacon.js` therefore parses HTML with domino
 and hands Turndown the resulting element, which skips Turndown's own parser. Do
 not "simplify" that back to `turndown(htmlString)` — it throws at runtime, not
 at build time.
+
+A second one, in the same function: `turndown.remove(['script', 'style',
+'noscript'])`. Turndown's default rule emits the **text** of any element it has
+no rule for, so without that line a saved page — this entry's stated input —
+came back with its analytics snippet, its JSON-LD block and its inline CSS
+sitting in the prose. It only ever showed for tags **inside** the body; a
+leading `<script>` is hoisted into `<head>` by the parser and never reaches
+`doc.body`, so a one-tag spot check looks clean. Covered by
+`test/convert-html-markdown.test.mjs`.
 
 ## Local demo
 
@@ -642,6 +652,119 @@ restore horizon, and the fallback is to hold the salt outside the restorable
 store. A derived salt (`HMAC(secret, date)`) is not the fallback — it is
 recomputable forever, which is the negation of discarded-at-rotation.
 
+## Testing
+
+Two commands, and the split between them is about **cost**, not about depth:
+
+```bash
+npm test           # the whole suite, LOCAL ONLY — touches nothing deployed
+npm run test:live  # the production smoke — spends AT MOST ONE free conversion
+```
+
+`npm test` is the real coverage: 192 tests across nine files, per-tool fixture
+batteries plus the protocol, quota, spoof-resistance, x402 and beacon contracts.
+It never speaks to production and it never needs a Cloudflare login. Framework
+is `node:test` — no test dependency was added, and none is wanted.
+
+Writing it found two real defects, both fixed in `worker/beacon.js` and both now
+carrying a named regression test: a CSV column headed `__proto__` was **silently
+dropped** from an otherwise-200 response (`csvToRecords` now builds
+null-prototype records), and `html-markdown` **leaked inline `<script>`,
+`<style>` and JSON-LD source into the prose** when those tags sat inside the
+body (see § Worker dependencies).
+
+```text
+test/harness.mjs                  boots wrangler dev, owns teardown and D1 access
+test/run.mjs                      the phase runner behind `npm test`
+test/convert-md-html.test.mjs     per-tool fixture batteries
+test/convert-json-yaml.test.mjs   json -> yaml -> json round-trip properties
+test/convert-yaml-json.test.mjs   block scalars, anchors, comments, tabs
+test/convert-csv-json.test.mjs    the RFC 4180 battery
+test/convert-html-markdown.test.mjs
+test/protocol.test.mjs            /check, method and routing guards, 413, /b
+test/quota.test.mjs               the free tier and its spoof resistance
+test/x402.test.mjs                the 402 envelope and the paid ceiling
+test/beacon.test.mjs              rows, bot drops, salt rotation
+test/live.smoke.mjs               the production smoke (`npm run test:live`)
+```
+
+### The fresh-state guarantee
+
+Every phase of a run boots its own `wrangler dev --local` against its own
+`--persist-to` directory under the OS temp dir, with `worker/schema.sql` applied
+to it **before** the server starts, and deletes that directory on teardown. Two
+runs cannot see each other's rows, and no run can see the demo database in
+`.wrangler/`. That is what lets the free-tier assertions be exact — "the 11th
+call is refused", not "some call is eventually refused".
+
+Teardown kills the process **group**. `wrangler dev` spawns two `workerd`
+children, so killing the node process alone orphans them and leaks the port; the
+harness spawns it `detached` and tears it down with `process.kill(-pid, …)`,
+escalating to `SIGKILL`, plus a best-effort sweep on process exit.
+
+### Why there are two phases
+
+One dev var changes the product's answer past the free tier — with `PAYTO`
+unset it is a 429, with `PAYTO` set it is a 402 envelope — and a dev var is
+fixed for the life of a `wrangler dev` process. So `npm test` runs phase 1
+(everything, no `PAYTO`), tears it down, then phase 2 (`x402.test.mjs`, with
+`PAYTO=0xTEST…`). Suites run at `--test-concurrency=1` so the tests that count
+D1 rows can compare a before and an after without another file writing between
+them.
+
+### Running one suite
+
+Any file works on its own — it boots its own worker when the runner has not
+already exported one, so there is nothing to set up:
+
+```bash
+node --test test/quota.test.mjs
+node --test test/convert-csv-json.test.mjs
+npm test csv                       # or filter the runner by substring
+```
+
+### `cf-connecting-ip`, and why the quota tests work at all
+
+The free-tier counter is keyed on `hash(daily salt + IP)`, read from
+`request.headers.get('cf-connecting-ip')`. **`wrangler dev --local` passes that
+header straight through from the client** — verified empirically against
+wrangler 4.42.2: three POSTs to `/convert/md-html` carrying `cf-connecting-ip`
+`203.0.113.1`, `.2` and `.2` produced **two** `convert_quota` rows with
+`used = 1` and `used = 2`. Had the header been ignored, there would have been
+one row at `used = 3`.
+
+So every virtual caller in the suite is just a header value, and per-test
+isolation costs nothing: each suite owns a band of `198.18.<octet>.<n>`
+addresses (`SUITE_OCTET` in `test/harness.mjs`), fixture tests take a fresh
+address per call so quota is never in play, and the quota and x402 suites pin
+addresses deliberately so they can exhaust one.
+
+In production the header comes from the edge and a client cannot forge it. There
+is no edge in front of `wrangler dev`, which is exactly what makes it usable as
+a test control.
+
+### The live smoke
+
+`npm run test:live` checks that what is deployed is the same product, on a
+strict budget: **at most one free-tier conversion**, and it never depends on how
+much allowance is left. It asserts the `/check` contract, fetches
+`catalog.json` / `llms.txt` / `llms-full.txt` and sanity-checks their shape
+(including that `catalog.json` and `/check` agree about what is hosted), then
+makes exactly one conversion — accepting **200**, **402** (paid gate live, tier
+spent) or **429** (tier spent, payment off) as passes, labelled differently, so
+a repeat run on a spent day still tells the truth. The remaining checks are
+refusals (405, 404), which reach no counter.
+
+```bash
+npm run test:live
+TOOLSHED_URL=http://localhost:8787 npm run test:live
+```
+
+`npm run test:live:full` is the older `scripts/test-live.mjs`: the whole surface
+plus a cost estimate, but it **spends six free conversions a run**, so two runs
+in a UTC day from one IP hit the tier. Use it deliberately, not in a loop. Its
+`--quota` probe burns the day on purpose and is unchanged.
+
 ## Maintenance
 
 The refresh pass is ~4 h/month: re-check the verdicts, bump `verified`, and open
@@ -649,12 +772,12 @@ a PR. `build.mjs` prints a `STALE` warning for any entry whose `verified` date i
 more than 35 days old and marks it *review due* on the page, so staleness is
 visible in the build rather than discovered by a reader.
 
-The smoke test now exists: `scripts/test-live.mjs` posts a known payload to
-every hosted endpoint and asserts a distinctive substring came back, so a rotted
-converter shows up as a red row rather than as a broken product.
+`scripts/test-live.mjs` posts a known payload to every hosted endpoint and
+asserts a distinctive substring came back, so a rotted converter shows up as a
+red row rather than as a broken product.
 
 ```bash
-node scripts/test-live.mjs                        # production
+npm run test:live:full                            # production
 node scripts/test-live.mjs http://localhost:8787  # against wrangler dev --local
 node scripts/test-live.mjs --quota                # the free-tier probe, opt-in
 ```
