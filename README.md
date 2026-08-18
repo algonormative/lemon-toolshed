@@ -176,8 +176,16 @@ DEPLOY, in order:
  4. D1: events / daily_aggregates / blocklist / salt / counters / convert_quota.
  5. API Worker, routes /b + /check + /convert/* on the zone, D1 binding; the
     page addresses the beacon by RELATIVE URL.
- 6. Rate-limiting rule — the zone's one Free rule: 5 req / 10 s per IP,
-    action block, over /b AND /convert/* (expression below). NOT /check.
+ 6. Edge abuse control — OWNER-VERIFIED 2026-08-18: the dashboard gates
+    rate-limiting rules behind a higher plan for this account, so the edge
+    rate rule is DROPPED from this runbook. The deployed in-Worker tiers
+    (10/day free per IP-hash, 100/day beacon identifier, 200k/day global
+    fail-closed) are the abuse bound, the $25 Usage-Based Billing
+    notification (step 8 — free on every plan) is the bill bound, and the
+    reactive edge control is a free WAF CUSTOM rule when the blocklist
+    identifies abusers: expression `(ip.src in {<addresses>})`, action
+    Block — blocks at the edge BEFORE billing. Populate it from the
+    blocklist table (operator query below).
  7. Access-lock the production *.pages.dev twin (Pages Known-issues
     procedure).
  8. Configure the $25 billing alert; commit the route-disable runbook to the
@@ -563,7 +571,7 @@ the same argument.
 
 | rung | where | control | failure mode |
 |---|---|---|---|
-| 0 | Cloudflare edge | rate-limiting rule on `/b` **and** `/convert/*`, 5 req / 10 s per IP, block | shared-IP undercount, recorded as a measurement cost |
+| 0 | Cloudflare edge | REACTIVE — free WAF custom rule blocking blocklist IPs (`ip.src in {…}`), populated from the `blocklist` table; the planned rate-limiting rule is unavailable on this account's plan (owner-verified 2026-08-18) | nothing blocks a first-seen IP at the edge; the in-Worker tiers below are the standing bound, and abuse is blocked at the edge only after it is identified |
 | 1 | Worker | 100 events / identifier / UTC day — **`/b` only**; convert rows are excluded from the count | honest runaway client stops being counted; UA rotation still mints fresh identifiers, which is a measurement cost, not a spend |
 | 1c | Worker | **10 conversions / caller / UTC day** (`FREE_TIER_DAILY`), or 5,000 when an `X-PAYMENT` header is presented and `PAYTO` is set | over-tier callers get 402 or 429; the key is the IP hash, so UA rotation does **not** mint a fresh allowance |
 | 2 | Worker | 200,000 events / UTC day, fail-closed before insert | metrics loss and no conversions for the rest of the day |
