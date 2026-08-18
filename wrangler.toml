@@ -2,19 +2,48 @@ name = "lemon-toolshed-beacon"
 main = "worker/beacon.js"
 compatibility_date = "2026-08-01"
 
+# The Worker imports marked, js-yaml, turndown and @mixmark-io/domino. Wrangler
+# bundles npm dependencies natively, so there is no build step to configure —
+# but `npm ci` must have run before `wrangler deploy`.
+#
+# It also imports worker/catalog.generated.js, which `npm run build` writes from
+# entries.yaml. Run the build and commit that file before deploying; wrangler
+# reads it from disk.
+
 # The read surface is NOT here. It is a separate Cloudflare Pages project
 # serving dist/ as static assets with ZERO Functions — adding a Function
 # re-opens the pages.dev twin's metered path (dossier § Limits, "The twin").
 
-# The route, added at deploy. The page addresses the beacon by RELATIVE URL,
+# The routes, added at deploy. The page addresses the beacon by RELATIVE URL,
 # so a page served from the pages.dev twin resolves /b against the twin, where
 # no Worker route and no Function exist, and the request lands on static
-# handling. Beacon traffic reaches this Worker only through the zone, where the
-# rung-0 rate-limiting rule lives.
+# handling. Traffic reaches this Worker only through the zone, where the rung-0
+# rate-limiting rule lives.
+#
+# The rung-0 rule must be WIDENED to cover the conversion endpoints as well as
+# the beacon — rungs 1 and 2 execute inside the Worker, so a request they reject
+# is already billed, and /convert costs more CPU than /b does. The expression is
+# in README.md § Deploy runbook, step 6:
+#
+#   (http.host eq "toolshed.lemon-agent.dev" and
+#    (http.request.uri.path eq "/b" or starts_with(http.request.uri.path, "/convert/")))
+#
+# GET /check is deliberately NOT in the rule: it touches no D1 and does no work,
+# so it is left cheap and open.
 #
 # routes = [
-#   { pattern = "toolshed.lemon-agent.dev/b", zone_name = "lemon-agent.dev" }
+#   { pattern = "toolshed.lemon-agent.dev/b", zone_name = "lemon-agent.dev" },
+#   { pattern = "toolshed.lemon-agent.dev/check", zone_name = "lemon-agent.dev" },
+#   { pattern = "toolshed.lemon-agent.dev/convert/*", zone_name = "lemon-agent.dev" }
 # ]
+
+# Payment configuration. Both are UNSET by default, and unset is a working
+# state: the priced conversion is served free with `x-pricing: pending` until
+# PAYTO holds a real receiving address. See README.md § Payment (x402).
+#
+# [vars]
+# PAYTO = "0x..."            # receiving address for USDC on Base
+# FACILITATOR_URL = "..."    # NOT read yet — settlement verification is unbuilt
 
 [[d1_databases]]
 binding = "DB"

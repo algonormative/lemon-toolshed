@@ -1,29 +1,44 @@
 # Toolshed
 
-**Toolshed** is a curated conversion-tool directory at the use-case layer: *which
-tool, when.* The unit is the **pair** — what you have, what you need — not
-the tool, which is the layer neither the awesome-lists (keyed by tool) nor the
-per-tool review sites occupy. Each entry names one tool worth reaching for, an
-install one-liner, the caveats that actually bite, and an `escalate` line saying
-where a model is honestly warranted. The editorial stance is the deterministic
-tool wherever it suffices, and a model only where the target is judgment-defined.
-There are two surfaces: a human page — a have/need picker over a grid of shelved
-verdict cards — and a machine surface (`catalog.json` + `llms.txt` +
-`llms-full.txt`) for an agent arriving on a *have X, need Y* query.
+**Toolshed** is a collection of server-hosted conversion tools. An agent posts a
+file to an HTTP endpoint and gets the converted file back — no install, no
+account, no key. Some tools are free. Priced ones take payment per call with
+x402 (USDC on Base).
+
+Not everything is hosted. Where we do not run the conversion ourselves, the
+entry is a **reference**: it names the tool worth reaching for, the install
+one-liner, the caveats that actually bite, and an `escalate` line saying where a
+model is honestly warranted. So the catalog has two kinds of entry, and each one
+says which it is.
+
+The unit is the **pair** — what you have, what you need. There are three ways in:
+
+- **Agents** install the skill (`skills/toolshed/SKILL.md`) or call the HTTP
+  endpoints directly: `GET /check` to see what exists, `POST /convert/<id>` to
+  run it.
+- **Machines without an agent** fetch `catalog.json`, `llms.txt` or
+  `llms-full.txt` — the whole catalog in one request.
+- **People** get a page: pick what you have and what you need from two
+  dropdowns, and read the cards.
 
 Repo: `~/git/lemon-toolshed` (`chronick/lemon-toolshed`). It ships under the
 **Lemon** house brand; the site name is **Toolshed**, and it lives at
 `toolshed.lemon-agent.dev` on the measured zone.
 
-Two honest caveats. **The curation is an owner-taste surface** — the 30 entries
-in `entries.yaml` are drafts for review, not a finished list, and every verdict is
-engineering judgment rather than measurement. **The instrument has a hole**: the
-beacon counts script-executing clients, so the three machine files — the
-differentiator — are fetched by clients that execute nothing and are invisible to
-it. The available cross-check is zone-analytics request counts; whether a Free
-zone breaks those out per path is unread. Serving the machine files through the
-Worker to count them is rejected on purpose: it would put the differentiator on
-the metered path, which is where a runaway client lands first.
+Three honest caveats:
+
+- **The curation is owner taste.** The 33 entries in `entries.yaml` are drafts
+  for review, not a finished list, and every verdict is engineering judgment
+  rather than measurement.
+- **Payment is not enforced yet.** The priced endpoint answers a spec-valid 402
+  when `PAYTO` is set, but nothing verifies settlement, so it serves the
+  conversion anyway. See [Payment (x402)](#payment-x402) — this is deliberate,
+  and it is stated in the response headers rather than hidden.
+- **The visit counter has a hole.** The beacon counts script-executing clients,
+  so the machine files are fetched by clients that execute nothing and stay
+  invisible to it. Conversion calls *are* counted, because they go through the
+  Worker. The available cross-check for the files is zone-analytics request
+  counts; whether a Free zone breaks those out per path is unread.
 
 Architecture of record: `tradewind/dossiers/conversion-tool-portfolio-dossier.md`
 § Architecture — 2026-08-18. Where this README and that section disagree, the
@@ -32,30 +47,73 @@ dossier wins.
 ## Layout
 
 ```text
-entries.yaml       content tier — 30 draft entries, in git; review is a diff
-build.mjs          build step — emits dist/{index.html,catalog.json,llms.txt,llms-full.txt}
-worker/beacon.js   beacon Worker — POST /b, rungs 1 and 2, D1 write
-worker/schema.sql  D1 schema — events / daily_aggregates / blocklist / salt / counters
-wrangler.toml      Worker config; route and database_id filled in at deploy
+entries.yaml                content tier — 33 draft entries, in git; review is a diff
+build.mjs                   build step — emits dist/ and worker/catalog.generated.js
+worker/beacon.js            the API Worker — /b, /check, /convert/*
+worker/catalog.generated.js GENERATED from entries.yaml; committed, because deploy reads it
+worker/schema.sql           D1 schema — events / daily_aggregates / blocklist / salt / counters
+skills/toolshed/SKILL.md    the agent skill — check availability, convert, x402
+wrangler.toml               Worker config; routes and database_id filled in at deploy
 ```
 
-The read surface is **static assets only, zero Functions**. The beacon is the
-only metered path in the system.
+The read surface is still **static assets only, zero Functions**. The Worker is
+the only metered path, and it now carries conversions as well as the beacon.
+
+### Entry shape
+
+Two optional blocks decide what an entry is:
+
+```yaml
+hosted:                      # present = we run this conversion
+  path: "/convert/md-html"   # must equal /convert/ + the entry id
+  price: free                # or { amount_usd: 0.001, scheme: exact }
+  status: live               # or planned
+
+local:                       # how to run it yourself
+  tool: pandoc               # optional; defaults to the top-level `tool`
+  install: "brew install pandoc"
+```
+
+No `hosted:` block means a local-only reference entry. A bare top-level
+`install:` still works and is read as `local.install`, so entries written before
+the split need no edit. The build fails if `hosted.path` and the id disagree.
+
+## Worker dependencies
+
+The Worker imports `marked`, `js-yaml`, `turndown` and `@mixmark-io/domino`.
+Wrangler bundles npm dependencies natively — there is no build step to
+configure — but `npm ci` has to have run before `wrangler deploy`.
+
+One non-obvious bit: Turndown's browser build reaches for a global `document`
+that workerd does not have. `worker/beacon.js` therefore parses HTML with domino
+and hands Turndown the resulting element, which skips Turndown's own parser. Do
+not "simplify" that back to `turndown(htmlString)` — it throws at runtime, not
+at build time.
 
 ## Local demo
 
 ```bash
 npm install
 npm run db:local                 # apply worker/schema.sql to the local D1
-npm run build:demo               # BEACON_URL=http://localhost:8787/b SITE_HOST=localhost:4173
-npm run dev:worker &             # beacon Worker on :8787 (miniflare, local D1)
+npm run build:demo               # points the page and the curl lines at localhost
+npm run dev:worker &             # the Worker on :8787 (miniflare, local D1)
 npx serve dist -l 4173           # the page on :4173
 ```
 
-Both build constants are env-overridable: `BEACON_URL` is what the inline beacon
-posts to, and `SITE_HOST` is the hostname printed in the page's *For agents*
-`curl` lines. `build:demo` defaults them to the local pair; either can be
-overridden on the command line.
+Three build constants are env-overridable: `BEACON_URL` (what the inline beacon
+posts to), `SITE_HOST` (the hostname printed in the page's file `curl` lines,
+and the `resource` the Worker names in its x402 envelope) and `API_HOST` (the
+host printed in the `/check` and `/convert` `curl` lines — a different port in
+the demo, the same host in production). `build:demo` defaults all three to the
+local pair.
+
+Exercise the API:
+
+```bash
+curl "http://localhost:8787/check?from=markdown&to=html"
+curl -X POST "http://localhost:8787/convert/md-html" --data-binary @README.md
+curl -sD- -o/dev/null -X POST http://localhost:8787/convert/html-markdown --data-binary '<h1>hi</h1>'
+```
 
 Open <http://localhost:4173>, click an outbound link, then read the events back:
 
@@ -64,8 +122,11 @@ npx wrangler d1 execute DB --local \
   --command "SELECT ts, type, id_hash, entry, ref_class FROM events ORDER BY ts DESC LIMIT 20;"
 ```
 
-`npm run build` (no `BEACON_URL`) is the production build: the beacon URL is the
-relative `/b`, which is what the deployed page must ship.
+`npm run build` with no overrides is the production build: the beacon URL is the
+relative `/b`, and `worker/catalog.generated.js` carries the production
+`SITE_BASE`. **Always re-run it before committing or deploying** — a
+`build:demo` run leaves localhost in the generated file, and the build prints a
+warning saying so.
 
 ## Deploy runbook
 
@@ -74,7 +135,7 @@ been created, nothing is deployed, no Cloudflare login has happened.
 
 ```text
 DEPLOY, in order:
- 1. Create repo. Entries file (30 draft entries for owner review) + build
+ 1. Create repo. Entries file (33 draft entries for owner review) + build
     step emitting page, catalog.json, llms.txt, llms-full.txt, how-we-count
     note, privacy note. Every entry carries a `verified` date.
  2. Pages project from the repo, named `lemon-toolshed` — STATIC ASSETS
@@ -82,12 +143,13 @@ DEPLOY, in order:
     path.
  3. Custom hostname on the lemon-agent.dev zone: toolshed.lemon-agent.dev.
     An off-zone deploy re-fails checklist item 2. The same hostname is the
-    `SITE_HOST` build constant, so the *For agents* curl lines match it.
+    `SITE_HOST` build constant, so the curl lines and the x402 `resource`
+    match it.
  4. D1: events / daily_aggregates / blocklist / salt.
- 5. Beacon Worker, route POST <host>/b on the zone, D1 binding; the page
-    addresses it by RELATIVE URL.
- 6. Rate-limiting rule — the zone's one Free rule: path /b, 5 req / 10 s per
-    IP, action block.
+ 5. API Worker, routes /b + /check + /convert/* on the zone, D1 binding; the
+    page addresses the beacon by RELATIVE URL.
+ 6. Rate-limiting rule — the zone's one Free rule: 5 req / 10 s per IP,
+    action block, over /b AND /convert/* (expression below). NOT /check.
  7. Access-lock the production *.pages.dev twin (Pages Known-issues
     procedure).
  8. Configure the $25 billing alert; commit the route-disable runbook to the
@@ -96,9 +158,22 @@ DEPLOY, in order:
 10. Launch = beacon live. KC-CUR's 60-day clocks start that day.
 ```
 
+**Step 6, the rung-0 expression.** The original rule matched `/b` alone. It has
+to be widened, because `/convert/*` executes rungs 1 and 2 *inside* the Worker —
+a request they reject is already billed, and a conversion costs more CPU than a
+beacon does. `/check` is deliberately left out: it touches no D1 and does no
+work, so it stays cheap and open.
+
+```text
+(http.host eq "toolshed.lemon-agent.dev" and
+ (http.request.uri.path eq "/b" or starts_with(http.request.uri.path, "/convert/")))
+```
+
 Commands for steps 4–5, once the owner has picked the hostname:
 
 ```bash
+npm ci                                                  # wrangler bundles the Worker's deps
+npm run build                                           # regenerates worker/catalog.generated.js
 npx wrangler d1 create lemon_toolshed                   # copy the id into wrangler.toml
 npx wrangler d1 execute DB --remote --file worker/schema.sql
 # uncomment the routes = [...] block in wrangler.toml, then:
@@ -108,23 +183,94 @@ npx wrangler deploy
 Build output for step 2 is `dist/`, produced by `npm run build`. Pages build
 command: `npm ci && npm run build`; output directory: `dist`.
 
+### Installing the skill
+
+`skills/toolshed/SKILL.md` ships in the repo. Once the repo is published:
+
+```bash
+npx skills add <repo-url>          # TODO: no URL until the repo exists
+```
+
+Until then — and as the always-works fallback — copy the file into the agent's
+skills directory:
+
+```bash
+cp -r skills/toolshed ~/.claude/skills/
+```
+
+The page says the same thing, with the same TODO, rather than printing a command
+that does not work yet.
+
+## Payment (x402)
+
+The priced endpoint is `POST /convert/html-markdown` at $0.001 a call. It is the
+demonstration pair: one priced tool so there is a working x402 flow to point at,
+with everything else free.
+
+Two environment variables, both unset by default:
+
+| var | read? | effect |
+| --- | --- | --- |
+| `PAYTO` | yes | the receiving address (USDC on Base) named in the 402 envelope |
+| `FACILITATOR_URL` | **not yet** | reserved; settlement verification is unbuilt |
+
+Behaviour, exactly as implemented:
+
+| `PAYTO` | `X-PAYMENT` sent? | response |
+| --- | --- | --- |
+| unset | either | **200**, the conversion, header `x-pricing: pending` |
+| set | no | **402**, a spec-valid x402 v1 envelope |
+| set | yes | **200**, the conversion, `x-pricing: pending` + `x-payment-verified: false` |
+
+The third row is the honest one. Verifying a payment needs a facilitator; there
+isn't one wired up, and the Worker will not pretend to have checked something it
+cannot check. It says so in a header rather than silently accepting the call as
+paid. **Full enforcement lands with the facilitator** — until then, treat
+`PAYTO` as a way to exercise the 402 flow, not as revenue.
+
+The envelope (`x402Version: 1`) advertises `scheme: exact`, `network: base` and
+`asset` = USDC on Base (`0x8335…2913`). `maxAmountRequired` is in atomic units,
+6 decimals, so $0.001 is `"1000"`. The price lives in `entries.yaml` and the
+atomic conversion happens in the Worker, so changing the price is a one-line
+content edit.
+
+Set it for a local test without editing the file:
+
+```bash
+npx wrangler dev --local --port 8787 --var PAYTO:0xTEST
+```
+
 ## Shutdown runbook
 
 There is **no preventive spend cap** on Workers. The controls are detective: a
-$25 billing alert (step 8) plus this runbook. Disabling the route costs metrics
-and nothing else — the read surface is unmetered static Pages, so the directory
-stays up and the links keep working.
+$25 billing alert (step 8) plus this runbook.
+
+What a shutdown costs is no longer only metrics. The read surface is unmetered
+static Pages, so the page, the catalog files and every outbound link keep
+working — but the **hosted conversions go with the Worker**, and so does
+`/check`. Agents get connection failures, not a graceful answer. If the burn is
+coming from one conversion rather than all of them, prefer the narrow option:
 
 ```bash
-# Option A — remove the route and redeploy: comment out routes = [...] in
+# Option A (narrow) — set the offending entry's hosted.status to `planned` in
+# entries.yaml, then rebuild and redeploy. The route stops answering, the page
+# says "planned", and the rest of the shed stays up.
+npm run build && npx wrangler deploy
+
+# Option B — remove the /convert route only: drop that line from routes = [...]
+# in wrangler.toml, keeping the beacon and /check alive, then
+npx wrangler deploy
+
+# Option C — remove all routes and redeploy: comment out routes = [...] in
 # wrangler.toml, then
 npx wrangler deploy
 
-# Option B — delete the Worker outright (fastest, loses nothing but the beacon)
+# Option D — delete the Worker outright (fastest; loses the beacon, /check and
+# every hosted conversion)
 npx wrangler delete --name lemon-toolshed-beacon
 
-# Option C — dashboard: Workers & Pages → lemon-toolshed-beacon → Settings →
-# Domains & Routes → remove the /b route.
+# Option E — dashboard: Workers & Pages → lemon-toolshed-beacon → Settings →
+# Domains & Routes → remove the routes.
 ```
 
 Exposure while the alert is unanswered is roughly the $25 threshold plus burn ×
@@ -137,14 +283,16 @@ There is no admin page — an admin page is an auth surface, and this design's
 whole argument is that it has none. KC-CUR is read with `wrangler d1 execute`.
 Swap `--remote` for `--local` against the demo database.
 
-**Daily visits and outbound clicks** (the two legs, over the same
-script-executing population):
+**Daily visits, outbound clicks and conversions.** Visits and clicks come from
+the same script-executing population; conversions come from anything that can
+make an HTTP request, which is the point:
 
 ```bash
 npx wrangler d1 execute DB --remote --command "
   SELECT date(ts, 'unixepoch') AS day,
-         SUM(type = 'visit')   AS visits,
-         SUM(type = 'click')   AS clicks,
+         SUM(type = 'visit')    AS visits,
+         SUM(type = 'click')    AS clicks,
+         SUM(type = 'convert')  AS conversions,
          COUNT(DISTINCT id_hash) AS identifiers
   FROM events
   GROUP BY day
@@ -152,14 +300,16 @@ npx wrangler d1 execute DB --remote --command "
   LIMIT 60;"
 ```
 
-**Which pairs get clicked** — the only evidence that re-opens the deferred MCP
-surface:
+**Which tools actually get called** — the demand signal that decides what to
+host next, and the evidence that re-opens the deferred MCP surface:
 
 ```bash
 npx wrangler d1 execute DB --remote --command "
-  SELECT entry, COUNT(*) AS clicks
-  FROM events WHERE type = 'click' AND entry IS NOT NULL
-  GROUP BY entry ORDER BY clicks DESC LIMIT 30;"
+  SELECT entry,
+         SUM(type = 'convert') AS conversions,
+         SUM(type = 'click')   AS clicks
+  FROM events WHERE entry IS NOT NULL
+  GROUP BY entry ORDER BY conversions DESC, clicks DESC LIMIT 40;"
 ```
 
 **Compacted history**, for days whose raw rows have been pruned:
@@ -192,6 +342,11 @@ npx wrangler d1 execute DB --remote --command "
   FROM events WHERE type = 'click' GROUP BY 1
   ON CONFLICT(day, metric) DO UPDATE SET value = excluded.value;
 
+  INSERT INTO daily_aggregates (day, metric, value)
+  SELECT date(ts, 'unixepoch'), 'conversions', COUNT(*)
+  FROM events WHERE type = 'convert' GROUP BY 1
+  ON CONFLICT(day, metric) DO UPDATE SET value = excluded.value;
+
   DELETE FROM events WHERE ts < strftime('%s', 'now', '-90 days');"
 ```
 
@@ -208,38 +363,68 @@ npx wrangler d1 execute DB --remote --command "
   DELETE FROM blocklist WHERE ip = '203.0.113.9';"
 ```
 
-The beacon store has no equivalent purge, and that is the point: it holds a
+The events store has no equivalent purge, and that is the point: it holds a
 truncated daily-salted hash and nothing attributable to a requester once the
-salt has rotated.
+salt has rotated. That is true of conversion rows as well as beacon rows — and
+the conversion input was never written in the first place.
 
 ## Limits, as built
 
 | rung | where | control | failure mode |
 |---|---|---|---|
-| 0 | Cloudflare edge | rate-limiting rule on `/b`, 5 req / 10 s per IP, block | shared-IP undercount, recorded as a measurement cost |
-| 1 | Worker | 100 events / identifier / UTC day | honest runaway client stops counting; UA rotation still mints fresh identifiers |
-| 2 | Worker | 200,000 events / UTC day, fail-closed before insert | metrics loss for the rest of the day |
+| 0 | Cloudflare edge | rate-limiting rule on `/b` **and** `/convert/*`, 5 req / 10 s per IP, block | shared-IP undercount, recorded as a measurement cost |
+| 1 | Worker | 100 events / identifier / UTC day, over `/b` and `/convert/*` together | honest runaway client stops counting and stops converting; UA rotation still mints fresh identifiers |
+| 2 | Worker | 200,000 events / UTC day, fail-closed before insert | metrics loss and no conversions for the rest of the day |
 | 3 | — | none; priced, not bounded — $2.49/day at 100 req/s, $25.82/day at 1,000 req/s | detective only: $25 alert + shutdown runbook |
 
 Rung 0 is configured in the dashboard (deploy step 6), not in this repo. It is
 the zone's only Free rate-limiting rule, so a second instrumented house surface
-on `lemon-agent.dev` contends for it.
+on `lemon-agent.dev` contends for it. **Its expression must cover `/convert/*`
+as well as `/b`** — the expression is in the deploy runbook above.
 
 Rungs 1 and 2 execute inside the Worker, so a request they reject is already
-billed. CPU is metered separately from requests, which is why `worker/beacon.js`
-checks method, path and body size before it reads a body, hashes anything, or
-touches D1.
+billed. CPU is metered separately from requests, which is why
+`worker/beacon.js` checks method, path and body size before it reads a body,
+hashes anything, touches D1, or runs a conversion.
+
+**Rungs 1 and 2 share one set of counters across all three routes.** A
+conversion writes an `events` row exactly like a beacon event does, because the
+rungs count rows: a conversion that wrote nothing would not be rate-limited at
+all. Two consequences worth knowing before launch:
+
+- The per-identifier budget is **100 events a day total**, not 100 of each. A
+  caller that loads the page and then makes 99 conversions is done for the day.
+  If conversion demand turns out to be real, this is the first number to split.
+- Daily visit counts now include callers who never load the page, so the
+  `type` column is what separates them. The operator queries above already do.
+
+`GET /check` is the exception: no D1, no row, no rung. It is a pure in-memory
+filter over the catalog compiled into the bundle, so it stays cheap and open.
+
+### Failing closed on `/convert`
+
+`/b` and `/convert` disagree on purpose about what to do when the store is
+unreachable. `/b` drops the event silently — metrics loss is the acceptable
+failure. `/convert` answers **503**. Failing open on a metered endpoint is
+precisely the runaway-cost scenario rung 3 has no mechanism for, so an
+unavailable limiter means no conversions rather than unlimited ones.
 
 ## Count integrity and privacy, as published
 
 The bot policy is on the page verbatim: *the count is script-executing clients
 minus self-declared bots; thresholds are set so crawler residue does not clear
 them alone; no claim to perfect human detection is made.* Self-declared bot
-user-agents are dropped before any write.
+user-agents are dropped before any write. That filter applies to `/b`; a
+conversion call is counted whatever its user-agent claims, because it is a real
+call rather than an audience measurement.
 
-Two stores, two subject-rights answers, both stated on the page: the beacon
+Two stores, two subject-rights answers, both stated on the page: the counting
 store holds a truncated daily-salted hash and nothing attributable once the salt
 rotates; the IP blocklist is attributable and is purged on request.
+
+**Conversion inputs are never stored.** The `events` row records that a call
+happened, which tool it used, and the day-scoped hash — never the body. The page
+says so in *How we count* and again in *Privacy*.
 
 One dependency of the anonymization argument is flagged in the dossier and
 unresolved here: *whether D1's own point-in-time restore retains overwritten
@@ -253,5 +438,17 @@ recomputable forever, which is the negation of discarded-at-rotation.
 The refresh pass is ~4 h/month: re-check the verdicts, bump `verified`, and open
 a PR. `build.mjs` prints a `STALE` warning for any entry whose `verified` date is
 more than 35 days old and marks it *review due* on the page, so staleness is
-visible in the build rather than discovered by a reader. A CI link-check over
-every `url` is the other half of that automation and is **not built yet**.
+visible in the build rather than discovered by a reader.
+
+Two pieces of that automation are **not built yet**: a CI link-check over every
+`url`, and a smoke test that posts a known payload to each hosted endpoint and
+diffs the output. The second one matters more now — a local reference entry that
+rots is a stale opinion, but a hosted endpoint that rots is a broken product.
+Until it exists, the hosted endpoints are exercised by hand against
+`wrangler dev --local`; the commands are in [Local demo](#local-demo).
+
+Adding a hosted tool is four steps: add the `hosted:` block in `entries.yaml`,
+add the matching entry to `CONVERTERS` in `worker/beacon.js`, run `npm run build`
+(which regenerates `worker/catalog.generated.js`), and deploy. The build fails
+if `hosted.path` and the entry id disagree; the Worker answers `501` if an entry
+is listed `live` with no implementation behind it.

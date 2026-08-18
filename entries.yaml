@@ -1,10 +1,25 @@
 # DRAFT for owner review — curation is an owner-taste surface; entries are proposals.
 #
 # Editorial stance: prefer the deterministic tool wherever it suffices; reach for a
-# model only when the target is judgment-defined. Every entry is a verdict, not a
-# listing. `kind: model` means the tool is a model (local or hosted), not that the
-# job is unsolvable deterministically — the `escalate` line is where model use is
-# honestly located. All verdicts are engineering judgment, not measurement.
+# model only when the target is judgment-defined. `kind: model` means the tool is a
+# model (local or hosted), not that the job is unsolvable deterministically — the
+# `escalate` line is where model use is honestly located. All verdicts are
+# engineering judgment, not measurement.
+#
+# Two optional blocks decide what an entry is:
+#
+#   hosted:              # present = we run this conversion on our server
+#     path: "/convert/<id>"   # must equal /convert/ + the entry id
+#     price: free             # or {amount_usd: 0.001, scheme: exact}
+#     status: live            # or planned
+#
+#   local:               # how to run it on your own machine
+#     tool: pandoc            # optional; defaults to the top-level `tool`
+#     install: "brew install pandoc"
+#
+# An entry with no `hosted:` block is a local-only reference entry. The top-level
+# `install:` field still works and is read as `local.install`, so the entries that
+# predate this split need no edit.
 
 entries:
   - id: markdown-to-pdf
@@ -69,7 +84,7 @@ entries:
       faked with formatting and you want semantic headings inferred.
     verified: 2026-08-18
 
-  - id: html-file-to-markdown
+  - id: html-markdown
     x: "Saved HTML page / static HTML file"
     y: "Markdown"
     tool: pandoc
@@ -78,17 +93,52 @@ entries:
       For HTML already on disk, pandoc's reader is exact and fast, and `--wrap=none`
       keeps the output diff-friendly. Feeding a whole page to a model to "clean it up"
       burns tokens and invents heading levels; pandoc preserves precisely the structure
-      that is there.
-    install: "brew install pandoc"
+      that is there. The hosted endpoint runs Turndown instead of pandoc — same job, no
+      install — and is the one priced tool here, so there is a working x402 flow to
+      point at rather than a description of one.
+    local:
+      tool: pandoc
+      install: "brew install pandoc"
     url: "https://pandoc.org"
     caveats: >-
       Pandoc converts everything, including nav, ads and cookie banners — pre-strip with
       a readability-style extractor (trafilatura, readability-lxml) if you only want the
-      article body.
+      article body. The hosted endpoint has the same blind spot.
     escalate: >-
       Never for the markup. Boilerplate removal is a heuristic problem first; a model is
       a last resort for pages where the article body is genuinely ambiguous.
     verified: 2026-08-18
+    hosted:
+      path: "/convert/html-markdown"
+      price:
+        amount_usd: 0.001
+        scheme: exact
+      status: live
+
+  - id: md-html
+    x: "Markdown"
+    y: "HTML"
+    tool: pandoc
+    kind: deterministic
+    verdict: >-
+      Markdown to HTML is a solved parse, so the only real questions are which dialect
+      and which extensions. Pandoc is the local answer and handles tables, footnotes and
+      math; the hosted endpoint runs `marked` over CommonMark plus GitHub tables, which
+      is what most agents actually want when they say "render this Markdown".
+    local:
+      tool: pandoc
+      install: "brew install pandoc"
+    url: "https://pandoc.org"
+    caveats: >-
+      The hosted endpoint emits an HTML fragment, not a full document — no `<html>`,
+      no stylesheet. It does not sanitize: raw HTML in the input passes through, so do
+      not render untrusted output into a page without sanitizing it yourself.
+    escalate: "Never."
+    verified: 2026-08-18
+    hosted:
+      path: "/convert/md-html"
+      price: free
+      status: live
 
   - id: rendered-dom-to-markdown
     x: "Live DOM in a browser or headless page (JS-rendered)"
@@ -241,24 +291,83 @@ entries:
     escalate: "Never."
     verified: 2026-08-18
 
-  - id: json-to-yaml
+  - id: json-yaml
     x: "JSON"
-    y: "YAML (and back)"
+    y: "YAML"
     tool: yq
     kind: deterministic
     verdict: >-
-      mikefarah's yq speaks both formats natively (`yq -P`, `yq -o=json`) and preserves
-      comments through YAML edits, which is the whole reason to use it on real config
-      files. Round-tripping a Kubernetes manifest through a `json.load`/`yaml.dump`
-      one-liner destroys every comment in it and reorders keys for good measure.
-    install: "brew install yq"
+      mikefarah's yq speaks both formats natively (`yq -P`) and preserves comments
+      through YAML edits, which is the whole reason to use it on real config files. The
+      hosted endpoint is the no-install version for the common case: valid JSON in,
+      block-style YAML out.
+    local:
+      tool: yq
+      install: "brew install yq"
     url: "https://github.com/mikefarah/yq"
     caveats: >-
       Two unrelated tools are named yq — the Go one (mikefarah) and a Python jq wrapper
-      (kislyuk); the flags differ, so pin which one your scripts assume. Comment
-      preservation is good, not perfect, under heavy restructuring.
+      (kislyuk); the flags differ, so pin which one your scripts assume. The hosted
+      endpoint has no comments to preserve, because JSON has none.
     escalate: "Never."
     verified: 2026-08-18
+    hosted:
+      path: "/convert/json-yaml"
+      price: free
+      status: live
+
+  - id: yaml-json
+    x: "YAML"
+    y: "JSON"
+    tool: yq
+    kind: deterministic
+    verdict: >-
+      `yq -o=json` is the local answer, and the direction that bites is this one: YAML
+      is the larger language, so anchors, multi-document streams and unquoted `no`/`yes`
+      all have to land somewhere in JSON. The hosted endpoint takes the first document
+      of a stream and resolves anchors, which is what a config-reading agent wants.
+    local:
+      tool: yq
+      install: "brew install yq"
+    url: "https://github.com/mikefarah/yq"
+    caveats: >-
+      Multi-document YAML collapses to its first document on the hosted endpoint — use
+      local yq if you need all of them. YAML dates and other non-JSON scalar types are
+      stringified.
+    escalate: "Never."
+    verified: 2026-08-18
+    hosted:
+      path: "/convert/yaml-json"
+      price: free
+      status: live
+
+  - id: csv-json
+    x: "CSV"
+    y: "JSON"
+    tool: csvkit
+    kind: deterministic
+    verdict: >-
+      `csvjson data.csv` turns a header row plus records into an array of objects, which
+      is the shape almost everything downstream wants. The hosted endpoint does the same
+      thing with an RFC-4180 parser, so quoted commas and embedded newlines survive —
+      which is exactly what a split-on-comma one-liner gets wrong.
+    local:
+      tool: csvkit
+      install: "pip install csvkit"
+    url: "https://csvkit.readthedocs.io"
+    caveats: >-
+      Every value comes out a string; the hosted endpoint does not guess types, because
+      guessing is where leading zeros and long IDs get destroyed. Rows shorter than the
+      header are padded with empty strings, and a row with more fields than the header
+      is an error rather than a silent truncation.
+    escalate: >-
+      Never for the parse. Deciding what the columns *mean* — see messy-csv-to-clean-csv
+      — is the judgment half.
+    verified: 2026-08-18
+    hosted:
+      path: "/convert/csv-json"
+      price: free
+      status: live
 
   - id: json-reshape
     x: "Nested JSON from an API"

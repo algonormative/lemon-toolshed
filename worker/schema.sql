@@ -1,4 +1,4 @@
--- Toolshed beacon store (D1). Four tables plus one counter row per day.
+-- Toolshed store (D1). Four tables plus one counter row per day.
 --
 -- Retention is an operator chore, not a cron (the Worker exports no `scheduled`
 -- handler by design). The queries that enforce the published retention promises
@@ -7,12 +7,17 @@
 -- Raw events. ~200 bytes a row. Kept 90 days at most, then compacted into
 -- daily_aggregates and deleted. `id_hash` is the first 16 hex chars of
 -- SHA-256(daily_salt + ip + ua) — unlinkable once the day's salt is overwritten.
--- No IP, no user-agent and no raw referrer are ever written here.
+-- No IP, no user-agent and no raw referrer are ever written here, and no
+-- conversion input is ever written here.
+--
+-- One row per beacon event AND one row per accepted /convert call, because
+-- rungs 1 and 2 count rows: a conversion that wrote nothing here would not be
+-- rate-limited. That is why the three types share one table.
 CREATE TABLE IF NOT EXISTS events (
   ts        INTEGER,  -- unix seconds, UTC
-  type      TEXT,     -- 'visit' | 'click'
+  type      TEXT,     -- 'visit' | 'click' | 'convert'
   id_hash   TEXT,     -- truncated day-scoped hash
-  entry     TEXT,     -- entry id for clicks, NULL for visits
+  entry     TEXT,     -- entry id for clicks and conversions, NULL for visits
   ref_class TEXT      -- 'internal' | 'external' | 'none'
 );
 

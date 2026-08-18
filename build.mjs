@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 // Toolshed build step.
 //
-// Reads entries.yaml and emits the read surface into dist/:
-//   index.html      — the human page (shelves, have/need picker, how-we-count, privacy)
-//   catalog.json    — the machine surface, verbatim entry fields
-//   llms.txt        — the machine surface, one line per pair
-//   llms-full.txt   — the machine surface, full verdicts
+// Reads entries.yaml and emits:
+//   dist/index.html            — the page (picker, shelves, for-agents, notes)
+//   dist/catalog.json          — every field, including the hosted/local blocks
+//   dist/llms.txt              — one line per pair
+//   dist/llms-full.txt         — full verdicts
+//   worker/catalog.generated.js — the same catalog compiled into the API Worker,
+//                                 so GET /check needs no fetch, no KV and no D1
 //
-// Static output only. The Pages project ships static assets and ZERO Functions
-// (dossier § Limits): a Function re-opens the pages.dev twin's metered path.
+// The read surface is static. The Pages project ships static assets and ZERO
+// Functions (dossier § Limits): a Function re-opens the pages.dev twin's metered
+// path. The conversion endpoints live in the Worker, not in Pages.
 //
 // Dependency: js-yaml. Nothing else.
 
@@ -26,19 +29,29 @@ const DIST = join(ROOT, 'dist');
 // Override for the local demo: BEACON_URL=http://localhost:8787/b
 const BEACON_URL = process.env.BEACON_URL || '/b';
 
-// Build-time constant. The hostname printed in the "For agents" curl lines.
+// Build-time constant. The hostname printed in the curl lines, and the host the
+// Worker names as the `resource` in its x402 payment envelope.
 // Override for the local demo: SITE_HOST=localhost:4173
-const HOST = process.env.SITE_HOST || 'toolshed.lemon-agent.dev';
+const HOST_DEFAULT = 'toolshed.lemon-agent.dev';
+const HOST = process.env.SITE_HOST || HOST_DEFAULT;
 // A demo host has to print a command that actually works, so the scheme follows
 // the host rather than being hard-coded to https.
 const SCHEME = /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(HOST) ? 'http' : 'https';
 const BASE = `${SCHEME}://${HOST}`;
 
+// The Worker answers /convert and /check on the API host. In the local demo the
+// page is served on one port and the Worker on another, so the printed curl
+// lines have to point at the Worker rather than at the page.
+// Override for the local demo: API_HOST=localhost:8787
+const API_HOST = process.env.API_HOST || HOST;
+const API_SCHEME = /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(API_HOST) ? 'http' : 'https';
+const API_BASE = `${API_SCHEME}://${API_HOST}`;
+
 const SITE_NAME = 'Toolshed';
 const HOUSE = 'Lemon';
 const KICKER = 'the Lemon';
-const STRAPLINE = 'Which tool, when. Every entry is a verdict, not a listing.';
-const TITLE = `${SITE_NAME} — which tool, when · ${HOUSE}`;
+const STRAPLINE = 'Server-hosted conversion tools. Agents pay per call with x402 — some tools are free.';
+const TITLE = `${SITE_NAME} — hosted conversion tools · ${HOUSE}`;
 
 // Refresh cadence is monthly (~4 h/month, dossier § Estimates). Entries whose
 // `verified` date predates it are flagged in the build (dossier § Components 7).
@@ -46,15 +59,18 @@ const STALE_AFTER_DAYS = 35;
 
 const KINDS = ['deterministic', 'model', 'hybrid'];
 const KIND_SET = new Set(KINDS);
-const REQUIRED = ['id', 'x', 'y', 'tool', 'kind', 'verdict', 'install', 'url', 'caveats', 'escalate', 'verified'];
+// `install` is required only when the entry has no `local:` block; see normalise().
+const REQUIRED = ['id', 'x', 'y', 'tool', 'kind', 'verdict', 'url', 'caveats', 'escalate', 'verified'];
 
-// The editorial stance, published on the page and in the machine surfaces.
+// The editorial stance. Plain sentences, published on the page and in the
+// machine surfaces.
 const STANCE =
-  'Every entry is a verdict, not a listing: the pair — what you have, what you need — ' +
-  'is the primary key, and the named tool is the one worth reaching for. The stance is ' +
-  'the deterministic tool wherever it suffices, and a model only where the target is ' +
-  'judgment-defined. Where a model genuinely earns its place, the escalate line says so ' +
-  'and says how narrow to keep it. All verdicts are engineering judgment, not measurement.';
+  'Each entry says which tool does the job, what it costs, and how to call it. ' +
+  'Some conversions run on our server and answer over HTTP; the rest are pointers ' +
+  'to a tool you install and run yourself. The preference is the plain deterministic ' +
+  'tool wherever one works, and a model only where the answer is a judgment call — ' +
+  'the escalate line on each entry says where that line falls. Every verdict is ' +
+  'engineering judgment, not measurement.';
 
 // Bot policy, verbatim from KC-CUR (dossier § Limits, "Count integrity").
 const BOT_POLICY =
@@ -90,6 +106,61 @@ function categoryOf(entry) {
   for (const [re, name] of CATEGORY_RULES) if (re.test(hay)) return name;
   return 'Other';
 }
+
+// Short labels for the two picker dropdowns. Ordered rules, first match wins,
+// matched against the lowercased field — the same idiom as CATEGORY_RULES, and
+// for the same reason: the mechanical derivation (strip parentheticals, lowercase)
+// leaves labels like "live dom in a browser or headless page" that nobody wants
+// in a <select>. Several source phrasings deliberately collapse onto one label.
+// Anything that falls through gets the mechanical form and a build warning, so
+// this table stays honest as entries are added.
+const LABEL_RULES = [
+  [/mojibake|legacy encoding/, 'legacy encoding'],
+  [/legacy ebook|mobi/, 'legacy ebook'],
+  [/scanned/, 'scanned pdf'],
+  [/digital-born/, 'digital-born pdf'],
+  [/searchable pdf/, 'searchable pdf'],
+  [/tables/, 'pdf tables'],
+  [/docx\/xlsx\/pptx/, 'office docs'],
+  [/messy document/, 'messy document'],
+  [/messy csv/, 'messy csv'],
+  [/clean, validated utf-8 csv/, 'clean csv'],
+  [/clean utf-8/, 'utf-8'],
+  [/image of text/, 'image of text'],
+  [/recorded speech/, 'recorded speech'],
+  [/live dom/, 'rendered dom'],
+  [/structured records/, 'structured records'],
+  [/structured metadata/, 'metadata json'],
+  [/transcript/, 'transcript'],
+  [/photo \/ video \/ pdf/, 'media file'],
+  [/heic/, 'heic photos'],
+  [/batch of source images/, 'images'],
+  [/web-sized/, 'web images'],
+  [/page images/, 'page images'],
+  [/plain text|layout-preserved/, 'plain text'],
+  [/ndjson/, 'json / ndjson'],
+  [/audio file/, 'audio file'],
+  [/mp3 or opus/, 'mp3 / opus'],
+  [/\bmarkdown\b/, 'markdown'],
+  [/\bhtml\b/, 'html'],
+  [/\bdocx\b/, 'docx'],
+  [/\bepub\b/, 'epub'],
+  [/\bxlsx\b/, 'xlsx'],
+  [/\bsvg\b/, 'svg'],
+  [/\bjpeg\b/, 'jpeg'],
+  [/\bpng\b/, 'png'],
+  [/\bmp4\b|h\.264/, 'mp4'],
+  [/\bwav\b|flac|arbitrary audio/, 'audio'],
+  [/\bvideo\b/, 'video'],
+  [/sqlite/, 'sqlite'],
+  [/\byaml\b/, 'yaml'],
+  [/\bjson\b/, 'json'],
+  [/\bcsv\b/, 'csv'],
+  [/\bpdf\b/, 'pdf'],
+];
+
+// File extension used in each hosted card's example curl, keyed by the x label.
+const SAMPLE_EXT = { markdown: 'md', html: 'html', json: 'json', yaml: 'yaml', csv: 'csv' };
 
 // ---------------------------------------------------------------- helpers
 
@@ -129,6 +200,32 @@ const daysSince = (isoDate) => {
 // entries.yaml dates may parse as JS Date (YAML 1.1 timestamps) or as strings.
 const asDate = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).trim());
 
+const labelWarnings = [];
+
+// The mechanical fallback: lowercase, drop parentheticals and trailing noise.
+function mechanicalLabel(field) {
+  return oneLine(String(field))
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[—–]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[.,;:]+$/, '')
+    .trim();
+}
+
+function labelOf(field, entryId, which) {
+  const hay = oneLine(String(field)).toLowerCase();
+  for (const [re, label] of LABEL_RULES) if (re.test(hay)) return label;
+  const fallback = mechanicalLabel(field);
+  labelWarnings.push(`${entryId}: no LABEL_RULES match for ${which} "${oneLine(field)}" — using "${fallback}"`);
+  return fallback;
+}
+
+const priceLabel = (price) =>
+  price === 'free' ? 'free' : `$${price.amount_usd}/call · x402`;
+
+const isFree = (hosted) => hosted && hosted.price === 'free';
+
 // ---------------------------------------------------------------- load
 
 const raw = yaml.load(readFileSync(join(ROOT, 'entries.yaml'), 'utf8'));
@@ -140,8 +237,10 @@ if (!entries.length) {
 
 const problems = [];
 const ids = new Set();
+
 for (const e of entries) {
   e.verified = asDate(e.verified);
+
   for (const f of REQUIRED) {
     if (!e[f] || !String(e[f]).trim()) problems.push(`${e.id || '(no id)'}: missing field "${f}"`);
   }
@@ -149,12 +248,50 @@ for (const e of entries) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(e.verified)) problems.push(`${e.id}: verified "${e.verified}" is not YYYY-MM-DD`);
   if (ids.has(e.id)) problems.push(`${e.id}: duplicate id`);
   ids.add(e.id);
+
+  // `local:` is the new home for the install one-liner. A bare top-level
+  // `install:` is the older form and still works — it is read as local.install,
+  // so entries written before the split need no edit.
+  const localInstall = (e.local && e.local.install) || e.install;
+  if (!localInstall || !String(localInstall).trim()) {
+    problems.push(`${e.id}: needs an install one-liner — either "install:" or "local: { install: ... }"`);
+  }
+  e._local = localInstall
+    ? { tool: String((e.local && e.local.tool) || e.tool), install: oneLine(localInstall) }
+    : null;
+
+  // `hosted:` is optional. Present means we run the conversion ourselves.
+  e._hosted = null;
+  if (e.hosted) {
+    const h = e.hosted;
+    const wantPath = `/convert/${e.id}`;
+    if (h.path !== wantPath) problems.push(`${e.id}: hosted.path "${h.path}" must be "${wantPath}"`);
+    if (h.status !== 'live' && h.status !== 'planned') {
+      problems.push(`${e.id}: hosted.status "${h.status}" is not live|planned`);
+    }
+    let price;
+    if (h.price === 'free') {
+      price = 'free';
+    } else if (h.price && typeof h.price === 'object' && typeof h.price.amount_usd === 'number') {
+      if (!(h.price.amount_usd > 0)) problems.push(`${e.id}: hosted.price.amount_usd must be > 0`);
+      price = { amount_usd: h.price.amount_usd, scheme: String(h.price.scheme || 'exact') };
+    } else {
+      problems.push(`${e.id}: hosted.price must be "free" or { amount_usd, scheme }`);
+      price = 'free';
+    }
+    e._hosted = { path: wantPath, price, status: h.status };
+  }
+
+  e._xlabel = labelOf(e.x, e.id, 'x');
+  e._ylabel = labelOf(e.y, e.id, 'y');
 }
+
 if (problems.length) {
   console.error('build: entries.yaml failed validation');
   for (const p of problems) console.error(`  - ${p}`);
   process.exit(1);
 }
+for (const w of labelWarnings) console.warn(`build: LABEL — ${w}`);
 
 // Staleness surfacing (dossier § Components 7). No entry is dropped; the build
 // says which verdicts are due for the refresh pass, and the page marks them.
@@ -164,12 +301,33 @@ for (const e of stale) {
 }
 const isStale = (e) => daysSince(e.verified) > STALE_AFTER_DAYS;
 
-// Group by X-category, preserving source order inside each group.
+// Group by X-category. Hosted-live entries sort first inside a shelf; everything
+// else keeps source order.
 const grouped = new Map(CATEGORY_ORDER.map((c) => [c, []]));
 for (const e of entries) grouped.get(categoryOf(e)).push(e);
+const liveRank = (e) => (e._hosted && e._hosted.status === 'live' ? 0 : e._hosted ? 1 : 2);
+for (const list of grouped.values()) {
+  list.forEach((e, i) => {
+    e._order = i;
+  });
+  list.sort((a, b) => liveRank(a) - liveRank(b) || a._order - b._order);
+}
 const sections = CATEGORY_ORDER.map((c) => [c, grouped.get(c)]).filter(([, list]) => list.length);
 
+const hostedEntries = entries.filter((e) => e._hosted);
+const hostedLive = hostedEntries.filter((e) => e._hosted.status === 'live');
+const hostedFree = hostedEntries.filter((e) => isFree(e._hosted));
+const localOnly = entries.filter((e) => !e._hosted);
+const SUMMARY = `${hostedEntries.length} hosted (${hostedFree.length} free) · ${localOnly.length} local references.`;
+
 const BUILD_DATE = new Date().toISOString().slice(0, 10);
+
+const uniqueSorted = (values) => Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
+const xLabels = uniqueSorted(entries.map((e) => e._xlabel));
+const yLabels = uniqueSorted(entries.map((e) => e._ylabel));
+
+const sampleFor = (e) => `input.${SAMPLE_EXT[e._xlabel] || 'txt'}`;
+const convertCurl = (e) => `curl -X POST "${API_BASE}${e._hosted.path}" --data-binary @${sampleFor(e)}`;
 
 // ---------------------------------------------------------------- css
 
@@ -246,6 +404,7 @@ h1 {
 h2 { font-size: clamp(1.35rem, 3.2vw, 1.7rem); font-weight: 700; line-height: 1.25; letter-spacing: -0.02em; margin: 3rem 0 0.9rem; }
 h2::before { content: '// '; color: var(--accent-ink); }
 h3 { font-size: 1.05rem; font-weight: 700; line-height: 1.3; margin: 0 0 0.5rem; letter-spacing: -0.01em; }
+h4 { font-size: 0.95rem; font-weight: 700; margin: 1.6rem 0 0.4rem; }
 
 code {
   font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
@@ -293,17 +452,19 @@ code {
   color: var(--muted); font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase;
   font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
 }
-.field input {
+.field select, .field input {
   font: inherit; font-size: 0.98rem; width: 100%; min-width: 0;
   padding: 0.55rem 0.7rem;
   color: var(--ink); background: var(--card);
   border: 1px solid var(--border); border-radius: 6px;
 }
-.field input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent-hover); }
+.field select:focus, .field input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent-hover); }
 .picker-arrow {
   color: var(--accent-ink); font-size: 2rem; line-height: 1; padding-bottom: 0.4rem;
   flex: 0 0 auto; user-select: none;
 }
+.search-field { margin: 0.7rem 0 0; }
+.search-field label { display: block; }
 .count-line {
   margin: 0.9rem 0 0; color: var(--muted);
   font-family: ui-monospace, Menlo, Monaco, Consolas, monospace; font-size: 0.82rem;
@@ -333,6 +494,11 @@ code {
 }
 .clear-btn:hover { color: var(--accent-hover); }
 .empty { color: var(--muted); font-style: italic; margin: 1.5rem 0 0; }
+.summary {
+  margin: 1.5rem 0 0; font-weight: 700;
+  font-family: ui-monospace, Menlo, Monaco, Consolas, monospace; font-size: 0.86rem;
+  color: var(--accent-ink);
+}
 
 /* ---- shelves --------------------------------------------------------- */
 .shelf { margin: 0; }
@@ -353,11 +519,15 @@ code {
   scroll-margin-top: 1.5rem;
   display: flex; flex-direction: column;
 }
+/* Hosted-live cards carry a subtle tint, so the tools we actually run read
+   differently from the tools we only point at. */
+.card.is-hosted { background: var(--accent-soft); border-color: var(--accent-hover); }
 .card:hover, .card:target {
   border-color: var(--accent-hover);
   background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent-soft) 55%, transparent);
 }
+.card.is-hosted:hover, .card.is-hosted:target { background: var(--accent-soft); }
 .pair { display: block; }
 .pair .arrow { color: var(--accent-ink); padding: 0 0.3em; }
 .toolrow {
@@ -381,6 +551,23 @@ code {
 .kind-deterministic { background: var(--accent-soft); color: var(--accent-ink); }
 .kind-model { background: transparent; color: var(--accent-ink); border: 1px dashed var(--border); }
 .kind-hybrid { background: var(--accent-soft); color: var(--accent-ink); border: 1px dashed var(--accent-hover); }
+
+/* ---- hosted row ------------------------------------------------------ */
+.hostedrow {
+  margin: 0 0 0.5rem;
+  display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap;
+}
+/* Deliberately NOT uppercased, unlike .kind: the pill carries "x402" and
+   "$0.001/call", and shouting them as X402 misspells a protocol name. */
+.pill {
+  flex: 0 0 auto;
+  font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em;
+  font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
+  padding: 0.12em 0.55em; border-radius: 3px;
+}
+.pill-free { background: var(--accent); color: var(--chip-ink); }
+.pill-paid { background: transparent; color: var(--accent-ink); border: 1px solid var(--accent-hover); }
+.pill-planned { background: transparent; color: var(--muted); border: 1px dashed var(--border); }
 
 .verdict {
   margin: 0 0 0.5rem; font-size: 0.94rem; line-height: 1.55;
@@ -418,14 +605,13 @@ details[open].more .lbl-less { display: inline; }
   border-radius: 6px; padding: 0.45rem 0.5rem 0.45rem 0.7rem;
   margin: 0 0 0.75rem;
 }
-/* Inside a card the install row is pushed to the bottom, so installs and
-   verified dates line up across a grid row however the verdicts clamp. */
-.card > .cmd { margin-top: auto; }
 .cmd code {
   flex: 1 1 auto; min-width: 0;
   background: none; color: var(--term-ink); padding: 0;
   font-size: 0.8rem; white-space: pre; overflow-x: auto;
 }
+.cmd-sm { padding: 0.3rem 0.4rem 0.3rem 0.6rem; margin-bottom: 0.4rem; }
+.cmd-sm code { font-size: 0.74rem; }
 .copy {
   flex: 0 0 auto; cursor: pointer;
   font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
@@ -437,6 +623,13 @@ details[open].more .lbl-less { display: inline; }
 .copy:hover { border-color: var(--accent); color: var(--accent); }
 .copy.copied { background: var(--accent); color: var(--chip-ink); border-color: var(--accent); }
 .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ---- the local fallback block, pushed to the card's bottom ------------ */
+.localblock { margin-top: auto; padding-top: 0.5rem; }
+.local-label {
+  margin: 0 0 0.3rem; color: var(--muted); font-size: 0.78rem;
+}
+.local-label .tool { font-size: 0.82rem; }
 
 .cardfoot {
   margin: 0; padding-top: 0.6rem; border-top: 1px solid var(--border);
@@ -492,9 +685,9 @@ const BEACON_JS = `
 })();
 `.trim();
 
-// Progressive enhancement: the have/need picker, the shelf and kind chips, and
-// the install copy buttons. Sends nothing anywhere — the beacon is the only
-// network client on this page, and it counts two events, neither of them here.
+// Progressive enhancement: the have/need dropdowns, the search box, the shelf
+// and kind chips, and the copy buttons. Sends nothing anywhere — the beacon is
+// the only network client on this page, and it counts two events, neither here.
 const ENHANCE_JS = `
 (function () {
   var doc = document;
@@ -511,6 +704,7 @@ const ENHANCE_JS = `
   ready(function () {
     var have = doc.getElementById('have');
     var need = doc.getElementById('need');
+    var q = doc.getElementById('q');
     var count = doc.getElementById('count');
     var clear = doc.getElementById('clear');
     var empty = doc.getElementById('no-matches');
@@ -523,14 +717,16 @@ const ENHANCE_JS = `
     var kindOn = {};
 
     function apply() {
-      var a = have ? have.value.trim().toLowerCase() : '';
-      var b = need ? need.value.trim().toLowerCase() : '';
+      var a = have ? have.value : '';
+      var b = need ? need.value : '';
+      var text = q ? q.value.trim().toLowerCase() : '';
       var shelfActive = any(shelfOn);
       var kindActive = any(kindOn);
       var shown = 0;
       cards.forEach(function (el) {
-        var hay = el.getAttribute('data-search') || '';
-        var ok = (!a || hay.indexOf(a) !== -1) && (!b || hay.indexOf(b) !== -1);
+        var ok = (!a || el.getAttribute('data-xlabel') === a) &&
+                 (!b || el.getAttribute('data-ylabel') === b);
+        if (ok && text) ok = (el.getAttribute('data-search') || '').indexOf(text) !== -1;
         if (ok && shelfActive) ok = !!shelfOn[el.getAttribute('data-shelf')];
         if (ok && kindActive) ok = !!kindOn[el.getAttribute('data-kind')];
         el.hidden = !ok;
@@ -541,11 +737,11 @@ const ENHANCE_JS = `
       });
       if (count) {
         count.textContent = shown === total
-          ? total + ' verdicts \\u00b7 ' + nShelves + ' shelves'
-          : shown + ' of ' + total + ' verdicts match';
+          ? total + ' tools \\u00b7 ' + nShelves + ' shelves'
+          : shown + ' of ' + total + ' tools match';
       }
       if (empty) empty.hidden = shown !== 0;
-      if (clear) clear.hidden = !(a || b || shelfActive || kindActive);
+      if (clear) clear.hidden = !(a || b || text || shelfActive || kindActive);
     }
 
     chips.forEach(function (btn) {
@@ -560,12 +756,14 @@ const ENHANCE_JS = `
       });
     });
 
-    if (have) have.addEventListener('input', apply);
-    if (need) need.addEventListener('input', apply);
+    if (have) have.addEventListener('change', apply);
+    if (need) need.addEventListener('change', apply);
+    if (q) q.addEventListener('input', apply);
     if (clear) {
       clear.addEventListener('click', function () {
         if (have) have.value = '';
         if (need) need.value = '';
+        if (q) q.value = '';
         chips.forEach(function (btn) {
           var map = btn.getAttribute('data-facet') === 'kind' ? kindOn : shelfOn;
           map[btn.getAttribute('data-value')] = false;
@@ -601,33 +799,75 @@ const ENHANCE_JS = `
 
 // ---------------------------------------------------------------- index.html
 
-function cmdRow(command, label) {
-  return `<div class="cmd"><code>${esc(command)}</code><button type="button" class="copy js-only" aria-label="${esc(label)}">copy</button></div>`;
+function cmdRow(command, label, extraClass = '') {
+  const cls = extraClass ? `cmd ${extraClass}` : 'cmd';
+  return `<div class="${cls}"><code>${esc(command)}</code><button type="button" class="copy js-only" aria-label="${esc(label)}">copy</button></div>`;
+}
+
+function hostedBlock(e) {
+  const h = e._hosted;
+  if (!h) return '';
+  const planned = h.status === 'planned';
+  const pillClass = planned ? 'pill-planned' : isFree(h) ? 'pill-free' : 'pill-paid';
+  const pillText = planned ? 'planned' : `hosted · ${priceLabel(h.price)}`;
+  const row = `          <p class="hostedrow">
+            <span class="pill ${pillClass}">${esc(pillText)}</span>
+            <span class="kind kind-${esc(e.kind)}">${esc(e.kind)}</span>
+          </p>`;
+  if (planned) return `${row}\n          <p class="note">Not live yet — run it locally for now.</p>`;
+  return `${row}\n          ${cmdRow(convertCurl(e), `Copy the convert command for ${oneLine(e.x)} to ${oneLine(e.y)}`)}`;
+}
+
+function localBlock(e) {
+  if (!e._local) return '';
+  const toolLink = `<a class="tool" href="${esc(e.url)}" data-entry="${esc(e.id)}" rel="noopener">${esc(e._local.tool)}</a>`;
+  if (e._hosted) {
+    return `          <div class="localblock">
+            <p class="local-label">Run it locally — ${toolLink}</p>
+            ${cmdRow(e._local.install, `Copy install command for ${e._local.tool}`, 'cmd-sm')}
+          </div>`;
+  }
+  return `          <div class="localblock">
+            <p class="local-label">local install</p>
+            ${cmdRow(e._local.install, `Copy install command for ${e._local.tool}`)}
+          </div>`;
 }
 
 function renderCard(e, shelfSlug) {
-  const search = esc(oneLine(`${e.x} ${e.y} ${e.tool} ${e.verdict}`).toLowerCase());
+  const search = esc(oneLine(`${e.x} ${e.y} ${e._xlabel} ${e._ylabel} ${e.tool} ${e.verdict}`).toLowerCase());
   const staleMark = isStale(e) ? ' stale' : '';
   const staleNote = isStale(e) ? ' · review due' : '';
-  return `        <article class="card" id="${esc(e.id)}"
+  const hostedState = e._hosted ? e._hosted.status : 'no';
+  const cardClass = e._hosted && e._hosted.status === 'live' ? 'card is-hosted' : 'card';
+  // Local-only cards keep the tool link and kind chip at the top, as before.
+  // Hosted cards lead with the hosted offer and carry the tool link in the
+  // secondary "Run it locally" block — every card still has exactly one
+  // [data-entry] link, which is what the beacon's click listener counts.
+  const topRow = e._hosted
+    ? ''
+    : `          <p class="toolrow">
+            <a class="tool" href="${esc(e.url)}" data-entry="${esc(e.id)}" rel="noopener">${esc(e.tool)}</a>
+            <span class="kind kind-${esc(e.kind)}">${esc(e.kind)}</span>
+          </p>\n`;
+  return `        <article class="${cardClass}" id="${esc(e.id)}"
           data-x="${esc(oneLine(e.x).toLowerCase())}"
           data-y="${esc(oneLine(e.y).toLowerCase())}"
+          data-xlabel="${esc(e._xlabel)}"
+          data-ylabel="${esc(e._ylabel)}"
           data-tool="${esc(String(e.tool).toLowerCase())}"
           data-kind="${esc(e.kind)}"
+          data-hosted="${esc(hostedState)}"
           data-shelf="${esc(shelfSlug)}"
           data-search="${search}">
           <h3 class="pair">${esc(oneLine(e.x))}<span class="arrow">&rarr;</span>${esc(oneLine(e.y))}</h3>
-          <p class="toolrow">
-            <a class="tool" href="${esc(e.url)}" data-entry="${esc(e.id)}" rel="noopener">${esc(e.tool)}</a>
-            <span class="kind kind-${esc(e.kind)}">${esc(e.kind)}</span>
-          </p>
-          <p class="verdict">${inline(e.verdict)}</p>
+${hostedBlock(e)}
+${topRow}          <p class="verdict">${inline(e.verdict)}</p>
           <details class="more">
             <summary><span class="lbl-more">more</span><span class="lbl-less">less</span></summary>
             <p class="meta"><span class="label">Caveats</span>${inline(e.caveats)}</p>
             <p class="meta"><span class="label">Escalate</span>${inline(e.escalate)}</p>
           </details>
-          ${cmdRow(oneLine(e.install), `Copy install command for ${e.tool}`)}
+${localBlock(e)}
           <p class="cardfoot"><span class="verified${staleMark}">verified ${esc(e.verified)}${staleNote}</span></p>
         </article>`;
 }
@@ -641,6 +881,11 @@ ${list.map((e) => renderCard(e, slug)).join('\n')}
       </div>
     </section>`;
 }
+
+const optionList = (labels) =>
+  ['<option value="">anything</option>', ...labels.map((l) => `<option value="${esc(l)}">${esc(l)}</option>`)].join(
+    '\n            '
+  );
 
 const shelfChips = sections
   .map(
@@ -675,7 +920,7 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(TITLE)}</title>
-<meta name="description" content="A curated directory of file-conversion tools at the use-case layer: which tool, when. Deterministic tool wherever it suffices; a model only where the target is judgment-defined.">
+<meta name="description" content="Server-hosted file and data conversion tools an agent can call over HTTP. Some are free; priced ones take payment per call with x402. Everything else is a pointer to a tool you install yourself.">
 <link rel="icon" href="${FAVICON}">
 <style>
 ${CSS}
@@ -705,15 +950,23 @@ ${NAV.map(([href, label]) => `      <a href="${href}">${esc(label)}</a>`).join('
       <div class="picker-fields">
         <div class="field">
           <label for="have">I have…</label>
-          <input id="have" type="search" autocomplete="off" placeholder="markdown · a scanned PDF · messy CSV">
+          <select id="have">
+            ${optionList(xLabels)}
+          </select>
         </div>
         <div class="picker-arrow" aria-hidden="true">&rarr;</div>
         <div class="field">
           <label for="need">I need…</label>
-          <input id="need" type="search" autocomplete="off" placeholder="a PDF · clean UTF-8 · a transcript">
+          <select id="need">
+            ${optionList(yLabels)}
+          </select>
         </div>
       </div>
-      <p class="count-line"><span id="count">${entries.length} verdicts · ${sections.length} shelves</span> <button type="button" class="clear-btn js-only" id="clear" hidden>clear</button></p>
+      <div class="field search-field">
+        <label for="q">Or search everything</label>
+        <input id="q" type="search" autocomplete="off" placeholder="pandoc · loudness · footnotes">
+      </div>
+      <p class="count-line"><span id="count">${entries.length} tools · ${sections.length} shelves</span> <button type="button" class="clear-btn js-only" id="clear" hidden>clear</button></p>
       <div class="chip-rows js-only">
         <div class="chip-row">
           <span class="row-label">Shelves</span>
@@ -724,20 +977,41 @@ ${NAV.map(([href, label]) => `      <a href="${href}">${esc(label)}</a>`).join('
         ${kindChips}
         </div>
       </div>
+      <p class="summary">${esc(SUMMARY)}</p>
     </div>
-    <p class="note">Install one-liners assume <code>brew</code>, <code>npm</code>, <code>pip</code> or <code>uv</code> on your PATH; each card's copy button hands you the exact command, and <a href="catalog.json">catalog.json</a> carries the same strings machine-readable.</p>
-    <p class="empty js-only" id="no-matches" hidden>No verdict matches that. Try a format name — pdf, csv, epub, docx.</p>
+    <p class="note">Hosted tools need nothing installed — post the file and read the answer. Local install lines assume <code>brew</code>, <code>npm</code>, <code>pip</code> or <code>uv</code> on your PATH; every copy button hands you the exact command, and <a href="catalog.json">catalog.json</a> carries the same strings machine-readable.</p>
+    <p class="empty js-only" id="no-matches" hidden>Nothing matches that pair. Try a broader option, or clear the filters.</p>
   </div>
 
 ${sections.map(renderShelf).join('\n')}
 
   <section class="prose" id="for-agents">
-    <h2>For agents</h2>
-    <p>This directory is machine-legible by design. The same verdicts a reader sees are published as files an agent can fetch in one request, with every field intact — no scraping, no HTML parsing, no key.</p>
+    <h2>For agents — install &amp; call</h2>
+    <p>There are two ways in. Install the skill so your agent knows these tools exist, or call the HTTP endpoints directly. Nothing here needs an account or a key.</p>
 
+    <h4>1. Install the skill</h4>
+    <div class="agent-row">
+      ${cmdRow('npx skills add <repo-url>', 'Copy the skill install command')}
+      <p class="note">TODO: the repo is not published yet, so there is no URL to paste here. Until it is, copy <code>skills/toolshed/SKILL.md</code> from the repo into your agent's skills directory.</p>
+    </div>
+
+    <h4>2. MCP</h4>
+    <p>No MCP server yet; the HTTP surface below is the whole API. If you want MCP, say so — the catalog is small on purpose.</p>
+
+    <h4>3. Check what is available, then convert</h4>
+    <div class="agent-row">
+      ${cmdRow(`curl "${API_BASE}/check?from=markdown&to=html"`, 'Copy the availability check command')}
+      <p class="note">Returns the matching pairs with their endpoint, price and status. <code>from</code> is matched against what you have, <code>to</code> against what you need. No parameters returns every hosted tool.</p>
+    </div>
+    <div class="agent-row">
+      ${cmdRow(`curl -X POST "${API_BASE}/convert/md-html" --data-binary @README.md`, 'Copy the convert command')}
+      <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB.</p>
+    </div>
+
+    <h4>4. The whole catalog as files</h4>
     <div class="agent-row">
       ${cmdRow(`curl ${BASE}/catalog.json`, 'Copy catalog.json fetch command')}
-      <p class="note">Structured entries — every field, including <code>install</code>.</p>
+      <p class="note">Structured entries — every field, including the hosted endpoint and the local install line.</p>
     </div>
     <div class="agent-row">
       ${cmdRow(`curl ${BASE}/llms.txt`, 'Copy llms.txt fetch command')}
@@ -748,24 +1022,28 @@ ${sections.map(renderShelf).join('\n')}
       <p class="note">Full verdicts, with caveats and escalate lines.</p>
     </div>
 
-    <p>Links on this page are plain <code>href</code>s to the tool, with no redirect and no interstitial. There is no API and no MCP server, by design — the three files above are the whole machine surface.</p>
+    <h4>5. Paying for a call</h4>
+    <p>Priced tools answer HTTP 402 with an x402 payment envelope (USDC on Base). Free-tier tools just answer. Pricing is per call; no accounts.</p>
+
+    <p>Links on this page are plain <code>href</code>s to the tool, with no redirect and no interstitial.</p>
   </section>
 
   <section class="prose" id="how-we-count">
     <h2>How we count</h2>
     <p>This page runs a small script that reports two things: that the page loaded, and which outbound link was clicked. Nothing else is collected — filtering and copying send nothing — and links are plain links, so they work with the script blocked.</p>
-    <p>The counting policy, stated plainly: ${esc(BOT_POLICY)}. Delivery of the click signal is best-effort, so the click number is a floor rather than a total.</p>
+    <p>Conversion calls are counted too: one row per call, recording that a call happened and which tool it used. The file you send is not stored and not logged.</p>
+    <p>Here is the counting policy in full: ${esc(BOT_POLICY)}. Click delivery is best-effort, so the click number is a floor rather than a total.</p>
   </section>
 
   <section class="prose" id="privacy">
     <h2>Privacy</h2>
-    <p>There are two stores here, and they have two different answers to a subject-rights request.</p>
-    <p><strong>The beacon store</strong> holds a truncated, daily-salted hash — not an address, not an identifier that survives the day. The salt is overwritten with fresh random bytes at the first request of each UTC day, and the overwrite is the discard: once the salt is gone, nothing in the store is attributable to a requester. Raw rows are kept 90 days at most, then compacted to aggregates and deleted.</p>
-    <p><strong>An IP blocklist</strong> exists for abuse defence. It is keyed on the address, is therefore attributable, and is purged on request; rows expire 90 days after last-seen.</p>
+    <p>There are two stores here, and they answer a "what do you hold on me" request differently.</p>
+    <p><strong>The counting store</strong> holds a short hash, not an address. The hash is salted with random bytes that are replaced at the first request of each UTC day, and replacing them is the deletion: once the old salt is gone, nothing in the store points back to anyone. Rows are kept 90 days at most, then reduced to daily totals and deleted. Files you send to a conversion endpoint are never written to it.</p>
+    <p><strong>An IP blocklist</strong> exists to stop abuse. It is keyed on the address, so it does identify a requester, and we delete an address on request; rows expire 90 days after they were last seen.</p>
   </section>
 
   <footer>
-    <p><span class="chip">${HOUSE}</span> ${SITE_NAME} — a ${HOUSE} field directory · built ${BUILD_DATE} · ${entries.length} verdicts, drafts under owner review.</p>
+    <p><span class="chip">${HOUSE}</span> ${SITE_NAME} — a ${HOUSE} field directory · built ${BUILD_DATE} · ${entries.length} entries, drafts under owner review.</p>
     <p>Provenance: mostly AI-generated, human-guided and reviewed. Verdicts are engineering judgment, not measurement. Entry set generated from <code>entries.yaml</code>.</p>
     <nav class="foot-nav" aria-label="Footer">
 ${NAV.map(([href, label]) => `      <a href="${href}">${esc(label)}</a>`).join('\n')}
@@ -781,30 +1059,59 @@ ${BEACON_JS}
 
 // ---------------------------------------------------------------- catalog.json
 
+const catalogEntry = (e) => ({
+  id: e.id,
+  x: oneLine(e.x),
+  y: oneLine(e.y),
+  xlabel: e._xlabel,
+  ylabel: e._ylabel,
+  tool: e.tool,
+  kind: e.kind,
+  verdict: oneLine(e.verdict),
+  hosted: e._hosted,
+  local: e._local,
+  install: e._local ? e._local.install : null, // retained for older readers
+  url: e.url,
+  caveats: oneLine(e.caveats),
+  escalate: oneLine(e.escalate),
+  verified: e.verified,
+});
+
 const catalog = {
   generated: new Date().toISOString(),
   source: 'entries.yaml',
-  entries: entries.map((e) => ({
-    id: e.id,
-    x: oneLine(e.x),
-    y: oneLine(e.y),
-    tool: e.tool,
-    kind: e.kind,
-    verdict: oneLine(e.verdict),
-    install: oneLine(e.install),
-    url: e.url,
-    caveats: oneLine(e.caveats),
-    escalate: oneLine(e.escalate),
-    verified: e.verified,
-  })),
+  api: {
+    base: API_BASE,
+    check: `${API_BASE}/check?from=<what you have>&to=<what you need>`,
+    convert: `${API_BASE}/convert/<id>`,
+    note: 'Entries with a hosted block run on our server. Priced ones answer HTTP 402 with an x402 envelope; free ones just answer. Entries without a hosted block are local-only references.',
+  },
+  entries: entries.map(catalogEntry),
 };
 
 // ---------------------------------------------------------------- llms.txt
 
+const hostedLine = (e) =>
+  e._hosted
+    ? `hosted ${e._hosted.status} ${priceLabel(e._hosted.price)} at POST ${e._hosted.path}`
+    : 'local only';
+
+const API_HEADER = [
+  `Availability check: GET ${API_BASE}/check?from=<what you have>&to=<what you need>`,
+  `  Field-bound substring match, case-insensitive: from is matched against the "have" side only,`,
+  `  to against the "need" side only. No parameters returns every hosted tool.`,
+  `Convert: POST ${API_BASE}/convert/<id> with the raw file as the body (256 KB cap).`,
+  `  The converted file comes back as the body, with the right Content-Type.`,
+  `Payment: priced tools answer HTTP 402 with an x402 envelope (USDC on Base). Free tools just answer.`,
+  `  No accounts, no keys, per-call pricing.`,
+];
+
 const llms = [
-  `# ${SITE_NAME} — which tool, when · a ${HOUSE} field directory`,
+  `# ${SITE_NAME} — hosted conversion tools · a ${HOUSE} field directory`,
   '',
-  `A curated directory of file-conversion tools at the use-case layer. The unit is the pair — what you have, what you need — not the tool: ${entries.length} pairs, each naming one tool worth reaching for, with the install line, the caveats that bite, and where a model is honestly warranted. Structured fields are in catalog.json alongside this file; the full verdicts, caveats and escalate lines are in llms-full.txt.`,
+  `Server-hosted conversion tools an agent can call over HTTP, plus local-only references for the jobs we do not host. ${SUMMARY} The unit is the pair — what you have, what you need. Structured fields are in catalog.json alongside this file; the full verdicts, caveats and escalate lines are in llms-full.txt.`,
+  '',
+  ...API_HEADER,
   '',
   `Editorial stance: ${STANCE}`,
   '',
@@ -812,7 +1119,7 @@ const llms = [
     `## ${category}`,
     ...list.map(
       (e) =>
-        `${oneLine(e.x)} -> ${oneLine(e.y)}: ${e.tool} (${e.kind}) — ${firstSentence(e.verdict)} — ${e.url}`
+        `${oneLine(e.x)} -> ${oneLine(e.y)} [${e.id}]: ${hostedLine(e)}; local ${e._local.tool} (${e.kind}) — ${firstSentence(e.verdict)} — ${e.url}`
     ),
     '',
   ]),
@@ -821,26 +1128,38 @@ const llms = [
 // ---------------------------------------------------------------- llms-full.txt
 
 const llmsFull = [
-  `# ${SITE_NAME} — which tool, when · a ${HOUSE} field directory`,
+  `# ${SITE_NAME} — hosted conversion tools · a ${HOUSE} field directory`,
   '',
   `Site: ${BASE}`,
+  `API: ${API_BASE}`,
   `Generated: ${BUILD_DATE}`,
-  `Source: entries.yaml — ${entries.length} verdicts across ${sections.length} shelves.`,
+  `Source: entries.yaml — ${entries.length} entries across ${sections.length} shelves. ${SUMMARY}`,
+  '',
+  ...API_HEADER,
   '',
   `Editorial stance: ${STANCE}`,
   '',
   'Every verdict below is engineering judgment, not measurement. Curation is an',
-  'owner-taste surface and these entries are drafts for review. The same fields are',
+  "owner-taste surface and these entries are drafts for review. The same fields are",
   'available as structured JSON in catalog.json.',
   '',
   ...sections.flatMap(([, list]) =>
     list.map((e) =>
       [
         `## ${oneLine(e.x)} -> ${oneLine(e.y)}`,
-        `tool: ${e.tool}`,
+        `id: ${e.id}`,
+        `hosted: ${e._hosted ? 'yes' : 'no'}`,
+        ...(e._hosted
+          ? [
+              `hosted_path: POST ${e._hosted.path}`,
+              `hosted_price: ${priceLabel(e._hosted.price)}`,
+              `hosted_status: ${e._hosted.status}`,
+            ]
+          : []),
+        `local_tool: ${e._local.tool}`,
+        `local_install: ${e._local.install}`,
         `kind: ${e.kind}`,
         `verdict: ${oneLine(e.verdict)}`,
-        `install: ${oneLine(e.install)}`,
         `caveats: ${oneLine(e.caveats)}`,
         `escalate: ${oneLine(e.escalate)}`,
         `url: ${e.url}`,
@@ -851,6 +1170,33 @@ const llmsFull = [
   ),
 ].join('\n');
 
+// ---------------------------------------------------------------- worker catalog
+
+// The Worker answers GET /check out of this file. Compiling the catalog into the
+// bundle is what keeps /check off D1, off KV and off any fetch — it is a pure
+// in-memory filter, which is why it is exempt from the rate-limit rungs.
+const workerCatalog = `// GENERATED by build.mjs from entries.yaml. Do not edit — run \`npm run build\`.
+//
+// Compiled into the Worker bundle so GET /check needs no fetch, no KV and no D1.
+// Regenerate and commit this file whenever entries.yaml changes, because
+// \`wrangler deploy\` reads it from disk.
+
+export const SITE_BASE = ${JSON.stringify(BASE)};
+
+export const CATALOG = ${JSON.stringify(
+  entries.map((e) => ({
+    id: e.id,
+    x: oneLine(e.x),
+    y: oneLine(e.y),
+    hosted: e._hosted,
+    local: e._local,
+    url: e.url,
+  })),
+  null,
+  2
+)};
+`;
+
 // ---------------------------------------------------------------- emit
 
 rmSync(DIST, { recursive: true, force: true });
@@ -859,10 +1205,20 @@ writeFileSync(join(DIST, 'index.html'), html);
 writeFileSync(join(DIST, 'catalog.json'), `${JSON.stringify(catalog, null, 2)}\n`);
 writeFileSync(join(DIST, 'llms.txt'), llms);
 writeFileSync(join(DIST, 'llms-full.txt'), llmsFull);
+writeFileSync(join(ROOT, 'worker', 'catalog.generated.js'), workerCatalog);
 
 console.log(`build: ${entries.length} entries on ${sections.length} shelves`);
 for (const [category, list] of sections) console.log(`  ${category}: ${list.length}`);
+console.log(`build: ${SUMMARY} ${hostedLive.length} hosted live`);
+for (const e of hostedLive) console.log(`  POST ${e._hosted.path} — ${priceLabel(e._hosted.price)}`);
 console.log(`build: beacon URL ${BEACON_URL}`);
 console.log(`build: site host ${BASE}`);
+console.log(`build: api host ${API_BASE}`);
+if (HOST !== HOST_DEFAULT) {
+  console.warn(
+    `build: WARNING — worker/catalog.generated.js now carries SITE_BASE ${BASE}, not the production host. ` +
+      'Run `npm run build` with no overrides before committing or deploying.'
+  );
+}
 console.log(`build: stale entries ${stale.length}`);
-console.log('build: wrote dist/index.html dist/catalog.json dist/llms.txt dist/llms-full.txt');
+console.log('build: wrote dist/index.html dist/catalog.json dist/llms.txt dist/llms-full.txt worker/catalog.generated.js');
