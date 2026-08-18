@@ -765,7 +765,7 @@ ${sections.map(renderShelf).join('\n')}
   </section>
 
   <footer>
-    <p><span class="chip">${HOUSE}</span> ${SITE_NAME} — a ${HOUSE} field directory · built ${BUILD_DATE} · ${entries.length} verdicts, every one reviewed by a human.</p>
+    <p><span class="chip">${HOUSE}</span> ${SITE_NAME} — a ${HOUSE} field directory · built ${BUILD_DATE} · ${entries.length} verdicts, drafts under owner review.</p>
     <p>Provenance: mostly AI-generated, human-guided and reviewed. Verdicts are engineering judgment, not measurement. Entry set generated from <code>entries.yaml</code>.</p>
     <nav class="foot-nav" aria-label="Footer">
 ${NAV.map(([href, label]) => `      <a href="${href}">${esc(label)}</a>`).join('\n')}
