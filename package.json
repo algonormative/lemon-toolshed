@@ -1,0 +1,19 @@
+{
+  "name": "lemon-x2y",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "X2Y — a curated conversion-tool directory at the use-case layer, under the Lemon house brand. Static read surface plus a beacon Worker.",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:demo": "BEACON_URL=http://localhost:8787/b node build.mjs",
+    "db:local": "wrangler d1 execute DB --local --file worker/schema.sql -y",
+    "dev:worker": "wrangler dev --local --port 8787",
+    "serve": "serve dist -l 4173"
+  },
+  "devDependencies": {
+    "js-yaml": "^4.1.0",
+    "serve": "^14.2.6",
+    "wrangler": "4.42.2"
+  }
+}

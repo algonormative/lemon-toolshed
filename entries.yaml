@@ -1,0 +1,613 @@
+# DRAFT for owner review — curation is an owner-taste surface; entries are proposals.
+#
+# Editorial stance: prefer the deterministic tool wherever it suffices; reach for a
+# model only when the target is judgment-defined. Every entry is a verdict, not a
+# listing. `kind: model` means the tool is a model (local or hosted), not that the
+# job is unsolvable deterministically — the `escalate` line is where model use is
+# honestly located. All verdicts are engineering judgment, not measurement.
+
+entries:
+  - id: markdown-to-pdf
+    x: "Markdown (with math, code blocks, citations)"
+    y: "PDF"
+    tool: pandoc
+    kind: deterministic
+    verdict: >-
+      Pandoc plus a Typst or LaTeX engine gives the same PDF on every run, with real
+      pagination, footnotes and cross-references. The naive alternative — print-to-PDF
+      from a Markdown previewer — loses footnote links and repaginates differently on
+      every machine, which shows up as a diff you can't reproduce.
+    install: "brew install pandoc typst"
+    url: "https://pandoc.org"
+    caveats: >-
+      PDF output needs an external engine; Typst is fast and light, LaTeX (texlive) is
+      heavy but still the only option for some journal templates.
+    escalate: >-
+      Never for the conversion. A model is only useful upstream — writing or
+      restructuring the Markdown before pandoc touches it.
+    verified: 2026-08-18
+
+  - id: markdown-to-docx
+    x: "Markdown"
+    y: "DOCX styled to a house template"
+    tool: pandoc
+    kind: deterministic
+    verdict: >-
+      `--reference-doc=template.docx` maps headings, tables and code blocks onto a real
+      Word style sheet, so a human reviewer gets an editable document instead of a wall
+      of Normal-styled text. Pasting rendered Markdown into Word is the failure mode:
+      styles arrive as direct formatting and the first edit shatters them.
+    install: "brew install pandoc"
+    url: "https://pandoc.org"
+    caveats: >-
+      Word-native features (comments, tracked changes, floats with anchors) don't
+      round-trip; you get clean structure, not pixel-matched design.
+    escalate: >-
+      Never — style mapping is a template problem, not a judgment problem. Rewriting
+      content for a different audience is a separate upstream step.
+    verified: 2026-08-18
+
+  - id: docx-to-markdown
+    x: "DOCX"
+    y: "Markdown + extracted media"
+    tool: pandoc
+    kind: deterministic
+    verdict: >-
+      Pandoc reads the DOCX XML directly, so headings, lists, tables and footnotes land
+      as real Markdown structure, and `--extract-media` writes embedded images to disk
+      instead of dropping them. Pasting a DOCX into a model to "convert it" is the
+      failure mode: you pay tokens for a plausible-looking file with quietly renumbered
+      lists and vanished tables.
+    install: "brew install pandoc"
+    url: "https://pandoc.org"
+    caveats: >-
+      Tracked changes and comments are discarded unless you pass `--track-changes=all`;
+      pseudo-headings faked with bold text stay paragraphs, because they were never
+      structure.
+    escalate: >-
+      Only when there is no structure to recover — a document where every heading was
+      faked with formatting and you want semantic headings inferred.
+    verified: 2026-08-18
+
+  - id: html-file-to-markdown
+    x: "Saved HTML page / static HTML file"
+    y: "Markdown"
+    tool: pandoc
+    kind: deterministic
+    verdict: >-
+      For HTML already on disk, pandoc's reader is exact and fast, and `--wrap=none`
+      keeps the output diff-friendly. Feeding a whole page to a model to "clean it up"
+      burns tokens and invents heading levels; pandoc preserves precisely the structure
+      that is there.
+    install: "brew install pandoc"
+    url: "https://pandoc.org"
+    caveats: >-
+      Pandoc converts everything, including nav, ads and cookie banners — pre-strip with
+      a readability-style extractor (trafilatura, readability-lxml) if you only want the
+      article body.
+    escalate: >-
+      Never for the markup. Boilerplate removal is a heuristic problem first; a model is
+      a last resort for pages where the article body is genuinely ambiguous.
+    verified: 2026-08-18
+
+  - id: rendered-dom-to-markdown
+    x: "Live DOM in a browser or headless page (JS-rendered)"
+    y: "Markdown"
+    tool: turndown
+    kind: deterministic
+    verdict: >-
+      When the content only exists after JavaScript runs, the conversion belongs where
+      the DOM is — Turndown runs in-page or in Node against a parsed DOM and takes
+      custom rules for app-specific markup. Fetching the raw HTML and running a static
+      converter gets you an empty shell.
+    install: "npm install turndown"
+    url: "https://github.com/mixmark-io/turndown"
+    caveats: >-
+      Smaller rule set than pandoc; tables need the GFM plugin and you own the escaping
+      edge cases.
+    escalate: >-
+      Never for markup. Use a model only to decide which region of a hostile app UI is
+      "the content" — then hand that node to turndown.
+    verified: 2026-08-18
+
+  - id: markdown-to-epub
+    x: "Markdown (multi-chapter manuscript)"
+    y: "EPUB 3"
+    tool: pandoc
+    kind: deterministic
+    verdict: >-
+      `pandoc -o book.epub` produces a valid EPUB with a real table of contents,
+      metadata and chapter splitting via `--split-level`; readers care about that
+      structure far more than typography. The naive path — export to PDF and sideload —
+      gives a fixed-layout file that is unreadable on a six-inch screen.
+    install: "brew install pandoc"
+    url: "https://pandoc.org"
+    caveats: >-
+      Run epubcheck before publishing; store-specific requirements (Apple, Kobo) go
+      beyond mere validity.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: video-to-portable-mp4
+    x: "Arbitrary video (any container/codec)"
+    y: "H.264 MP4 that plays everywhere"
+    tool: ffmpeg
+    kind: deterministic
+    verdict: >-
+      `-c:v libx264 -crf 20 -preset slow -c:a aac -movflags +faststart` is the boring
+      correct answer for delivery: CRF targets quality rather than a guessed bitrate,
+      and faststart lets playback begin before the file finishes downloading. GUI
+      "convert to MP4" presets routinely omit faststart, so web playback stalls until
+      the whole file lands.
+    install: "brew install ffmpeg"
+    url: "https://ffmpeg.org"
+    caveats: >-
+      CRF values are codec-relative — don't reuse an x264 number for x265 or AV1.
+      Hardware encoders are much faster and meaningfully worse per bit.
+    escalate: >-
+      Never. Encoding is math; the only judgment is your quality/size target, which is a
+      knob you set once.
+    verified: 2026-08-18
+
+  - id: video-to-audio-track
+    x: "Video file with an audio track"
+    y: "Audio file (m4a/wav)"
+    tool: ffmpeg
+    kind: deterministic
+    verdict: >-
+      `ffmpeg -i in.mp4 -vn -c:a copy out.m4a` lifts the existing audio stream with no
+      re-encode and no generation loss; switch to `-c:a pcm_s16le out.wav` only when the
+      next tool demands PCM. Reflexively re-encoding to MP3 adds a lossy generation for
+      nothing.
+    install: "brew install ffmpeg"
+    url: "https://ffmpeg.org"
+    caveats: >-
+      Stream copy needs a container that accepts the codec (AAC to .m4a, not .wav);
+      multi-track sources need an explicit `-map`.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: audio-transcode-and-normalize
+    x: "WAV / FLAC / arbitrary audio"
+    y: "MP3 or Opus at a fixed sample rate and loudness"
+    tool: ffmpeg
+    kind: deterministic
+    verdict: >-
+      ffmpeg does the format change, the resample (`-ar`) and loudness normalization
+      (`loudnorm`) in a single pass, which matters because chaining separate tools
+      resamples twice and compounds artifacts. For speech and web delivery Opus at a low
+      bitrate is clearly better than MP3 at the same size.
+    install: "brew install ffmpeg"
+    url: "https://ffmpeg.org"
+    caveats: >-
+      Single-pass loudnorm is approximate; use the two-pass measure-then-apply form when
+      you actually care about hitting a LUFS target.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: heic-to-jpeg
+    x: "HEIC/HEIF photos from an iPhone"
+    y: "JPEG"
+    tool: imagemagick
+    kind: deterministic
+    verdict: >-
+      `magick mogrify -format jpg -quality 88 *.heic` converts a folder in one line and
+      keeps EXIF, which matters when the timestamps are the reason you kept the photos.
+      Re-exporting through a photo app or a web converter tends to strip or rewrite
+      metadata — and uploading personal photos to a random site is a privacy trade you
+      probably didn't intend to make.
+    install: "brew install imagemagick libheif"
+    url: "https://imagemagick.org"
+    caveats: >-
+      Requires a libheif-enabled build (check `magick -list format | grep -i heic`);
+      slower and hungrier than libvips on large batches.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: bulk-image-resize
+    x: "Large batch of source images"
+    y: "Web-sized JPEG/WebP/AVIF derivatives"
+    tool: libvips
+    kind: deterministic
+    verdict: >-
+      `vipsthumbnail` streams through a batch on a small memory footprint and gets the
+      defaults right — shrink-on-load for JPEG, sane colour handling. The naive
+      `magick -resize` loop over thousands of files is where the out-of-memory kills and
+      the hour-long builds come from.
+    install: "brew install vips"
+    url: "https://www.libvips.org"
+    caveats: >-
+      Fewer effects and filters than ImageMagick; heavy compositing or annotation work
+      still belongs in ImageMagick, at its cost.
+    escalate: >-
+      Never for the resize. Picking crop focal points across a large library is the one
+      adjacent task where a model (saliency detection) earns its keep.
+    verified: 2026-08-18
+
+  - id: svg-to-png
+    x: "Static SVG"
+    y: "PNG at a chosen scale"
+    tool: resvg
+    kind: deterministic
+    verdict: >-
+      resvg renders an SVG to PNG with no browser and no JS runtime, so it runs in CI and
+      produces the same bytes run after run. Headless Chrome does the same job while
+      pulling in a browser-sized dependency and a screenshot timing race.
+    install: "cargo install resvg"
+    url: "https://github.com/linebender/resvg"
+    caveats: >-
+      Static SVG only — no scripting, no remote resource fetching, and web fonts must be
+      installed locally. `rsvg-convert` (librsvg) is the distro-packaged alternative.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: json-to-yaml
+    x: "JSON"
+    y: "YAML (and back)"
+    tool: yq
+    kind: deterministic
+    verdict: >-
+      mikefarah's yq speaks both formats natively (`yq -P`, `yq -o=json`) and preserves
+      comments through YAML edits, which is the whole reason to use it on real config
+      files. Round-tripping a Kubernetes manifest through a `json.load`/`yaml.dump`
+      one-liner destroys every comment in it and reorders keys for good measure.
+    install: "brew install yq"
+    url: "https://github.com/mikefarah/yq"
+    caveats: >-
+      Two unrelated tools are named yq — the Go one (mikefarah) and a Python jq wrapper
+      (kislyuk); the flags differ, so pin which one your scripts assume. Comment
+      preservation is good, not perfect, under heavy restructuring.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: json-reshape
+    x: "Nested JSON from an API"
+    y: "Flat JSON / NDJSON / CSV rows"
+    tool: jq
+    kind: deterministic
+    verdict: >-
+      jq is a real language for this: `-r`, `@csv`, `to_entries`, `group_by` cover most
+      reshapes in a line, and the result is an auditable program you can re-run on
+      tomorrow's payload. Asking a model to "reshape this JSON" produces an answer, not
+      a program — it doesn't survive the next record and quietly guesses on nulls.
+    install: "brew install jq"
+    url: "https://jqlang.github.io/jq/"
+    caveats: >-
+      Very large documents need `--stream` or NDJSON input; the syntax has a genuine
+      learning curve that people repeatedly underestimate.
+    escalate: >-
+      Use a model to *write the jq program* when the shape is unfamiliar — then keep the
+      program, drop the model, and put the program in version control.
+    verified: 2026-08-18
+
+  - id: messy-csv-to-clean-csv
+    x: "Messy CSV (ragged rows, BOM, mixed quoting, duplicate headers)"
+    y: "Clean, validated UTF-8 CSV"
+    tool: qsv
+    kind: deterministic
+    verdict: >-
+      `qsv input` normalizes quoting and line endings, and `validate`/`headers`/`dedup`
+      tell you what is actually wrong before the data reaches anything downstream — all
+      at streaming speed on files far past spreadsheet size. Opening it in Excel to "fix
+      it" is the classic failure: leading zeros vanish, long IDs become floats, and dates
+      get silently localized.
+    install: "brew install qsv"
+    url: "https://github.com/dathere/qsv"
+    caveats: >-
+      Some subcommands depend on how the binary was built (feature flags); csvkit is
+      slower but pip-installable everywhere and reads more input formats.
+    escalate: >-
+      Only when the fix requires meaning — deciding that "N/A", "-" and "" are the same
+      null, or that two differently-spelled columns are one field. Extract
+      deterministically, let a model propose the mapping, then encode that mapping as a
+      rule you can re-run.
+    verified: 2026-08-18
+
+  - id: xlsx-to-csv
+    x: "XLSX workbook (specific sheet)"
+    y: "CSV"
+    tool: csvkit
+    kind: deterministic
+    verdict: >-
+      `in2csv --sheet "Sheet2" book.xlsx` gets the sheet you asked for with stable typing
+      and scripts across a directory. Save-As-CSV in Excel exports only the active sheet,
+      applies the machine's locale to dates and separators, and cannot be automated —
+      which is how two people produce two different CSVs from one workbook.
+    install: "pip install csvkit"
+    url: "https://csvkit.readthedocs.io"
+    caveats: >-
+      Formulas export as their last cached value; merged cells and multi-row headers
+      still need reshaping. Very large workbooks are slow — `qsv excel` is the fast path.
+    escalate: >-
+      When the sheet is a human-formatted report rather than a table (title rows, merged
+      headers, stacked sub-tables), identifying the header row is genuine judgment: dump
+      deterministically first, then let a model name the header row and the sub-table
+      boundaries.
+    verified: 2026-08-18
+
+  - id: csv-to-sqlite
+    x: "Large CSV"
+    y: "Queryable SQLite database"
+    tool: sqlite3
+    kind: deterministic
+    verdict: >-
+      `.import --csv data.csv t` buys you indexes, joins and SQL over a file too big for
+      a spreadsheet, with no service and no ORM. Loading a multi-hundred-megabyte CSV
+      into pandas just to filter it is the naive alternative — paying RAM for work the
+      disk should be doing.
+    install: "built-in (macOS/most Linux); brew install sqlite for a current version"
+    url: "https://sqlite.org/cli.html"
+    caveats: >-
+      `.import` types every column as TEXT unless you create the table first — declare
+      the schema when numeric comparison matters. csvkit's `csvsql --db` infers types at
+      a large speed cost.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: sqlite-to-json
+    x: "SQLite query result"
+    y: "JSON / NDJSON for an API or an agent"
+    tool: sqlite3
+    kind: deterministic
+    verdict: >-
+      `sqlite3 -json db.sqlite "select ..."` (or `.mode json`) emits valid JSON straight
+      from the CLI, composes with jq in a pipe, and needs no serialization layer.
+      Hand-rolling a Python export script for this creates code you now have to maintain
+      and test.
+    install: "built-in"
+    url: "https://sqlite.org/cli.html"
+    caveats: >-
+      Needs a reasonably modern SQLite (3.33+) for the `-json` flag; check BLOB and NULL
+      handling before shipping the output anywhere.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: pdf-digital-born-to-text
+    x: "PDF (digital-born — has a text layer)"
+    y: "Plain text / layout-preserved text"
+    tool: pdftotext
+    kind: deterministic
+    verdict: >-
+      If `pdftotext -layout` returns real text, the job is already finished — the
+      characters are in the file and extraction is exact and instant. This is the entry
+      that governs the whole PDF branch of the directory: run pdftotext first on every
+      PDF, and only when it comes back empty or garbled does the file deserve OCR or a
+      model.
+    install: "brew install poppler"
+    url: "https://poppler.freedesktop.org"
+    caveats: >-
+      Multi-column and tabular layouts still interleave; `-layout` helps, and
+      `-bbox-layout` gives coordinates when you need to reconstruct columns yourself.
+    escalate: >-
+      Never for extraction. Escalate only for interpretation — turning extracted text
+      into a schema (see messy-doc-to-schema).
+    verified: 2026-08-18
+
+  - id: pdf-scanned-to-searchable
+    x: "PDF (scanned — page images, no text layer)"
+    y: "Searchable PDF + extractable text"
+    tool: ocrmypdf
+    kind: hybrid
+    verdict: >-
+      ocrmypdf adds an invisible text layer to the original pages, so the file stays a
+      faithful scan and becomes greppable and citable; `--skip-text` and `--redo-ocr`
+      make it safe to sweep a mixed directory. Pointing raw tesseract at the page images
+      throws the PDF away and leaves you a text blob nobody can cite a page number from.
+    install: "brew install ocrmypdf"
+    url: "https://ocrmypdf.readthedocs.io"
+    caveats: >-
+      OCR quality is bounded by scan quality — deskew and clean help, but phone photos of
+      curved pages stay bad. Slow and CPU-hungry on long documents.
+    escalate: >-
+      When accuracy matters on hard scans — handwriting, historical type, dense tables —
+      a vision model reads them better. Still run OCR first and keep its output as a
+      cross-check: OCR fails loudly, models fail by writing plausible words.
+    verified: 2026-08-18
+
+  - id: pdf-to-page-images
+    x: "PDF page(s)"
+    y: "PNG/JPEG page images"
+    tool: pdftoppm
+    kind: deterministic
+    verdict: >-
+      `pdftoppm -r 200 -png` renders pages reproducibly and is the correct pre-step
+      whenever OCR or a vision model is the next stage, because you control DPI, page
+      range and colour — which is exactly what downstream accuracy depends on.
+      Screenshotting pages by hand introduces cropping and scaling nobody wrote down.
+    install: "brew install poppler"
+    url: "https://poppler.freedesktop.org"
+    caveats: >-
+      300+ dpi over a long document produces very large files quickly; pick the lowest
+      DPI the downstream stage tolerates and record it.
+    escalate: >-
+      This pair is the deterministic half of a model workflow — the model comes after,
+      on the rendered images, never instead of the render.
+    verified: 2026-08-18
+
+  - id: pdf-tables-to-csv
+    x: "PDF with ruled or whitespace-aligned tables"
+    y: "CSV / DataFrame"
+    tool: camelot
+    kind: deterministic
+    verdict: >-
+      Camelot's lattice mode reconstructs cells from the table's actual ruling lines, so
+      on a bordered table it is exact rather than approximate; stream mode handles
+      whitespace-aligned tables with more supervision. Copy-pasting a table out of a PDF
+      viewer merges columns unpredictably and you won't notice until a number is wrong in
+      a report.
+    install: 'pip install "camelot-py[base]"'
+    url: "https://github.com/camelot-dev/camelot"
+    caveats: >-
+      Digital-born PDFs only; borderless tables need tuning, and the parse-accuracy
+      report is worth reading rather than trusting. tabula-java and pdfplumber are
+      reasonable alternatives with different failure shapes.
+    escalate: >-
+      Scanned tables, or tables whose header semantics are ambiguous, are legitimately
+      model work — render pages with pdftoppm, give the model the image, then validate
+      totals and row counts deterministically.
+    verified: 2026-08-18
+
+  - id: office-docs-to-pdf-batch
+    x: "DOCX/XLSX/PPTX (batch)"
+    y: "PDF"
+    tool: libreoffice
+    kind: deterministic
+    verdict: >-
+      `soffice --headless --convert-to pdf --outdir out/ *.docx` is the only free path
+      that renders Office layout faithfully enough to hand to someone, and it batches on
+      a server with no Office licence. Pandoc converts the content but is not a layout
+      engine — it will not preserve a deck's slides or a spreadsheet's pagination.
+    install: "brew install --cask libreoffice"
+    url: "https://www.libreoffice.org"
+    caveats: >-
+      Fidelity is high, not perfect: fonts must be installed on the host, and exotic
+      SmartArt or macro-driven content drifts. Concurrent runs need separate profiles via
+      `-env:UserInstallation=`.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: html-to-paginated-pdf
+    x: "HTML + CSS (invoice, report, generated page)"
+    y: "Paginated PDF"
+    tool: weasyprint
+    kind: deterministic
+    verdict: >-
+      WeasyPrint implements print CSS — `@page`, running headers, page counters — so a
+      report template paginates the same way in CI as on your laptop, with no browser in
+      the image. Headless Chrome does the same job but its output shifts with the Chrome
+      version, which is a bad property for anything invoice-shaped.
+    install: "pip install weasyprint"
+    url: "https://weasyprint.org"
+    caveats: >-
+      No JavaScript execution — render dynamic content to static HTML first. Very modern
+      CSS layout features can differ from a browser's rendering.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: image-to-text
+    x: "Image of text (screenshot, clean scan, photo)"
+    y: "Plain text"
+    tool: tesseract
+    kind: model
+    verdict: >-
+      Tesseract is a fixed local model — same input, same output, no API, nothing leaving
+      the machine — and `--psm` is the knob that actually matters (6 for a block, 7 for a
+      single line). Sending screenshots to a hosted vision API for text you could extract
+      locally is a cost and privacy leak on the easy majority of cases.
+    install: "brew install tesseract tesseract-lang"
+    url: "https://github.com/tesseract-ocr/tesseract"
+    caveats: >-
+      Wants clean, high-contrast, deskewed input; handwriting, stylized type and text
+      over busy imagery are outside its range. When it fails it produces visible garbage,
+      which is a useful property.
+    escalate: >-
+      Handwriting, dense multi-column layouts, or text embedded in imagery — a vision
+      model reads those. Also whenever the target is semantic ("what is the total on this
+      receipt") rather than the characters themselves.
+    verified: 2026-08-18
+
+  - id: speech-audio-to-transcript
+    x: "Recorded speech (meeting, interview, podcast)"
+    y: "Transcript (text/SRT/VTT)"
+    tool: whisper.cpp
+    kind: model
+    verdict: >-
+      This pair has no deterministic answer; speech-to-text is model work and pretending
+      otherwise wastes a day. whisper.cpp runs the weights locally at usable speed on
+      Apple Silicon and writes SRT/VTT directly, so recordings never leave the machine
+      and the marginal cost per hour of audio is zero.
+    install: "brew install whisper-cpp"
+    url: "https://github.com/ggml-org/whisper.cpp"
+    caveats: >-
+      No speaker diarization out of the box; accuracy drops with accents, crosstalk and
+      domain jargon, and it can emit invented text over long silences. Bigger models are
+      considerably better and considerably slower. faster-whisper is the Python/GPU
+      alternative.
+    escalate: >-
+      Already model-tier. Go further only for diarization, or for a cleanup pass on
+      punctuation and domain terminology — and always keep the raw transcript alongside
+      the cleaned one.
+    verified: 2026-08-18
+
+  - id: messy-doc-to-schema
+    x: "Messy document (invoice, contract, report PDF/DOCX)"
+    y: "Structured records against a schema"
+    tool: unstructured
+    kind: hybrid
+    verdict: >-
+      Split the job rather than the tool: deterministic partitioning (unstructured's
+      parsers, or pdftotext/pdfplumber) yields elements, positions and tables, and a
+      model is asked only for the fields that are genuinely judgment — which of these
+      three numbers is "the total", is this clause an indemnity. Handing the whole PDF to
+      an LLM and asking for JSON is the expensive failure mode: it works on the demo
+      document and fabricates on the tenth, with no signal that it did.
+    install: 'pip install "unstructured[all-docs]"'
+    url: "https://github.com/Unstructured-IO/unstructured"
+    caveats: >-
+      Heavy dependency tree (OCR, ONNX models) and quality varies a lot by document type;
+      validate the extracted structure before trusting anything built on top of it.
+    escalate: >-
+      The model tier is the point here — keep it narrow. Constrain output to the schema,
+      validate every extracted number against the deterministic parse, and log both so a
+      disagreement is visible.
+    verified: 2026-08-18
+
+  - id: legacy-ebook-to-epub
+    x: "MOBI/AZW3/LIT and other legacy ebook formats"
+    y: "EPUB"
+    tool: calibre
+    kind: deterministic
+    verdict: >-
+      `ebook-convert in.azw3 out.epub` carries the TOC, metadata and internal links
+      across a dozen legacy formats — a decade of accumulated format edge cases you
+      should not re-derive. Pandoc does not read these formats, and "free online ebook
+      converter" sites mean uploading your library to a stranger.
+    install: "brew install --cask calibre"
+    url: "https://calibre-ebook.com"
+    caveats: >-
+      DRM-protected files will not convert, and whether to remove DRM is your legal call,
+      not the tool's. Heavily designed fixed-layout books reflow poorly.
+    escalate: "Never."
+    verified: 2026-08-18
+
+  - id: media-to-metadata-json
+    x: "Photo / video / PDF file"
+    y: "Structured metadata (JSON)"
+    tool: exiftool
+    kind: deterministic
+    verdict: >-
+      `exiftool -json -r dir/` reads (and writes) metadata across essentially every
+      format and tag standard, which makes it the right first move before any lossy
+      pipeline: capture the metadata, then convert. The naive path drops timestamps and
+      GPS during the convert step and you find out months later, with no way back.
+    install: "brew install exiftool"
+    url: "https://exiftool.org"
+    caveats: >-
+      Writing tags rewrites files — keep the `_original` backups, or pass
+      `-overwrite_original` deliberately. Tag namespaces are numerous and vendor-specific.
+    escalate: >-
+      Never for reading. A model is only relevant for deriving metadata that isn't there
+      — captions, subjects, scene descriptions — which is a different job with different
+      accuracy expectations.
+    verified: 2026-08-18
+
+  - id: legacy-encoding-to-utf8
+    x: "Text/CSV in a legacy encoding (CP-1252, Latin-1, Shift-JIS) showing mojibake"
+    y: "Clean UTF-8"
+    tool: iconv
+    kind: deterministic
+    verdict: >-
+      `iconv -f WINDOWS-1252 -t UTF-8` fixes the entire class of "why are there Â
+      characters" bugs in one pass once you know the source encoding; pair it with
+      `uchardet` or `file -I` to guess. Find-and-replacing the visible mojibake by hand is
+      the failure mode — you fix the common characters and leave the rare ones to break a
+      parser downstream.
+    install: "built-in (GNU/BSD iconv); brew install uchardet for detection"
+    url: "https://www.gnu.org/software/libiconv/"
+    caveats: >-
+      Encoding detection is a guess, not a fact — verify on a sample containing known-odd
+      characters. `//TRANSLIT` silently degrades anything unmappable.
+    escalate: >-
+      Never for the conversion; a model is at most a tie-breaker when detection is
+      ambiguous and you have a sample of known-correct text to compare against.
+    verified: 2026-08-18

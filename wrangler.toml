@@ -1,0 +1,24 @@
+name = "lemon-x2y-beacon"
+main = "worker/beacon.js"
+compatibility_date = "2026-08-01"
+
+# The read surface is NOT here. It is a separate Cloudflare Pages project
+# serving dist/ as static assets with ZERO Functions — adding a Function
+# re-opens the pages.dev twin's metered path (dossier § Limits, "The twin").
+
+# The route, added at deploy. The page addresses the beacon by RELATIVE URL,
+# so a page served from the pages.dev twin resolves /b against the twin, where
+# no Worker route and no Function exist, and the request lands on static
+# handling. Beacon traffic reaches this Worker only through the zone, where the
+# rung-0 rate-limiting rule lives.
+#
+# routes = [
+#   { pattern = "x2y.lemon-agent.dev/b", zone_name = "lemon-agent.dev" }
+# ]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lemon_x2y"
+# Placeholder — local dev only. REPLACE at deploy with the id printed by
+# `wrangler d1 create lemon_x2y`.
+database_id = "00000000-0000-0000-0000-000000000000"
