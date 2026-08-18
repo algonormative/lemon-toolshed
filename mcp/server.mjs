@@ -151,10 +151,19 @@ async function convert(args) {
     );
   }
   if (res.headers.get('x-pricing') === 'pending') {
+    // Over the tier, served, but nothing was checked — the facilitator could not
+    // be reached (or is not configured on the service). Worth interrupting the
+    // product for, because the caller may believe it just paid and it did not.
+    const why = res.headers.get('x-payment-error') || 'unknown';
     return text(
-      `${body}\n\n[toolshed: x-pricing: pending — served without settlement being verified ` +
-        `(x-payment-verified: ${res.headers.get('x-payment-verified') || 'false'}). You have not paid for this call.]`
+      `${body}\n\n[toolshed: x-pricing: pending — this call was served WITHOUT its payment being ` +
+        `verified (x-payment-error: ${why}). The payment service could not be reached, so no ` +
+        'money moved and you have not been charged. Nothing is owed; retry later if you want ' +
+        'the call to actually settle.]'
     );
+  }
+  if (res.headers.get('x-payment-verified') === 'true') {
+    return text(`${body}\n\n[toolshed: payment verified and settling — you were charged for this call.]`);
   }
   return text(body);
 }
@@ -198,8 +207,8 @@ function formatDuration(seconds) {
 }
 
 // A 402 is the payment envelope, not an error to swallow. Quote the terms the
-// envelope actually names, then say plainly what the caller has to do — and that
-// settlement is not switched on yet.
+// envelope actually names, then say plainly what the caller has to do — and, if
+// the service rejected a payment it was given, exactly why.
 function explainPayment(id, body, res) {
   let envelope;
   try {
@@ -226,6 +235,23 @@ function explainPayment(id, body, res) {
   } else {
     lines.push('', 'The 402 body could not be parsed as an x402 envelope:', body.trim());
   }
+  // A 402 that names an invalidReason is a REJECTED payment, not a first ask:
+  // the caller sent something and the facilitator refused it. Retrying the same
+  // payload will fail the same way, so say what to fix instead.
+  if (envelope && envelope.invalidReason) {
+    lines.push(
+      '',
+      `The payment you presented was REJECTED: ${envelope.invalidReason}`,
+      ...(envelope.invalidMessage ? [`  ${envelope.invalidMessage}`] : []),
+      '',
+      'Retrying the same payment payload will be rejected again. Common causes:',
+      '  insufficient_funds                     the paying wallet has too little USDC on Base',
+      '  invalid_exact_evm_payload_signature    the signature does not match the terms above',
+      '  malformed_payment_header               X-PAYMENT was not base64-encoded JSON',
+      'Sign a fresh payment against the terms above and retry once.'
+    );
+  }
+
   lines.push(
     '',
     'To pay, retry the request through an x402-capable HTTP client (x402-fetch, the',
@@ -234,11 +260,12 @@ function explainPayment(id, body, res) {
     'is no login and no account — the payment is the auth. Never ask a person to paste a',
     'private key or seed phrase.',
     '',
-    'Status: settlement is not verified yet. A 402 here means a receiving address IS',
-    'configured, but the service checks no payment — it never treats an X-PAYMENT header',
-    'as paid, and says so with x-payment-verified: false. If you have no x402 client, wait',
-    'for the free tier to reset at midnight UTC, or run toolshed_check and use the local',
-    'tool it names instead.'
+    'Status: payments ARE verified and settled — a payment presented against this envelope',
+    'is checked with the Coinbase CDP facilitator before the conversion is served, and a',
+    'verified call comes back with x-payment-verified: true. If the facilitator cannot be',
+    'reached the call is served anyway, unverified and uncharged, and says so with',
+    'x-payment-error. If you have no x402 client, wait for the free tier to reset at',
+    'midnight UTC, or run toolshed_check and use the local tool it names instead.'
   );
   if (res.headers.get('x-pricing')) lines.push('', `Response header x-pricing: ${res.headers.get('x-pricing')}`);
   return lines.join('\n');

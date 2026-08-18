@@ -41,13 +41,16 @@ Three honest caveats:
 - **The curation is owner taste.** The 33 entries in `entries.yaml` are drafts
   for review, not a finished list, and every verdict is engineering judgment
   rather than measurement.
-- **The free tier is enforced; settlement is not yet verified.** The 10/day
-  free tier is real and runs against D1. Past it, a spec-valid 402 is issued
-  (`PAYTO` is set — live since 2026-08-18) — but nothing verifies settlement
-  yet, so an `X-PAYMENT` header is never treated as paid and the call is
-  served with `x-payment-verified: false`. Verification lands with the CDP
-  facilitator. See
-  [Pricing and payment (x402)](#pricing-and-payment-x402) — all of this is
+- **The free tier is enforced; payment is verified in code but has never been
+  paid.** The 10/day free tier is real and runs against D1. Past it, a
+  spec-valid 402 is issued (`PAYTO` is set — live since 2026-08-18), and a
+  payment presented against it is now verified and settled with the Coinbase
+  CDP facilitator. Two honest caveats: **no real payment has settled yet** —
+  the path is proven against a mock facilitator and a real `x402-fetch` client,
+  not against real USDC — and an unreachable facilitator serves the call
+  *unverified* rather than refusing it. See
+  [Settlement (live)](#settlement-live) and
+  [Pricing and payment (x402)](#pricing-and-payment-x402) — all of it is
   stated in the response headers rather than hidden.
 - **The visit counter has a hole.** The beacon counts script-executing clients,
   so the machine files are fetched by clients that execute nothing and stay
@@ -66,11 +69,13 @@ entries.yaml                content tier — 33 draft entries, in git; review is
 build.mjs                   build step — emits dist/ and worker/catalog.generated.js
 worker/beacon.js            the API Worker — /b, /check, /convert/*
 worker/catalog.generated.js GENERATED from entries.yaml; committed, because deploy reads it
-worker/schema.sql           D1 schema — events / daily_aggregates / blocklist / salt / counters / convert_quota
+worker/schema.sql           D1 schema — events / daily_aggregates / blocklist / salt / counters / convert_quota / settlements
 mcp/server.mjs              the MCP server — thin stdio wrapper over the HTTP API
 skills/toolshed/SKILL.md    the agent skill — check availability, convert, x402
 test/                       the e2e suite — `npm test`, local only; see § Testing
 scripts/test-live.mjs       the older live probe + cost estimate; spends 6 free calls a run
+scripts/create-test-buyer.mjs  OWNER ONLY — makes a throwaway buyer key (.buyer.env)
+scripts/pay-test.mjs        OWNER ONLY — SPENDS REAL USDC; one paid call end to end
 wrangler.toml               Worker config; routes are live, database_id filled in at deploy
 ```
 
@@ -111,6 +116,13 @@ enforces cannot drift apart.
 The Worker imports `marked`, `js-yaml`, `turndown` and `@mixmark-io/domino`.
 Wrangler bundles npm dependencies natively — there is no build step to
 configure — but `npm ci` has to have run before `wrangler deploy`.
+
+**That list did not grow when settlement landed.** The facilitator is two REST
+calls and one Ed25519 JWT, and workerd signs Ed25519 natively, so verification
+and settlement add **no production dependency** — see
+[Settlement (live)](#settlement-live) for the reasoning and what was rejected.
+`viem` and `x402-fetch` are devDependencies used only by the buyer test kit and
+by one test; neither reaches the bundle.
 
 One non-obvious bit: Turndown's browser build reaches for a global `document`
 that workerd does not have. `worker/beacon.js` therefore parses HTML with domino
@@ -236,6 +248,25 @@ needs one new table, so **run this before deploying a Worker that enforces it**
 
 ```bash
 npx wrangler d1 execute DB --remote --command "CREATE TABLE IF NOT EXISTS convert_quota (day TEXT, ip_hash TEXT, used INTEGER, PRIMARY KEY (day, ip_hash));"
+```
+
+### Migration — the settlements table (existing databases)
+
+Settlement verification adds one more table. **Run this before deploying a
+Worker that verifies payments:**
+
+```bash
+npx wrangler d1 execute DB --remote --command "CREATE TABLE IF NOT EXISTS settlements (ts INTEGER, tool TEXT, payer TEXT, amount TEXT, verify_ok INTEGER, settle_ok INTEGER, tx_hash TEXT, error TEXT);"
+```
+
+Unlike `convert_quota`, a missing `settlements` table does **not** take the
+endpoint down: the ledger write is deliberately best-effort, so a forgotten
+migration degrades to "payments work, nothing is recorded" rather than to 503s.
+That is the safer failure, and it is also the easier one to miss — so run the
+migration, then check it landed:
+
+```bash
+npx wrangler d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE name = 'settlements';"
 ```
 
 Equivalently, `npx wrangler d1 execute DB --remote --file worker/schema.sql`
@@ -370,35 +401,64 @@ reached.
 | var | read? | effect |
 | --- | --- | --- |
 | `PAYTO` | yes | the receiving address (USDC on Base) named in the 402 envelope. **Unset = there is nowhere to pay**, so over-tier calls answer 429 instead of 402. |
-| `FACILITATOR_URL` | **not yet** | reserved; settlement verification is unbuilt. The paid tier activates for real when this lands. |
+| `FACILITATOR_URL` | yes | the x402 facilitator base URL. Defaults to `https://api.cdp.coinbase.com/platform/v2/x402`; overridden only by the test suite, which points it at a local mock. |
+| `CDP_API_KEY_ID` | yes | CDP API key id. A **Worker secret**, not a var. |
+| `CDP_API_KEY_SECRET` | yes | CDP API key secret (base64 Ed25519). A **Worker secret**. Without both keys nothing can be verified, and over-tier paid calls are served with `x-payment-error: facilitator-unconfigured`. |
+
+Set the two secrets with `wrangler secret put`, never in `wrangler.toml`:
+
+```bash
+npx wrangler secret put CDP_API_KEY_ID
+npx wrangler secret put CDP_API_KEY_SECRET
+```
 
 ### Behaviour, exactly as implemented
 
-| calls today | `PAYTO` | `X-PAYMENT` | response |
-| --- | --- | --- | --- |
-| ≤ 10 | unset | no | **200**, the conversion, `x-free-tier-remaining: <n>` |
-| ≤ 10 | unset | yes | **200**, plus `x-payment-verified: false` — an unverified claim changes nothing |
-| ≤ 10 | set | no | **200**, the conversion, `x-free-tier-remaining: <n>` — a receiving address does not cancel the free tier |
-| any, ≤ 5,000 | set | yes | **200**, `x-pricing: pending` + `x-payment-verified: false` — the paid ceiling applies instead of the free tier |
-| > 10 | unset | either | **429**, `{"error": "free tier is 10 conversions per day per caller", …}` + `Retry-After` |
-| > 10 | set | no | **402**, a spec-valid x402 v1 envelope for that tool |
-| > 5,000 | set | yes | **429** + `Retry-After` — the runaway bound, not a price gate |
+| calls today | `PAYTO` | `X-PAYMENT` | facilitator says | response |
+| --- | --- | --- | --- | --- |
+| ≤ 10 | unset | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` |
+| ≤ 10 | unset | yes | *not asked* | **200**, plus `x-payment-verified: false` — the free tier is not a payment path |
+| ≤ 10 | set | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` — a receiving address does not cancel the free tier |
+| ≤ 10 | set | yes | *not asked* | **200**, `x-free-tier-remaining: <n>` + `x-payment-verified: false`. **Never billed inside the free tier** |
+| > 10 | unset | either | *not asked* | **429**, `{"error": "free tier is 10 conversions per day per caller", …}` + `Retry-After` |
+| > 10 | set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool |
+| > 10 | set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable to send |
+| > 10 | set | yes | `isValid` | **200**, `x-payment-verified: true`, and settlement runs after the response |
+| > 10 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served |
+| > 10 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served free, recorded |
+| > 5,000 | set | yes | — | **429** + `Retry-After` — the runaway bound, not a price gate |
 
-Two rows deserve saying out loud:
+Three rows deserve saying out loud:
 
-- **Nothing is ever fake-verified.** Verifying a payment needs a facilitator;
-  there isn't one wired up, and the Worker will not pretend to have checked
-  something it cannot check. Every response that so much as *sees* an
-  `X-PAYMENT` header says `x-payment-verified: false`. Presenting one today buys
-  a higher ceiling, not a paid call. **Full enforcement lands with the
-  facilitator**; until then treat `PAYTO` as a way to exercise the 402 flow, not
-  as revenue.
-- **The paid ceiling answers 429, not 402.** `PAID_DAILY` (5,000/day per caller,
-  in `worker/beacon.js`, owner-tunable) is a runaway bound rather than a quota to
-  advertise — so it is deliberately absent from the catalog and the page. A
-  caller that already presented a payment cannot buy its way past it, and
-  answering "pay to continue" would be a lie; it gets the plain rate-limit answer
-  with a `Retry-After`.
+- **The free tier is never a payment path.** The free allowance is claimed
+  *first*, before anything looks at `X-PAYMENT`, so a caller with allowance left
+  is never verified and never billed — and the facilitator is not called at
+  all. That ordering is the rule, expressed as control flow rather than as a
+  promise, and `test/x402-settlement.test.mjs` asserts it as **zero** calls to
+  the facilitator rather than as a header.
+- **The paid ceiling now keys on a VERIFIED payment.** *Changed 2026-08-18.*
+  `PAID_DAILY` (5,000/day per caller) used to be unlocked by the mere
+  **presence** of an `X-PAYMENT` header — a pre-facilitator placeholder that let
+  any caller who could type a header buy a 500× higher ceiling for free. The
+  higher ceiling is now claimed only after the facilitator returns `isValid`. A
+  rejected payment leaves the counter exactly where the free tier left it.
+- **An unreachable facilitator serves the call.** Availability-first, and it is
+  a deliberate trade: at $0.001 a call the price is a signal, and turning paying
+  callers away because *our* dependency is down is the worse failure. Every one
+  of these is written to `settlements` with the precise reason, so the choice is
+  auditable rather than invisible. If that table fills up with
+  `facilitator-*` rows, the dependency is broken and revenue is quietly zero —
+  see [Operator queries](#operator-queries-kc-cur).
+
+And the invariant that has not changed: **nothing is ever fake-verified.**
+`x-payment-verified: true` appears only after a facilitator round trip that
+returned `isValid`. There is no code path that infers it from a header.
+
+**The paid ceiling answers 429, not 402.** `PAID_DAILY` (5,000/day per caller,
+in `worker/beacon.js`, owner-tunable) is a runaway bound rather than a quota to
+advertise — so it is deliberately absent from the catalog and the page. A caller
+that already paid cannot buy its way past it, and answering "pay to continue"
+would be a lie; it gets the plain rate-limit answer with a `Retry-After`.
 
 The page publishes the same thing in plain language under **Pricing, and paying
 with USDC** — the free tier and its IP-keyed counter, what the 402 carries, the
@@ -425,6 +485,204 @@ Exercising the 402 needs the free tier spent first — eleven calls, or a
 ```bash
 npx wrangler d1 execute DB --local --command "DELETE FROM convert_quota;"
 ```
+
+## Settlement (live)
+
+Past the free tier, a payment is now **checked before the conversion is served
+and settled on chain immediately afterwards**, through the Coinbase CDP
+facilitator.
+
+> **Status.** The code path is live and tested end to end, but **no real payment
+> has settled yet.** Everything below is verified against a mock facilitator and
+> against a real `x402-fetch` client signing a real EIP-3009 authorization — not
+> against real USDC on Base. The flip criteria are at the end of this section.
+
+### The shape of it
+
+```text
+caller ──POST /convert/x, X-PAYMENT──▶ Worker
+                                        │  free tier gone? and PAYTO set?
+                                        ▼
+                                      POST <facilitator>/verify     (2 s cap)
+                                        │
+                        isValid ────────┼──────── not valid ──▶ 402 + invalidReason
+                                        ▼
+                              200 + x-payment-verified: true
+                                        │  (response is already sent)
+                                        ▼
+                                      POST <facilitator>/settle    ctx.waitUntil
+                                        ▼
+                                      INSERT INTO settlements
+```
+
+`verify` is on the critical path, so it has a hard **2-second** cap and its
+failure is an availability decision, not a payment decision. `settle` runs after
+the response in `ctx.waitUntil`, because the caller paid for a conversion, not
+for a chain confirmation. A settlement that fails after a good verify is the
+accepted exposure: one conversion served for $0.001 that never arrived,
+recorded as `settle_ok = 0`.
+
+### The endpoints, and what we send
+
+| | |
+| --- | --- |
+| **base URL** | `https://api.cdp.coinbase.com/platform/v2/x402` (`FACILITATOR_URL`) |
+| **verify** | `POST <base>/verify` |
+| **settle** | `POST <base>/settle` |
+| **body** | `{ x402Version, paymentPayload, paymentRequirements }` |
+| **auth** | `Authorization: Bearer <CDP JWT>` |
+| **verify →** | `{ isValid, invalidReason, invalidMessage, payer }` |
+| **settle →** | `{ success, errorReason, transaction, network, payer }` |
+
+`paymentPayload` is the caller's `X-PAYMENT` header, base64-decoded.
+`paymentRequirements` is **the same object the 402 envelope advertised** — built
+once in `paymentRequirements()` and used by both, because the client signs
+against what the envelope said and the facilitator recovers that signature from
+what we send. Any field that differs between the two turns a perfectly good
+payment into `invalid_exact_evm_payload_signature`.
+
+### The dependency decision: no new production dependency
+
+The obvious route is `@coinbase/x402` (its `facilitator` config) plus `x402`'s
+`useFacilitator`. **We call the two REST endpoints directly instead**, and add
+**zero** production dependencies. Reasoning:
+
+- `@coinbase/x402` is ~40 lines of glue whose real job is minting a JWT. It
+  depends on `@coinbase/cdp-sdk`, `viem`, `zod` and `@x402/core` — all of which
+  would land in the Worker bundle for one Ed25519 signature.
+- The signature itself is native in workerd. `crypto.subtle.importKey('jwk', …,
+  { name: 'Ed25519' })` and `crypto.subtle.sign('Ed25519', …)` were **measured
+  working** in `wrangler dev --local` before any of this was written.
+- `jose` would also have worked and is the documented fallback, but it is still
+  a dependency for something WebCrypto already does.
+- The two request bodies are three fields each, and they are pinned by tests
+  against a mock that asserts them field for field.
+
+So `cdpAuthHeader()` in `worker/beacon.js` mints the same JWT
+`@coinbase/cdp-sdk`'s `buildEdwardsJWT` does — read from its source, not from
+memory:
+
+| | |
+| --- | --- |
+| **header** | `{ alg: "EdDSA", kid: <key id>, typ: "JWT", nonce: <16 random bytes, hex> }` |
+| **claims** | `{ sub: <key id>, iss: "cdp", uris: ["POST api.cdp.coinbase.com/platform/v2/x402/verify"], iat, nbf, exp }` |
+| **lifetime** | 120 seconds |
+| **key** | `CDP_API_KEY_SECRET` is base64 of 64 bytes — a 32-byte Ed25519 seed then its 32-byte public key — imported as an OKP JWK |
+
+Two details that are easy to get wrong: the claim is **`uris`** (plural, an
+array), not `uri` — the CDP docs page shows `uri`, the SDK sends `uris`, and the
+SDK is what the facilitator actually accepts. And the token is **bound to one
+endpoint**, so a `/verify` token cannot be replayed at `/settle`.
+
+**Only the modern Ed25519 key format is supported.** If `CDP_API_KEY_SECRET` is
+a PEM EC key (the older format, starting `-----BEGIN EC PRIVATE KEY-----`), the
+JWT will not mint and every paid call is served with
+`x-payment-error: facilitator-unconfigured`. Issue a new Secret API Key.
+
+### The `extra` field — a bug this work found
+
+The 402 envelope now carries:
+
+```json
+"extra": { "name": "USD Coin", "version": "2" }
+```
+
+This is the EIP-712 domain the payer signs the `TransferWithAuthorization` over,
+and **omitting it silently breaks every real payment**. x402's client reads
+`paymentRequirements.extra?.name` with *no fallback*, while the verifier falls
+back to its own per-chain table — so an envelope without `extra` makes the
+client sign over `name: undefined`, the verifier check against `"USD Coin"`, and
+the payment come back `invalid_exact_evm_payload_signature`. Every previous
+envelope assertion passed while this was broken, which is exactly why the suite
+now drives a real client (below).
+
+Note `"USD Coin"`, not `"USDC"`: on Base mainnet the token's `name()` differs
+from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
+`"USDC"` — if this ever runs on testnet, that value changes.)
+
+### Response headers, past the free tier
+
+| header | meaning |
+| --- | --- |
+| `x-payment-verified: true` | the facilitator returned `isValid`. Never inferred from a header |
+| `x-payment-verified: false` | nothing was checked — see `x-payment-error` |
+| `x-payment-error: facilitator-unreachable` | timeout, network failure, or a non-200 from the facilitator |
+| `x-payment-error: facilitator-unconfigured` | no CDP credentials on this Worker. Operator fault, not caller fault |
+| `x-pricing: pending` | served over the tier without a verified payment |
+
+The **ledger** keeps the precise reason (`facilitator-timeout`,
+`facilitator-http-503`, …) because that is what you debug from; the **header**
+keeps a small stable vocabulary because that is what a client branches on.
+
+### Reading the ledger
+
+```bash
+# the last few payment attempts
+npx wrangler d1 execute DB --remote \
+  --command "SELECT ts, tool, payer, amount, verify_ok, settle_ok, tx_hash, error FROM settlements ORDER BY ts DESC LIMIT 20;"
+
+# money that actually landed
+npx wrangler d1 execute DB --remote \
+  --command "SELECT COUNT(*) AS settled, SUM(CAST(amount AS INTEGER))/1000000.0 AS usd FROM settlements WHERE settle_ok = 1;"
+
+# the alarm: served but never paid for
+npx wrangler d1 execute DB --remote \
+  --command "SELECT error, COUNT(*) AS n FROM settlements WHERE verify_ok = 0 GROUP BY error ORDER BY n DESC;"
+```
+
+`settlements` rows are **kept**, not pruned on the 90-day chore: `payer` is an
+address its owner revealed by paying and `tx_hash` is public chain data, so
+neither is covered by the daily-salt discard the other tables rely on — and they
+are the revenue record.
+
+### The buyer test kit — proving it with real money
+
+Two scripts, both **owner-only**. Nothing in `npm test` touches them, and
+`pay-test.mjs` refuses to run without `--yes`.
+
+```bash
+# 1. make a throwaway key (writes .buyer.env, chmod 600, gitignored)
+npm run buyer:create
+
+# 2. fund the printed ADDRESS with ~$1 USDC on Base.
+#    NETWORK MUST BE BASE. The key needs no ETH — the `exact` scheme pays with
+#    a signed EIP-3009 authorization and the FACILITATOR submits the transaction.
+
+# 3. see what would happen, spending nothing
+npm run buyer:pay -- --dry-run
+
+# 4. the real thing
+npm run buyer:pay -- --yes
+```
+
+**What step 4 actually costs:** one $0.001 USDC payment, *plus* today's free
+tier for whatever IP you run it from — up to 10 throwaway conversions. The paid
+path is unreachable until the free tier is spent (that is the design), so the
+script burns it first and says so, call by call. It then signs, pays, and prints
+the status, `x-payment-verified`, and where to confirm the money moved.
+
+The key in `.buyer.env` is a **plaintext private key on disk**. That is fine for
+a key holding a dollar and catastrophic for one holding anything else — fund it
+with the minimum that proves the path, and treat the file as burnable.
+
+### Flipping the honest-status box
+
+The site still says settlement verification is not live, and **that copy stays
+until a real payment settles**. "The code is written and the tests pass" is not
+the same claim as "money has moved", and the status box exists to not blur the
+two.
+
+The criteria, all three:
+
+1. `npm run buyer:pay -- --yes` returns **200** with `x-payment-verified: true`.
+2. A `settlements` row exists with `verify_ok = 1`, `settle_ok = 1`, and a real
+   `tx_hash`.
+3. The $0.001 is visible at the `PAYTO` address (and on the CDP x402 chart).
+
+Then replace the `<p>` inside `<div class="status-box">` in `build.mjs` with the
+sentence in the HTML comment directly above it — it is written out in full,
+ready to paste — rebuild, and redeploy. Do not paraphrase it; the comment is the
+approved copy.
 
 ## Shutdown runbook
 
@@ -584,7 +842,7 @@ the same argument.
 |---|---|---|---|
 | 0 | Cloudflare edge | REACTIVE — free WAF custom rule blocking blocklist IPs (`ip.src in {…}`), populated from the `blocklist` table; the planned rate-limiting rule is unavailable on this account's plan (owner-verified 2026-08-18) | nothing blocks a first-seen IP at the edge; the in-Worker tiers below are the standing bound, and abuse is blocked at the edge only after it is identified |
 | 1 | Worker | 100 events / identifier / UTC day — **`/b` only**; convert rows are excluded from the count | honest runaway client stops being counted; UA rotation still mints fresh identifiers, which is a measurement cost, not a spend |
-| 1c | Worker | **10 conversions / caller / UTC day** (`FREE_TIER_DAILY`), or 5,000 when an `X-PAYMENT` header is presented and `PAYTO` is set | over-tier callers get 402 or 429; the key is the IP hash, so UA rotation does **not** mint a fresh allowance |
+| 1c | Worker | **10 conversions / caller / UTC day** (`FREE_TIER_DAILY`), or 5,000 once a payment has been **verified** by the facilitator (changed 2026-08-18 — presenting a header is no longer enough) | over-tier callers get 402 or 429; the key is the IP hash, so UA rotation does **not** mint a fresh allowance |
 | 2 | Worker | 200,000 events / UTC day, fail-closed before insert | metrics loss and no conversions for the rest of the day |
 | 3 | — | none; priced, not bounded — $2.49/day at 100 req/s, $25.82/day at 1,000 req/s | detective only: $25 alert + shutdown runbook |
 
@@ -684,7 +942,8 @@ test/convert-csv-json.test.mjs    the RFC 4180 battery
 test/convert-html-markdown.test.mjs
 test/protocol.test.mjs            /check, method and routing guards, 413, /b
 test/quota.test.mjs               the free tier and its spoof resistance
-test/x402.test.mjs                the 402 envelope and the paid ceiling
+test/x402.test.mjs                the 402 envelope, and PAYTO set with no facilitator
+test/x402-settlement.test.mjs     verify/settle against a mock facilitator + a real client
 test/beacon.test.mjs              rows, bot drops, salt rotation
 test/live.smoke.mjs               the production smoke (`npm run test:live`)
 ```
@@ -703,15 +962,48 @@ children, so killing the node process alone orphans them and leaks the port; the
 harness spawns it `detached` and tears it down with `process.kill(-pid, …)`,
 escalating to `SIGKILL`, plus a best-effort sweep on process exit.
 
-### Why there are two phases
+### Why there are three phases
 
-One dev var changes the product's answer past the free tier — with `PAYTO`
-unset it is a 429, with `PAYTO` set it is a 402 envelope — and a dev var is
-fixed for the life of a `wrangler dev` process. So `npm test` runs phase 1
-(everything, no `PAYTO`), tears it down, then phase 2 (`x402.test.mjs`, with
-`PAYTO=0xTEST…`). Suites run at `--test-concurrency=1` so the tests that count
-D1 rows can compare a before and an after without another file writing between
-them.
+Dev vars change the product's answer past the free tier — with `PAYTO` unset it
+is a 429, with `PAYTO` set it is a 402 envelope, and with a facilitator
+configured it is a verified payment — and a dev var is fixed for the life of a
+`wrangler dev` process. So `npm test` runs them in turn:
+
+| phase | vars | files |
+| --- | --- | --- |
+| 1 | none | everything except the two x402 suites |
+| 2 | `PAYTO` | `x402.test.mjs` — the envelope, and a half-configured deploy |
+| 3 | `PAYTO` + `FACILITATOR_URL` + fake CDP keys | `x402-settlement.test.mjs` |
+
+Phase 3 is marked `standalone` in `test/run.mjs`: it runs a mock facilitator on
+a port it only learns at startup, and `FACILITATOR_URL` has to name that port,
+so the worker cannot be booted before the mock exists. The suite boots its own —
+on its own fresh D1, like every other phase.
+
+The CDP credentials it uses are **structurally real and worth nothing**: a
+freshly generated Ed25519 keypair, base64-encoded the way CDP encodes a Secret
+API Key, never sent anywhere but the local mock. They have to be real enough to
+sign with, because the point is that the Worker's JWT path executes for real
+inside workerd — a runtime that could not import or sign with an Ed25519 key
+would fail the suite rather than quietly skip it.
+
+Suites run at `--test-concurrency=1` so the tests that count D1 rows can compare
+a before and an after without another file writing between them.
+
+### The positive control
+
+`x402-settlement.test.mjs` ends by driving the **real `x402-fetch` client**
+against the real 402 envelope: it parses our response, signs a genuine EIP-3009
+authorization with a genuine key, and the Worker verifies it. No funds are
+involved — the key is generated in the test and the mock does not look at the
+chain — but the *signing* is real, and that is the half a mock cannot fake.
+
+It earns its place: every other test in the file builds its own `X-PAYMENT`
+header, which proves the Worker handles the payload *the test writes*, not that
+a real client can produce one. The missing-`extra` bug lived exactly in that
+gap — the envelope was spec-shaped, every envelope assertion passed, and no
+genuine payment could ever have verified. Removing `extra` from the Worker now
+fails this test (measured, not assumed).
 
 ### Running one suite
 

@@ -1,14 +1,31 @@
-// The paid tier, as far as it is actually built.
+// The 402 envelope, and the paid tier with NO facilitator configured.
 //
-// PHASE: PAYTO set. This file needs its own worker instance with
-// PAYTO=<test address>, because the over-tier answer is a 402 envelope only
-// when there is somewhere to pay; with PAYTO unset it is a 429 (quota.test.mjs).
+// PHASE: PAYTO set, and deliberately no CDP credentials. This file needs its own
+// worker instance with PAYTO=<test address>, because the over-tier answer is a
+// 402 envelope only when there is somewhere to pay; with PAYTO unset it is a 429
+// (quota.test.mjs). Verification against a real (mock) facilitator is
+// x402-settlement.test.mjs; what is pinned HERE is the envelope itself, and the
+// half-configured deployment — an address to pay to, but no way to check a
+// payment — which is a state a real deploy can be in.
 //
-// The thing most worth guarding here is the negative: NOTHING IS EVER
-// FAKE-VERIFIED. There is no facilitator wired up, so an X-PAYMENT header buys
-// a higher ceiling and nothing else, and every response that so much as sees
-// one must say `x-payment-verified: false`. A regression that started reporting
-// `true` would look like a feature and be a lie.
+// The thing most worth guarding is still the negative: NOTHING IS EVER
+// FAKE-VERIFIED. With no facilitator reachable, `x-payment-verified` must never
+// be `true`, whatever the caller presents. A regression that started reporting
+// `true` here would look like a feature and be a lie.
+//
+// WHAT CHANGED when the facilitator landed (2026-08-18), and why these
+// assertions moved with it:
+//
+//   - The free tier is claimed FIRST, always. An X-PAYMENT header presented
+//     inside the free tier no longer moves the caller onto the paid ceiling —
+//     it is a free call that happens to carry a header nobody looked at.
+//   - The paid ceiling keys on a VERIFIED payment. Presenting the header used
+//     to buy PAID_DAILY (5,000) outright; that was a pre-facilitator
+//     placeholder, and it let an unverified claim buy a 500x ceiling for free.
+//   - An X-PAYMENT that is not base64 JSON is now a 402, not a served call.
+//     There is nothing to verify in it, and that is the caller's bug.
+//   - Over-tier calls with a payment are served with `x-payment-error` when the
+//     facilitator cannot be asked — availability-first, and honest about it.
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -49,6 +66,36 @@ after(async () => {
   await worker.stop();
 });
 
+/**
+ * A well-formed x402 v1 `exact` payload, base64-encoded as X-PAYMENT.
+ *
+ * The Worker decodes this header before it does anything else with it, so a
+ * test about the CEILING has to present something decodable — otherwise it is
+ * really a test about malformed headers, which is separately covered below.
+ * Nothing here is signed: this phase has no facilitator to check it.
+ */
+function paymentHeader() {
+  const now = Math.floor(Date.now() / 1000);
+  return Buffer.from(
+    JSON.stringify({
+      x402Version: 1,
+      scheme: 'exact',
+      network: 'base',
+      payload: {
+        signature: `0x${'ab'.repeat(65)}`,
+        authorization: {
+          from: '0x000000000000000000000000000000000000dEaD',
+          to: PAYTO_TEST,
+          value: '1000',
+          validAfter: String(now - 600),
+          validBefore: String(now + 60),
+          nonce: `0x${'cd'.repeat(32)}`,
+        },
+      },
+    })
+  ).toString('base64');
+}
+
 /** Spend the whole free tier for one caller, asserting it was actually free. */
 async function exhaust(ip) {
   for (let call = 1; call <= FREE_TIER_DAILY; call++) {
@@ -74,10 +121,15 @@ describe('a receiving address does not cancel the free tier', () => {
     });
     assert.equal(res.status, 200, res.text);
     assert.equal(res.headers.get('x-payment-verified'), 'false', 'a presented payment was implied to be verified');
-    // PAYTO is set and a payment was presented, so this call is on the paid
-    // ceiling — which means no free-tier header, and a pricing-pending label.
-    assert.equal(res.headers.get('x-pricing'), 'pending');
-    assert.equal(res.headers.get('x-free-tier-remaining'), null);
+    // CHANGED with the facilitator: this is a FREE-TIER call that happens to
+    // carry a header. It used to be pushed onto the paid ceiling by the mere
+    // presence of X-PAYMENT — no free-tier header, `x-pricing: pending` — which
+    // meant the free tier could be skipped for free. The free tier is now
+    // claimed first and unconditionally, so the call spends its allowance and
+    // reports what is left, and nothing is charged or checked.
+    assert.equal(res.headers.get('x-free-tier-remaining'), String(FREE_TIER_DAILY - 1));
+    assert.equal(res.headers.get('x-pricing'), null, 'a free-tier call was labelled as pricing-pending');
+    assert.equal(res.headers.get('x-payment-error'), null, 'the free tier tried to take a payment');
   });
 });
 
@@ -106,6 +158,13 @@ describe('the 402 envelope', () => {
       payTo: PAYTO_TEST,
       maxTimeoutSeconds: 60,
       asset: USDC_BASE,
+      // ADDED with the facilitator, and not cosmetic: the client builds its
+      // EIP-712 signing domain from `extra`, with no fallback, while the
+      // verifier falls back to USDC's real on-chain name. An envelope without
+      // this field makes every genuine payment fail as
+      // `invalid_exact_evm_payload_signature`. "USD Coin" is the token's name(),
+      // which is not its ticker.
+      extra: { name: 'USD Coin', version: '2' },
     });
   });
 
@@ -141,35 +200,46 @@ describe('the 402 envelope', () => {
   });
 });
 
-describe('X-PAYMENT raises the ceiling and nothing else', () => {
-  test('an over-tier call presenting X-PAYMENT is served, unverified', async () => {
+describe('a payment that cannot be checked is never treated as checked', () => {
+  test('an over-tier call presenting X-PAYMENT is served, and says nothing was verified', async () => {
     const ip = ips.pinned(6);
     await exhaust(ip);
 
     // Without the header: 402.
     assert.equal((await api.convert('md-html', '# hi\n', { ip })).status, 402);
 
-    // With it: served, on the paid ceiling.
-    const res = await api.convert('md-html', '# hi\n', {
-      ip,
-      headers: { 'x-payment': 'eyJ0ZXN0Ijoic3R1YiJ9' },
-    });
+    // With it: served. CHANGED — this used to be "served because a header was
+    // present". It is now "served because the facilitator could not be asked,
+    // and turning a paying caller away for OUR missing configuration is the
+    // worse failure". The new `x-payment-error` is what makes the difference
+    // legible instead of silent.
+    const res = await api.convert('md-html', '# hi\n', { ip, headers: { 'x-payment': paymentHeader() } });
     assert.equal(res.status, 200, `expected 200 with X-PAYMENT, got ${res.status}: ${res.text}`);
     assert.ok(res.text.includes('<h1>hi</h1>'), 'the conversion did not run');
     assert.equal(res.headers.get('x-payment-verified'), 'false', 'settlement was implied to be verified');
+    // No CDP credentials in this phase, so the fault is ours and named as such
+    // — distinct from a facilitator that exists and did not answer.
+    assert.equal(res.headers.get('x-payment-error'), 'facilitator-unconfigured');
     assert.equal(res.headers.get('x-pricing'), 'pending');
     assert.equal(res.headers.get('x-free-tier-remaining'), null, 'a paid-ceiling call reported free-tier remaining');
   });
 
   test('an arbitrary X-PAYMENT value is never treated as valid', async () => {
-    // Nothing verifies settlement, so the header's CONTENT cannot matter — and
-    // the response must keep saying so whatever is in it.
+    // CHANGED: these used to be served with `x-payment-verified: false`, because
+    // nothing looked at the header at all. Now the header is DECODED before
+    // anything else, and none of these is a base64-encoded JSON object — so
+    // there is no payment here to verify, and the honest answer is the 402 with
+    // the reason attached rather than a free conversion.
+    //
+    // Coverage is kept, not deleted: the property under test is still "an
+    // arbitrary value never buys a verified call". Only the answer moved.
     const ip = ips.pinned(7);
     await exhaust(ip);
     for (const value of ['x', 'null', '{}', 'Bearer nope', '0'.repeat(500)]) {
       const res = await api.convert('md-html', '# hi\n', { ip, headers: { 'x-payment': value } });
-      assert.equal(res.status, 200, `X-PAYMENT ${JSON.stringify(value.slice(0, 12))} answered ${res.status}`);
-      assert.equal(res.headers.get('x-payment-verified'), 'false');
+      assert.equal(res.status, 402, `X-PAYMENT ${JSON.stringify(value.slice(0, 12))} answered ${res.status}`);
+      assert.equal(res.json().invalidReason, 'malformed_payment_header');
+      assert.notEqual(res.headers.get('x-payment-verified'), 'true');
     }
   });
 
@@ -195,7 +265,10 @@ describe('X-PAYMENT raises the ceiling and nothing else', () => {
     try {
       const scratchApi = client(scratch);
       const ip = ips.pinned(9);
-      const paid = { 'x-payment': 'stub' };
+      // A DECODABLE payload, which it now has to be: an undecodable header is
+      // rejected as malformed before the ceiling is ever consulted, so `'stub'`
+      // would have made this a test about parsing rather than about the bound.
+      const paid = { 'x-payment': paymentHeader() };
 
       const first = await scratchApi.convert('md-html', '# hi\n', { ip, headers: paid });
       assert.equal(first.status, 200, first.text);

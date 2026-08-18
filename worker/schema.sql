@@ -68,7 +68,41 @@ CREATE TABLE IF NOT EXISTS convert_quota (
   PRIMARY KEY (day, ip_hash)
 );
 
+-- Settlement ledger. One row per payment ATTEMPT that reached the facilitator,
+-- so this table is the answer to "did anyone actually pay, and did the money
+-- land". It is written on three paths, and the three stay distinguishable:
+--
+--   verify_ok = 1, settle_ok = 1  the money moved; tx_hash is the chain hash
+--   verify_ok = 1, settle_ok = 0  the conversion was served and settlement then
+--                                 failed. The accepted exposure, $0.001 a row.
+--   verify_ok = 0, settle_ok = 0  either the facilitator REJECTED the payment
+--                                 (error = its invalidReason, and no conversion
+--                                 was served) or it could not be reached (error
+--                                 = facilitator-unreachable / -unconfigured /
+--                                 -error, and the conversion WAS served free).
+--
+-- `payer` is an address its owner revealed by paying, and `tx_hash` is public
+-- chain data. Neither is derived from an IP, a user-agent or any other passive
+-- signal, so neither is covered by the daily-salt discard the other tables rely
+-- on — and these rows are kept rather than pruned: they are the revenue record.
+--
+-- NOT written for free-tier calls. The free tier is not a payment path and the
+-- facilitator is never called inside it, so it has nothing to record here.
+CREATE TABLE IF NOT EXISTS settlements (
+  ts        INTEGER,  -- unix seconds, UTC
+  tool      TEXT,     -- entry id, e.g. 'md-html'
+  payer     TEXT,     -- payer address from the payment payload, or NULL
+  amount    TEXT,     -- atomic units as a string, '1000' for $0.001
+  verify_ok INTEGER,  -- 1 | 0
+  settle_ok INTEGER,  -- 1 | 0
+  tx_hash   TEXT,     -- settlement transaction hash, or NULL
+  error     TEXT      -- invalidReason / errorReason / transport reason, or NULL
+);
+
 -- Rung 1 looks up by identifier; the operator read and the 90-day prune scan by time.
 CREATE INDEX IF NOT EXISTS idx_events_id_hash ON events (id_hash);
 CREATE INDEX IF NOT EXISTS idx_events_ts      ON events (ts);
 CREATE INDEX IF NOT EXISTS idx_events_entry   ON events (entry);
+
+-- The operator read on settlements is "what happened lately", so it scans by time.
+CREATE INDEX IF NOT EXISTS idx_settlements_ts ON settlements (ts);

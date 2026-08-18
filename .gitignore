@@ -2,3 +2,8 @@ node_modules/
 dist/
 .wrangler/
 .DS_Store
+
+# The throwaway buyer key written by scripts/create-test-buyer.mjs. A PRIVATE
+# KEY in plaintext — never commit it. (It is chmod 600 as well; see
+# README § Settlement (live).)
+.buyer.env

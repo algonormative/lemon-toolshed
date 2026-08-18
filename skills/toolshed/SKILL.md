@@ -104,10 +104,23 @@ Then:
   no card, no account — the payment is the auth.
 - Never ask the user to paste a private key or a seed phrase. If you have no
   x402 client wired up, say so and offer the local tool from `/check` instead.
-- **Settlement is not verified yet.** The service never treats an `X-PAYMENT`
-  header as paid: any response that sees one carries
-  `x-payment-verified: false`, and `x-pricing: pending` means the call was
-  served without a payment being checked. Do not report such a call as paid.
+- **Payments are verified and settled.** A payment presented against the
+  envelope is checked with the Coinbase CDP facilitator *before* the conversion
+  is served. Read the response headers and report accordingly:
+
+  | header | what happened | report it as |
+  | --- | --- | --- |
+  | `x-payment-verified: true` | verified, and settling on Base | **paid** |
+  | `x-payment-verified: false` + `x-payment-error` | the facilitator could not be reached; served anyway | **served, not charged** |
+  | `x-free-tier-remaining: <n>` | a free call | **free** — never report it as paid |
+
+  A `402` carrying an `invalidReason` means a payment you sent was **rejected**;
+  retrying the same payload will fail identically. Sign a fresh one against the
+  terms in the envelope, and retry once — not in a loop.
+
+- **Inside the free tier, `X-PAYMENT` is ignored.** The free allowance is spent
+  first and the facilitator is never called, so a free-tier call carrying a
+  payment header is still free and still uncharged. Do not report it as paid.
 
 ## 4. The whole catalog
 

@@ -45,6 +45,15 @@ const PHASES = [
     vars: { PAYTO: PAYTO_TEST },
     files: ['test/x402.test.mjs'],
   },
+  {
+    // STANDALONE, and it has to be: this suite runs a mock facilitator on a
+    // port it only learns at startup, and FACILITATOR_URL must name that port.
+    // The worker therefore cannot be booted out here, before the mock exists.
+    // The file boots its own — on its own fresh D1, like every other phase.
+    name: 'settlement (PAYTO + mock facilitator)',
+    standalone: true,
+    files: ['test/x402-settlement.test.mjs'],
+  },
 ];
 
 const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));
@@ -56,6 +65,15 @@ for (const phase of PHASES) {
   if (!files.length) continue;
 
   process.stdout.write(`\n── phase: ${phase.name} ── ${files.length} file(s)\n`);
+
+  if (phase.standalone) {
+    process.stdout.write('   the suite boots its own worker\n\n');
+    // Nothing is exported into the child, so a bootWorker() inside the file
+    // cannot accidentally join a worker left over from an earlier phase.
+    if ((await runNodeTest(files, {})) !== 0) failed = true;
+    continue;
+  }
+
   const worker = await bootWorker({ vars: phase.vars });
   process.stdout.write(`   worker on ${worker.baseUrl}, fresh D1 at ${worker.persistDir}\n\n`);
 

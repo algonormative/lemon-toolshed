@@ -29,6 +29,7 @@
 //    SIGKILL escalation and a synchronous best-effort sweep on process exit.
 
 import { spawn, execFile } from 'node:child_process';
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -75,7 +76,32 @@ const SUITE_OCTET = {
   beacon: 17,
   x402: 18,
   'yaml-json': 19,
+  settlement: 20,
 };
+
+/**
+ * A structurally real CDP Secret API Key that is worth nothing.
+ *
+ * The Worker signs an Ed25519 JWT with this, so it cannot be a placeholder
+ * string — it has to be what CDP actually issues: base64 of 64 bytes, a 32-byte
+ * seed followed by its 32-byte public key. Generated fresh per call and never
+ * sent anywhere but the local mock, so it authorises nothing and there is
+ * nothing to leak. The point is that the JWT path is exercised for real: if
+ * workerd could not import or sign with an Ed25519 key, the settlement suite
+ * would fail rather than quietly skip.
+ */
+export function fakeCdpCredentials() {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const pkcs8 = privateKey.export({ format: 'der', type: 'pkcs8' });
+  const spki = publicKey.export({ format: 'der', type: 'spki' });
+  // Both DER wrappers put the 32 raw bytes last.
+  const seed = pkcs8.subarray(pkcs8.length - 32);
+  const pub = spki.subarray(spki.length - 32);
+  return {
+    CDP_API_KEY_ID: 'test-key-0000-0000-0000-000000000000',
+    CDP_API_KEY_SECRET: Buffer.concat([seed, pub]).toString('base64'),
+  };
+}
 
 /**
  * A per-suite source of caller addresses.
@@ -366,6 +392,25 @@ export function client(worker) {
 // ------------------------------------------------------------------ small helpers
 
 export const sqlString = (value) => `'${String(value).replace(/'/g, "''")}'`;
+
+/**
+ * True when a column read back through `d1()` is SQL NULL.
+ *
+ * Needed because `wrangler d1 execute --json` renders a NULL column as the
+ * STRING "null", not as JSON null — so `assert.equal(row.tx_hash, null)` fails
+ * against a row that is genuinely NULL. Measured 2026-08-18 (wrangler 4.42.2):
+ *
+ *   INSERT … VALUES (NULL)   → {"error":"null","typeof":"null","IS NULL":1}
+ *   INSERT … VALUES ('null') → {"error":"null","typeof":"text","IS NULL":0}
+ *
+ * The two are INDISTINGUISHABLE in the value, which is why this is a helper
+ * rather than a normalisation inside `d1()`: rewriting "null" to null there
+ * would silently corrupt a column legitimately holding the text "null". No
+ * column in worker/schema.sql ever does, but a reader that quietly destroys
+ * data is the wrong default. Where the difference actually matters, select
+ * `typeof(col)` alongside the column and assert on that.
+ */
+export const isSqlNull = (value) => value === null || value === 'null';
 
 /** Seconds from now to the next UTC midnight — what Retry-After should carry. */
 export function secondsToUtcMidnight(at = Date.now()) {

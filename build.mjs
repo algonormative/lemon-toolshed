@@ -1128,6 +1128,36 @@ ${sections.map(renderShelf).join('\n')}
       <p class="note">The wrapper does the 402 handling and the retry; your code just awaits a response. Never paste a private key or a seed phrase into a chat — the key belongs in the environment your client runs in.</p>
     </div>
 
+    <!--
+      HONEST STATUS — DO NOT UPDATE THIS COPY UNTIL A REAL PAYMENT HAS SETTLED.
+
+      NOTE FOR EDITORS: this comment lives inside a JS template literal, so it
+      must contain no backticks and no dollar-brace sequences.
+
+      The Worker now verifies and settles against the CDP facilitator (README
+      section "Settlement (live)"), and the whole path is proven against a mock
+      facilitator AND against a real x402-fetch client in
+      test/x402-settlement.test.mjs. What has NOT happened yet is one real
+      payment, with real USDC, on Base, landing in the real wallet. Until it
+      has, the sentence below stays as it is: "we wrote the code and the tests
+      pass" is not the same claim as "money has moved", and this box exists
+      precisely to not blur the two.
+
+      THE FLIP: run "node scripts/pay-test.mjs --yes" (owner only — it spends
+      real USDC), confirm a settlements row with settle_ok = 1 and a real
+      tx_hash, then replace the <p> below with EXACTLY this, rebuild, redeploy:
+
+      <p><span class="status-label">Honest status</span>The free tier is
+      <strong>live and enforced</strong>, and payment is <strong>live and
+      verified</strong>: a call past the free tier answers the <code>402</code>
+      envelope above, and a payment presented against it is checked with the
+      Coinbase CDP facilitator before the conversion is served — a verified call
+      comes back with <code>x-payment-verified: true</code> and settles on Base
+      immediately afterwards. If the facilitator cannot be reached, the call is
+      served anyway and says so with <code>x-payment-error</code>: at $0.001 the
+      price is a signal, and an outage on our side should not turn a paying
+      caller away.</p>
+    -->
     <div class="status-box">
       <p><span class="status-label">Honest status</span>The free tier is <strong>live and enforced</strong>, and the payment surface is <strong>advertised for real</strong>: a receiving address is configured, so a call past the free tier answers the <code>402</code> envelope above with a live USDC address on Base. What is <em>not</em> live yet is settlement verification — nothing checks that a payment actually landed, so an <code>X-PAYMENT</code> header is never treated as paid; a response that sees one says <code>x-payment-verified: false</code> and the call is served unverified. Settlement verification is the next build; until it lands, the 402 is an honest price signal, not a wall.</p>
     </div>

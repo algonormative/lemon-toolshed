@@ -61,7 +61,24 @@ routes = [
 #
 # [vars]
 # PAYTO = "0x..."            # receiving address for USDC on Base
-# FACILITATOR_URL = "..."    # NOT read yet — settlement verification is unbuilt
+# FACILITATOR_URL = "..."    # OPTIONAL override; defaults to the CDP facilitator
+#                            # (https://api.cdp.coinbase.com/platform/v2/x402).
+#                            # Only the test suite sets it, to reach a local mock.
+#
+# The two CDP credentials are SECRETS, not vars — they never belong in this
+# file, which is committed. Set them once per environment:
+#
+#   npx wrangler secret put CDP_API_KEY_ID
+#   npx wrangler secret put CDP_API_KEY_SECRET
+#
+# Without both, over-tier paid calls are still SERVED (availability-first) but
+# carry `x-payment-verified: false` and `x-payment-error:
+# facilitator-unconfigured`, and every one is recorded in `settlements`. That is
+# a working state, and it is also a revenue-is-zero state — see README
+# § Settlement (live).
+#
+# `settlements` is a NEW TABLE. Run the migration in README § Migration — the
+# settlements table before deploying a Worker that verifies payments.
 
 [[d1_databases]]
 binding = "DB"
