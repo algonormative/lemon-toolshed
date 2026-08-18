@@ -68,4 +68,4 @@ binding = "DB"
 database_name = "lemon_toolshed"
 # Placeholder — local dev only. REPLACE at deploy with the id printed by
 # `wrangler d1 create lemon_toolshed`.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "50c4127d-9f06-47e3-a727-2ebbc0036505"
