@@ -9,8 +9,8 @@
 //                      bundle at build time (worker/catalog.generated.js). No
 //                      fetch, no KV, no D1 — so it is cheap, and it is exempt
 //                      from the rungs below.
-//   POST /convert/<id> the hosted conversions. Rungs 1 and 2 apply here too,
-//                      sharing the same daily counters as /b.
+//   POST /convert/<id> the hosted conversions. Metered on their OWN budget — the
+//                      free tier below — with rung 2 as the outer bound.
 //
 // The file keeps its name because the beacon is still the thing that has to keep
 // working byte-for-byte; the conversions grew around it.
@@ -19,6 +19,12 @@
 //   0  edge rate-limiting rule, 5 req / 10 s per IP, action block  [dashboard, not here]
 //      NOTE: the rule's expression must cover /b AND /convert/* — see README § Deploy.
 //   1  per-identifier token count, 100 events / identifier / UTC day   [below]
+//      /b ONLY. Convert rows are excluded from the count, so a busy converting
+//      caller no longer spends the beacon's budget, and vice versa.
+//   1c the conversion free tier, FREE_TIER_DAILY calls / caller / UTC day  [below]
+//      Its caller key is hash(daily salt + IP) with NO user-agent, on purpose:
+//      rotating a UA string must not mint a fresh allowance. A second identity
+//      costs a second IP, which is the cheapest spoof-resistance available here.
 //   2  global fail-closed, 200,000 events / UTC day                    [below]
 //   3  the residual — priced, not bounded by mechanism; detective controls
 //      are the $25 billing alert plus the route-disable runbook in README.md
@@ -41,12 +47,23 @@ import { marked } from 'marked';
 import yaml from 'js-yaml';
 import TurndownService from 'turndown';
 import domino from '@mixmark-io/domino';
-import { CATALOG, SITE_BASE } from './catalog.generated.js';
+// FREE_TIER_DAILY is generated, not typed here: it lives in build.mjs and is
+// compiled into catalog.generated.js, so the number the page advertises, the
+// number catalog.json publishes and the number enforced below cannot drift
+// apart. OWNER-TUNABLE — edit build.mjs and rebuild.
+import { CATALOG, SITE_BASE, FREE_TIER_DAILY } from './catalog.generated.js';
 
 const MAX_BODY = 1024; // bytes; a legitimate beacon body is ~40
 const MAX_ENTRY_ID = 64;
 const RUNG1_PER_ID_PER_DAY = 100;
 const RUNG2_GLOBAL_PER_DAY = 200_000;
+
+// The paid ceiling. A runaway bound, NOT a quota to advertise: it is deliberately
+// absent from the catalog, the page and the machine files, because publishing it
+// would read as a promise. OWNER-TUNABLE.
+const PAID_DAILY = 5000;
+
+const SECONDS_PER_DAY = 86_400;
 
 const MAX_CONVERT_BODY = 256 * 1024; // 256 KB
 const MAX_QUERY_LEN = 64;
@@ -210,7 +227,7 @@ async function handleConvert(request, env, path) {
   const declared = Number(request.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > MAX_CONVERT_BODY) return tooLarge();
 
-  // --- rungs 1 and 2, sharing /b's daily counters ------------------------
+  // --- the conversion budget ---------------------------------------------
   const db = env.DB;
   if (!db) return json({ error: 'conversion is unavailable' }, 503);
 
@@ -218,18 +235,43 @@ async function handleConvert(request, env, path) {
   const day = new Date(now * 1000).toISOString().slice(0, 10); // UTC
   const dayStart = Math.floor(Date.parse(`${day}T00:00:00Z`) / 1000);
 
+  // The paid tier needs BOTH halves: an address to pay to, and a payment
+  // presented. Either alone leaves the caller on the free tier.
+  const payTo = env.PAYTO || '';
+  const presented = !!request.headers.get('x-payment');
+  const paid = !!payTo && presented;
+  const ceiling = paid ? PAID_DAILY : FREE_TIER_DAILY;
+
+  let remaining;
   try {
     const salt = await currentSalt(db, day);
     const ip = request.headers.get('cf-connecting-ip') || '';
     const ua = request.headers.get('user-agent') || '';
+
+    // TWO identities, and the difference is the whole spoof-resistance argument:
+    //   ipHash  the quota key — salt + IP, NO user-agent. A rotated UA string
+    //           must not mint a fresh free allowance; a fresh identity has to
+    //           cost a fresh IP.
+    //   idHash  the measurement identity written to `events` — salt + IP + UA,
+    //           unchanged, so that column keeps the meaning schema.sql documents
+    //           and the beacon's rung-1 identifier space is untouched.
+    const ipHash = await truncatedHash(salt + ip);
     const idHash = await truncatedHash(salt + ip + ua);
 
-    if (await rungsExceeded(db, idHash, day, dayStart)) {
+    // Rung 2 is still the outer bound over every route, and it is read first:
+    // a doomsday day should not spend anyone's daily allowance.
+    if (await globalExceeded(db, day)) {
       return json({ error: 'daily call limit reached' }, 429);
     }
 
-    // One row per accepted call: that a call happened, and which tool. The
-    // input is never written. This is also what makes rung 1 bite on /convert.
+    const used = await claimConvertQuota(db, day, ipHash, ceiling);
+    if (used === null) return overQuota(entry, conv, { payTo, paid, now, dayStart });
+    remaining = ceiling - used;
+
+    // One row per accepted call: that a call happened, and which tool. The input
+    // is never written. These rows are MEASUREMENT now — convert_quota is what
+    // rate-limits conversions — so they no longer spend the beacon's rung-1
+    // budget, and beacon events no longer spend conversions. Separate budgets.
     await recordEvent(db, {
       now,
       day,
@@ -242,10 +284,6 @@ async function handleConvert(request, env, path) {
     // Fail closed: an unreachable limiter means no conversions, not unlimited ones.
     return json({ error: 'conversion is unavailable' }, 503);
   }
-
-  // --- payment gate ------------------------------------------------------
-  const gate = paymentGate(entry, conv, env, request);
-  if (gate.response) return gate.response;
 
   // --- read, convert -----------------------------------------------------
   let input;
@@ -270,59 +308,98 @@ async function handleConvert(request, env, path) {
 
   return new Response(output, {
     status: 200,
-    headers: { 'content-type': conv.contentType, ...gate.headers },
+    headers: { 'content-type': conv.contentType, ...servedHeaders({ paid, presented, remaining }) },
   });
 }
 
 const tooLarge = () =>
   json({ error: `input is larger than the ${MAX_CONVERT_BODY / 1024} KB limit` }, 413);
 
-// ------------------------------------------------------------------ x402
+// ------------------------------------------------------------------ tiers & x402
 //
-// What is implemented, and what is not:
+// Every hosted tool is priced, and every hosted tool is free to try:
+// FREE_TIER_DAILY calls per caller per UTC day, no login. What happens on call
+// FREE_TIER_DAILY + 1 is the only question, and it has two answers:
 //
-//   PAYTO unset            → the conversion is served free, with `x-pricing: pending`.
-//   PAYTO set, no payment  → HTTP 402 with a spec-valid x402 v1 envelope.
-//   PAYTO set, X-PAYMENT   → the conversion is served free, with `x-pricing: pending`
-//                            and `x-payment-verified: false`.
+//   PAYTO unset (today)  → HTTP 429. There is nowhere to pay yet, so the answer
+//                          says exactly that instead of sending a 402 nobody can
+//                          satisfy.
+//   PAYTO set            → HTTP 402 with a spec-valid x402 v1 envelope: pay to
+//                          continue.
 //
-// The last line is the honest one: settlement verification needs a facilitator,
-// FACILITATOR_URL is not wired up yet, and this Worker will not pretend to have
-// checked a payment it cannot check. Full enforcement lands with the facilitator.
+// Inside the free tier the conversion is simply served, with the count that is
+// left in `x-free-tier-remaining`.
+//
+// What is NOT implemented, and is not pretended: settlement verification needs a
+// facilitator, FACILITATOR_URL is not wired up, and this Worker will never claim
+// to have checked a payment it cannot check. A request that presents X-PAYMENT
+// today changes exactly one thing — its ceiling — and every response that sees
+// one carries `x-payment-verified: false`. The paid tier ACTIVATES FOR REAL WHEN
+// FACILITATOR_URL VERIFICATION LANDS; until then X-PAYMENT is an unverified claim.
 
-function paymentGate(entry, conv, env, request) {
-  const price = entry.hosted.price;
-  if (price === 'free') return { headers: {} };
+function servedHeaders({ paid, presented, remaining }) {
+  const headers = {};
+  // The free tier's promise, made checkable on every call.
+  if (!paid) headers['x-free-tier-remaining'] = String(Math.max(0, remaining));
+  // A paid-tier call was served without settlement being verified. Say so.
+  if (paid) headers['x-pricing'] = 'pending';
+  // Never fake-verify: any response that saw an X-PAYMENT header says it did not
+  // check it, whether or not PAYTO is configured.
+  if (presented) headers['x-payment-verified'] = 'false';
+  return headers;
+}
 
-  const payTo = env.PAYTO;
-  if (!payTo) return { headers: { 'x-pricing': 'pending' } };
+function overQuota(entry, conv, { payTo, paid, now, dayStart }) {
+  // Seconds to the next UTC midnight, which is when every counter resets.
+  const retryAfter = String(Math.max(1, dayStart + SECONDS_PER_DAY - now));
 
-  if (request.headers.get('x-payment')) {
-    return { headers: { 'x-pricing': 'pending', 'x-payment-verified': 'false' } };
+  // The paid ceiling is a runaway bound, not a price gate. A caller that already
+  // presented a payment cannot buy its way past it, so answering 402 "pay to
+  // continue" would be a lie; it gets the plain rate-limit answer instead.
+  if (paid) {
+    return json(
+      { error: 'the daily conversion ceiling for this caller is reached', retry: 'tomorrow UTC' },
+      429,
+      { 'retry-after': retryAfter, 'x-payment-verified': 'false' }
+    );
   }
 
-  return {
-    response: json(
-      {
-        x402Version: 1,
-        error: 'X-PAYMENT header is required',
-        accepts: [
-          {
-            scheme: price.scheme || 'exact',
-            network: 'base',
-            maxAmountRequired: atomicAmount(price.amount_usd),
-            resource: `${SITE_BASE}${entry.hosted.path}`,
-            description: conv.description,
-            mimeType: conv.mimeType,
-            payTo,
-            maxTimeoutSeconds: X402_TIMEOUT_SECONDS,
-            asset: USDC_BASE,
-          },
-        ],
-      },
-      402
-    ),
-  };
+  const price = entry.hosted.price;
+  if (payTo && price !== 'free') return paymentRequired(entry, conv, price, payTo);
+
+  return json(
+    {
+      error: `free tier is ${FREE_TIER_DAILY} conversions per day per caller`,
+      free_tier_daily: FREE_TIER_DAILY,
+      paid_tier: 'per-call USDC via x402 — activating soon',
+      retry: 'tomorrow UTC',
+    },
+    429,
+    { 'retry-after': retryAfter }
+  );
+}
+
+function paymentRequired(entry, conv, price, payTo) {
+  return json(
+    {
+      x402Version: 1,
+      error: 'X-PAYMENT header is required',
+      accepts: [
+        {
+          scheme: price.scheme || 'exact',
+          network: 'base',
+          maxAmountRequired: atomicAmount(price.amount_usd),
+          resource: `${SITE_BASE}${entry.hosted.path}`,
+          description: conv.description,
+          mimeType: conv.mimeType,
+          payTo,
+          maxTimeoutSeconds: X402_TIMEOUT_SECONDS,
+          asset: USDC_BASE,
+        },
+      ],
+    },
+    402
+  );
 }
 
 const atomicAmount = (usd) => String(Math.round(usd * 10 ** USDC_DECIMALS));
@@ -481,22 +558,49 @@ const HOSTED = new Map(
 
 // ------------------------------------------------------------------ store
 
-// Rungs 1 and 2, in that order, shared by /b and /convert.
+// Rungs 1 and 2, in that order. Rung 1 is the BEACON's budget only.
 //   1  per-identifier token count. Identifiers expire daily with the salt, so
 //      today's rows are all this identifier has; the ts predicate is
-//      belt-and-braces across a rotation.
+//      belt-and-braces across a rotation. Convert rows are excluded — they are
+//      metered by convert_quota, and a shared budget meant a caller that made
+//      99 conversions could no longer be counted as a visitor.
 //   2  global fail-closed, read before every insert.
 async function rungsExceeded(db, idHash, day, dayStart) {
   const seen = await db
-    .prepare('SELECT COUNT(*) AS n FROM events WHERE id_hash = ?1 AND ts >= ?2')
+    .prepare("SELECT COUNT(*) AS n FROM events WHERE id_hash = ?1 AND ts >= ?2 AND type <> 'convert'")
     .bind(idHash, dayStart)
     .first();
   if ((seen?.n ?? 0) >= RUNG1_PER_ID_PER_DAY) return true;
 
-  const counter = await db.prepare('SELECT total FROM counters WHERE day = ?1').bind(day).first();
-  if ((counter?.total ?? 0) >= RUNG2_GLOBAL_PER_DAY) return true;
+  return await globalExceeded(db, day);
+}
 
-  return false;
+// Rung 2 on its own — /convert reads it without touching rung 1's identifier count.
+async function globalExceeded(db, day) {
+  const counter = await db.prepare('SELECT total FROM counters WHERE day = ?1').bind(day).first();
+  return (counter?.total ?? 0) >= RUNG2_GLOBAL_PER_DAY;
+}
+
+// The conversion budget: claim one call, atomically.
+//
+// The guarded upsert IS the mechanism — the same idiom the salt rotation uses.
+// The row is created at 1, and incremented only WHILE it is under the ceiling, so
+// the "may I" read and the "spend one" write cannot race apart across isolates.
+// No row comes back when the guard fails, and that is the over-quota signal.
+//
+// Keyed on (day, ip_hash) where ip_hash carries no user-agent: see handleConvert.
+// Returns the new count, or null when the ceiling is already reached.
+async function claimConvertQuota(db, day, ipHash, ceiling) {
+  const row = await db
+    .prepare(
+      'INSERT INTO convert_quota (day, ip_hash, used) VALUES (?1, ?2, 1) ' +
+        'ON CONFLICT(day, ip_hash) DO UPDATE SET used = convert_quota.used + 1 ' +
+        'WHERE convert_quota.used < ?3 ' +
+        'RETURNING used'
+    )
+    .bind(day, ipHash, ceiling)
+    .first();
+  return typeof row?.used === 'number' ? row.used : null;
 }
 
 async function recordEvent(db, { now, day, type, idHash, entry, refClass }) {

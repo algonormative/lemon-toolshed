@@ -1,4 +1,4 @@
--- Toolshed store (D1). Four tables plus one counter row per day.
+-- Toolshed store (D1). Five tables plus one counter row per day.
 --
 -- Retention is an operator chore, not a cron (the Worker exports no `scheduled`
 -- handler by design). The queries that enforce the published retention promises
@@ -10,9 +10,10 @@
 -- No IP, no user-agent and no raw referrer are ever written here, and no
 -- conversion input is ever written here.
 --
--- One row per beacon event AND one row per accepted /convert call, because
--- rungs 1 and 2 count rows: a conversion that wrote nothing here would not be
--- rate-limited. That is why the three types share one table.
+-- One row per beacon event AND one row per accepted /convert call. The three
+-- types share one table because they are one measurement — what got used — but
+-- they no longer share one BUDGET: rung 1 counts rows where type <> 'convert',
+-- and conversions are metered by convert_quota below.
 CREATE TABLE IF NOT EXISTS events (
   ts        INTEGER,  -- unix seconds, UTC
   type      TEXT,     -- 'visit' | 'click' | 'convert'
@@ -51,6 +52,20 @@ CREATE TABLE IF NOT EXISTS salt (
 CREATE TABLE IF NOT EXISTS counters (
   day   TEXT PRIMARY KEY,
   total INTEGER
+);
+
+-- The conversion free tier: one row per caller per UTC day, claimed by a guarded
+-- upsert in worker/beacon.js. `ip_hash` is the first 16 hex chars of
+-- SHA-256(daily_salt + ip) — the IP ALONE, no user-agent, because rotating a UA
+-- string must not mint a fresh daily allowance. It is unlinkable across days for
+-- the same reason `events.id_hash` is: the salt is overwritten, and the overwrite
+-- is the discard. Only today's row is ever read; older rows are pruned on the
+-- same 90-day chore as the raw events (README.md § Retention chores).
+CREATE TABLE IF NOT EXISTS convert_quota (
+  day     TEXT,     -- UTC date, YYYY-MM-DD
+  ip_hash TEXT,     -- truncated day-scoped hash of the IP alone
+  used    INTEGER,  -- conversions claimed today
+  PRIMARY KEY (day, ip_hash)
 );
 
 -- Rung 1 looks up by identifier; the operator read and the 90-day prune scan by time.

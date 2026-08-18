@@ -47,16 +47,28 @@ const API_HOST = process.env.API_HOST || HOST;
 const API_SCHEME = /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(API_HOST) ? 'http' : 'https';
 const API_BASE = `${API_SCHEME}://${API_HOST}`;
 
+// The free tier, in one place. This constant is the single source of truth for
+// the number: it is printed on the page, published in catalog.json, llms.txt and
+// llms-full.txt, AND compiled into worker/catalog.generated.js, which is where
+// the Worker reads it to enforce the limit. Change it here and everything the
+// site claims and everything it enforces move together.
+//
+// OWNER-TUNABLE. It is deliberately severe: a free tier exists to let an agent
+// try the thing, not to be a free service, and the caller key it is counted
+// against (a daily-salted hash of the IP alone) is the cheapest spoof-resistance
+// available — a fresh identity costs a fresh IP, not a fresh user-agent string.
+const FREE_TIER_DAILY = 10;
+
 const SITE_NAME = 'Toolshed';
 const HOUSE = 'Lemon';
 const KICKER = 'the Lemon';
 const STRAPLINE =
-  'A collection of tools for agents — no install required. Privacy-first: no login, no credit card. ' +
-  'Pay per call with USDC; many tools are free.';
+  'A collection of tools for agents — no install required. Privacy-first: no login, no credit card, ' +
+  'no account. Every tool is free to try.';
 const TITLE = `${SITE_NAME} — tools for agents · ${HOUSE}`;
 const META_DESCRIPTION =
-  'Conversion tools an agent can call over HTTP with nothing installed. No login, no credit card. ' +
-  'Many tools are free; priced ones take USDC per call with x402.';
+  `Conversion tools an agent can call over HTTP with nothing installed. No login, no credit card. ` +
+  `Every tool is free to try — ${FREE_TIER_DAILY} conversions a day — then priced per call in USDC with x402.`;
 
 // Refresh cadence is monthly (~4 h/month, dossier § Estimates). Entries whose
 // `verified` date predates it are flagged in the build (dossier § Components 7).
@@ -230,6 +242,13 @@ const priceLabel = (price) =>
 
 const isFree = (hosted) => hosted && hosted.price === 'free';
 
+// What a hosted tool costs, in one phrase: the free tier first, because that is
+// what a caller meets first.
+const tierLabel = (hosted) =>
+  isFree(hosted)
+    ? `free, ${FREE_TIER_DAILY}/day cap`
+    : `${FREE_TIER_DAILY}/day free, then ${priceLabel(hosted.price)}`;
+
 // ---------------------------------------------------------------- load
 
 const raw = yaml.load(readFileSync(join(ROOT, 'entries.yaml'), 'utf8'));
@@ -283,7 +302,10 @@ for (const e of entries) {
       problems.push(`${e.id}: hosted.price must be "free" or { amount_usd, scheme }`);
       price = 'free';
     }
-    e._hosted = { path: wantPath, price, status: h.status };
+    // free_tier_daily rides along on every hosted entry, so catalog.json, the
+    // Worker's compiled catalog and therefore GET /check all state the tier
+    // rule per tool instead of leaving a reader to find it in prose.
+    e._hosted = { path: wantPath, price, status: h.status, free_tier_daily: FREE_TIER_DAILY };
   }
 
   e._xlabel = labelOf(e.x, e.id, 'x');
@@ -320,9 +342,24 @@ const sections = CATEGORY_ORDER.map((c) => [c, grouped.get(c)]).filter(([, list]
 
 const hostedEntries = entries.filter((e) => e._hosted);
 const hostedLive = hostedEntries.filter((e) => e._hosted.status === 'live');
-const hostedFree = hostedEntries.filter((e) => isFree(e._hosted));
 const localOnly = entries.filter((e) => !e._hosted);
-const SUMMARY = `${hostedEntries.length} hosted (${hostedFree.length} free) · ${localOnly.length} local references.`;
+
+// The one pricing sentence the whole site repeats — page, machine files, README.
+// The price is DERIVED from entries.yaml rather than typed here a second time:
+// when every priced tool costs the same, the sentence names the figure; price
+// them differently and the phrasing degrades honestly instead of lying.
+const priceAmounts = Array.from(
+  new Set(hostedEntries.filter((e) => !isFree(e._hosted)).map((e) => e._hosted.price.amount_usd))
+);
+const PRICE_PHRASE =
+  priceAmounts.length === 1 ? `$${priceAmounts[0]} in USDC via x402` : 'a per-call price in USDC via x402';
+const PRICING_LINE =
+  `Every tool is free to try: ${FREE_TIER_DAILY} conversions a day, no login. ` +
+  `Past that it's a paid call — ${PRICE_PHRASE}, with much higher limits.`;
+
+const SUMMARY =
+  `${hostedEntries.length} hosted · ${localOnly.length} local references. ` +
+  `${FREE_TIER_DAILY} free conversions a day on every hosted tool.`;
 
 const BUILD_DATE = new Date().toISOString().slice(0, 10);
 
@@ -443,7 +480,13 @@ code {
   font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
   font-size: 0.78rem; letter-spacing: 0.16em; text-transform: lowercase;
 }
-.strapline { color: var(--muted); margin: 0 0 1.6rem; font-size: 1.08rem; }
+.strapline { color: var(--muted); margin: 0 0 1rem; font-size: 1.08rem; }
+/* The standing offer. Marked, not shouted — a rule down the side is enough to
+   make it the second thing read after the name. */
+.pricing-line {
+  margin: 0 0 1.6rem; font-size: 1.02rem;
+  padding-left: 0.85rem; border-left: 3px solid var(--accent);
+}
 .stance { font-size: 1.02rem; margin: 0 0 0.9rem; }
 .note { color: var(--muted); font-size: 0.92rem; }
 .draft-note { margin: 0 0 0.4rem; }
@@ -559,7 +602,7 @@ code {
 /* ---- hosted row ------------------------------------------------------ */
 .hostedrow {
   margin: 0 0 0.5rem;
-  display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap;
+  display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap;
 }
 /* Deliberately NOT uppercased, unlike .kind: the pill carries "x402" and
    "$0.001/call", and shouting them as X402 misspells a protocol name. */
@@ -824,10 +867,10 @@ function cmdRow(command, label, extraClass = '') {
   return `<div class="${cls}"><code>${esc(command)}</code><button type="button" class="copy js-only" aria-label="${esc(label)}">copy</button></div>`;
 }
 
-// The worked example in "How to get my agent to pay with USDC?". Deliberately
-// short: two imports, an account, the wrapper, one call. The priced endpoint is
-// the one real priced tool in the shed, so the snippet is runnable rather than
-// illustrative — modulo settlement, which is not switched on yet.
+// The worked example in the pricing section. Deliberately short: two imports, an
+// account, the wrapper, one call. Every hosted tool is priced past the free tier,
+// so the snippet is runnable rather than illustrative — modulo settlement, which
+// is not switched on yet.
 const X402_SNIPPET = [
   'import { wrapFetchWithPayment } from "x402-fetch";',
   'import { privateKeyToAccount } from "viem/accounts";',
@@ -840,16 +883,24 @@ const X402_SNIPPET = [
   'console.log(await res.text());',
 ].join('\n');
 
+// Two pills, because there are two facts and the first one is the offer: what it
+// costs to try (nothing, FREE_TIER_DAILY a day) and what a call costs past that.
+function pricePills(h) {
+  if (h.status === 'planned') return '<span class="pill pill-planned">planned</span>';
+  const free = `<span class="pill pill-free">${FREE_TIER_DAILY}/day free</span>`;
+  if (isFree(h)) return free;
+  return `${free}
+            <span class="pill pill-paid">$${esc(h.price.amount_usd)} x402</span>`;
+}
+
 function hostedBlock(e) {
   const h = e._hosted;
   if (!h) return '';
   const planned = h.status === 'planned';
-  const pillClass = planned ? 'pill-planned' : isFree(h) ? 'pill-free' : 'pill-paid';
-  const pillText = planned ? 'planned' : `hosted · ${priceLabel(h.price)}`;
   // The kind chip is NOT repeated here — the tool row below carries it on every
   // card, hosted or not.
   const row = `          <p class="hostedrow">
-            <span class="pill ${pillClass}">${esc(pillText)}</span>
+            ${pricePills(h)}
           </p>`;
   if (planned) return `${row}\n          <p class="note">Not live yet — the tool below is the one to reach for meanwhile.</p>`;
   return `${row}\n          ${cmdRow(convertCurl(e), `Copy the convert command for ${oneLine(e.x)} to ${oneLine(e.y)}`)}`;
@@ -926,7 +977,7 @@ const kindChips = KINDS.map(
 const NAV = [
   ['#shelves', 'Shelves'],
   ['#for-agents', 'For agents'],
-  ['#pay-with-usdc', 'Pay with USDC'],
+  ['#pay-with-usdc', 'Pricing'],
   ['#how-we-count', 'How we count'],
   ['#privacy', 'Privacy'],
   ['catalog.json', 'catalog.json'],
@@ -968,6 +1019,7 @@ ${NAV.map(([href, label]) => `      <a href="${href}">${esc(label)}</a>`).join('
     <p class="kicker">${esc(KICKER)}</p>
     <h1>${SITE_NAME}</h1>
     <p class="strapline">${esc(STRAPLINE)}</p>
+    <p class="pricing-line">${esc(PRICING_LINE)}</p>
 
     <p class="stance">${esc(STANCE)}</p>
     <p class="note draft-note">Curation is an owner-taste surface. These ${entries.length} entries are drafts for review.</p>
@@ -1018,11 +1070,11 @@ ${sections.map(renderShelf).join('\n')}
     <h4>1. Check what is available, then convert</h4>
     <div class="agent-row">
       ${cmdRow(`curl "${API_BASE}/check?from=markdown&to=html"`, 'Copy the availability check command')}
-      <p class="note">Returns the matching pairs with their endpoint, price and status. <code>from</code> is matched against what you have, <code>to</code> against what you need. No parameters returns every hosted tool.</p>
+      <p class="note">Returns the matching pairs with their endpoint, price, free-tier allowance and status. <code>from</code> is matched against what you have, <code>to</code> against what you need. No parameters returns every hosted tool.</p>
     </div>
     <div class="agent-row">
       ${cmdRow(`curl -X POST "${API_BASE}/convert/md-html" --data-binary @README.md`, 'Copy the convert command')}
-      <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB.</p>
+      <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB. The first ${FREE_TIER_DAILY} calls a day are free and say how many are left in <code>x-free-tier-remaining</code>; past that the answer is a <code>402</code> asking for payment, or a <code>429</code> while payment is switched off.</p>
     </div>
 
     <h4>2. The whole catalog as files</h4>
@@ -1057,8 +1109,10 @@ ${sections.map(renderShelf).join('\n')}
   </section>
 
   <section class="prose" id="pay-with-usdc">
-    <h2>How to get my agent to pay with USDC?</h2>
-    <p>Most tools here are free and just answer. A priced tool answers <strong>HTTP 402</strong> instead, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation.</p>
+    <h2>Pricing, and paying with USDC</h2>
+    <p>${esc(PRICING_LINE)}</p>
+    <p>The free tier needs no account, no key and no wallet — just call the endpoint. Every free-tier answer carries an <code>x-free-tier-remaining</code> header saying how many of the day's ${FREE_TIER_DAILY} are left, and the count resets at midnight UTC. It is counted per caller, where a caller is an IP address: rotating your user-agent does not get you a second ${FREE_TIER_DAILY}.</p>
+    <p>Past the free tier, a call answers <strong>HTTP 402</strong>, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation.</p>
 
     <p>Your agent needs two things to answer it:</p>
     <ol>
@@ -1075,7 +1129,7 @@ ${sections.map(renderShelf).join('\n')}
     </div>
 
     <div class="status-box">
-      <p><span class="status-label">Honest status</span>Pricing is <strong>not enforced yet</strong> — priced tools currently answer free with an <code>x-pricing: pending</code> header. When settlement goes live, the 402 above is the only gate.</p>
+      <p><span class="status-label">Honest status</span>The free tier is <strong>live and enforced</strong>. Payment is <strong>not switched on yet</strong>: no receiving address is configured, so a call past the free tier answers <code>429</code> — the day's free calls are spent, come back tomorrow — rather than the <code>402</code> above. And nothing verifies settlement, so an <code>X-PAYMENT</code> header is never treated as paid; a response that sees one says <code>x-payment-verified: false</code>. When settlement goes live, the 402 is the gate.</p>
     </div>
   </section>
 
@@ -1083,13 +1137,14 @@ ${sections.map(renderShelf).join('\n')}
     <h2>How we count</h2>
     <p>This page runs a small script that reports two things: that the page loaded, and which outbound link was clicked. Nothing else is collected — filtering and copying send nothing — and links are plain links, so they work with the script blocked.</p>
     <p>Conversion calls are counted too: one row per call, recording that a call happened and which tool it used. The file you send is not stored and not logged.</p>
+    <p>The free-tier counter is separate, and it is the one place a caller is identified across calls: it is keyed on a daily-salted hash of the IP address alone — no user-agent, so rotating one does not mint a fresh allowance — which makes it unlinkable across days once the salt is replaced, and it is kept on the same retention as every other counter here.</p>
     <p>Here is the counting policy in full: ${esc(BOT_POLICY)}. Click delivery is best-effort, so the click number is a floor rather than a total.</p>
   </section>
 
   <section class="prose" id="privacy">
     <h2>Privacy</h2>
     <p>There are two stores here, and they answer a "what do you hold on me" request differently.</p>
-    <p><strong>The counting store</strong> holds a short hash, not an address. The hash is salted with random bytes that are replaced at the first request of each UTC day, and replacing them is the deletion: once the old salt is gone, nothing in the store points back to anyone. Rows are kept 90 days at most, then reduced to daily totals and deleted. Files you send to a conversion endpoint are never written to it.</p>
+    <p><strong>The counting store</strong> holds a short hash, not an address. The hash is salted with random bytes that are replaced at the first request of each UTC day, and replacing them is the deletion: once the old salt is gone, nothing in the store points back to anyone. Rows are kept 90 days at most, then reduced to daily totals and deleted. Files you send to a conversion endpoint are never written to it. The free-tier counter lives in the same store under the same rules — a daily-salted hash of the IP alone, one row per caller per day, pruned on the same 90-day chore.</p>
     <p><strong>An IP blocklist</strong> exists to stop abuse. It is keyed on the address, so it does identify a requester, and we delete an address on request; rows expire 90 days after they were last seen.</p>
   </section>
 
@@ -1135,7 +1190,12 @@ const catalog = {
     base: API_BASE,
     check: `${API_BASE}/check?from=<what you have>&to=<what you need>`,
     convert: `${API_BASE}/convert/<id>`,
-    note: 'Entries with a hosted block run on our server. Priced ones answer HTTP 402 with an x402 envelope; free ones just answer. Entries without a hosted block are local-only references.',
+    free_tier_daily: FREE_TIER_DAILY,
+    note:
+      `Entries with a hosted block run on our server. Every one is free to try — ${FREE_TIER_DAILY} conversions ` +
+      'per caller (per IP) per UTC day, reported in an x-free-tier-remaining header — and priced per call past ' +
+      'that: HTTP 402 with an x402 envelope, or HTTP 429 with a Retry-After while payment is switched off. ' +
+      'Entries without a hosted block are local-only references.',
   },
   entries: entries.map(catalogEntry),
 };
@@ -1143,9 +1203,7 @@ const catalog = {
 // ---------------------------------------------------------------- llms.txt
 
 const hostedLine = (e) =>
-  e._hosted
-    ? `hosted ${e._hosted.status} ${priceLabel(e._hosted.price)} at POST ${e._hosted.path}`
-    : 'local only';
+  e._hosted ? `hosted ${e._hosted.status}, ${tierLabel(e._hosted)}, at POST ${e._hosted.path}` : 'local only';
 
 const API_HEADER = [
   `Availability check: GET ${API_BASE}/check?from=<what you have>&to=<what you need>`,
@@ -1153,10 +1211,15 @@ const API_HEADER = [
   `  to against the "need" side only. No parameters returns every hosted tool.`,
   `Convert: POST ${API_BASE}/convert/<id> with the raw file as the body (256 KB cap).`,
   `  The converted file comes back as the body, with the right Content-Type.`,
-  `Payment: priced tools answer HTTP 402 with an x402 envelope (USDC on Base). Free tools just answer.`,
+  `Tiers: every hosted tool is free to try — ${FREE_TIER_DAILY} conversions per caller per UTC day, no login —`,
+  `  and priced per call past that. A caller is an IP address (rotating the user-agent does not reset it);`,
+  `  every free-tier response carries x-free-tier-remaining: <n>, and the count resets at midnight UTC.`,
+  `Payment: past the free tier a call answers HTTP 402 with an x402 envelope (USDC on Base).`,
   `  No accounts, no keys, per-call pricing. Pay with an x402-capable client (x402-fetch, the x402`,
   `  SDK, Coinbase AgentKit) holding a wallet key with USDC on Base; it signs and retries with an`,
-  `  X-PAYMENT header. NOT ENFORCED YET: priced tools currently answer free with x-pricing: pending.`,
+  `  X-PAYMENT header. NOT SWITCHED ON YET: with no receiving address configured, a call past the free`,
+  `  tier answers HTTP 429 with a Retry-After instead of a 402, and nothing verifies settlement — a`,
+  `  response that sees an X-PAYMENT header says x-payment-verified: false rather than treating it as paid.`,
   `Skill: npx skills add chronick/lemon-toolshed`,
   `MCP: claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed`,
   `  Tools: toolshed_check, toolshed_convert, toolshed_catalog. Base URL via TOOLSHED_URL.`,
@@ -1209,6 +1272,7 @@ const llmsFull = [
           ? [
               `hosted_path: POST ${e._hosted.path}`,
               `hosted_price: ${priceLabel(e._hosted.price)}`,
+              `hosted_free_tier: ${e._hosted.free_tier_daily} conversions per caller per UTC day`,
               `hosted_status: ${e._hosted.status}`,
             ]
           : []),
@@ -1239,6 +1303,10 @@ const workerCatalog = `// GENERATED by build.mjs from entries.yaml. Do not edit 
 
 export const SITE_BASE = ${JSON.stringify(BASE)};
 
+// The free tier, compiled in from build.mjs so the number the site advertises and
+// the number the Worker enforces are the same number. OWNER-TUNABLE in build.mjs.
+export const FREE_TIER_DAILY = ${FREE_TIER_DAILY};
+
 export const CATALOG = ${JSON.stringify(
   entries.map((e) => ({
     id: e.id,
@@ -1266,7 +1334,7 @@ writeFileSync(join(ROOT, 'worker', 'catalog.generated.js'), workerCatalog);
 console.log(`build: ${entries.length} entries on ${sections.length} shelves`);
 for (const [category, list] of sections) console.log(`  ${category}: ${list.length}`);
 console.log(`build: ${SUMMARY} ${hostedLive.length} hosted live`);
-for (const e of hostedLive) console.log(`  POST ${e._hosted.path} — ${priceLabel(e._hosted.price)}`);
+for (const e of hostedLive) console.log(`  POST ${e._hosted.path} — ${tierLabel(e._hosted)}`);
 console.log(`build: beacon URL ${BEACON_URL}`);
 console.log(`build: site host ${BASE}`);
 console.log(`build: api host ${API_BASE}`);

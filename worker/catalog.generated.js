@@ -6,6 +6,10 @@
 
 export const SITE_BASE = "https://toolshed.lemon-agent.dev";
 
+// The free tier, compiled in from build.mjs so the number the site advertises and
+// the number the Worker enforces are the same number. OWNER-TUNABLE in build.mjs.
+export const FREE_TIER_DAILY = 10;
+
 export const CATALOG = [
   {
     "id": "markdown-to-pdf",
@@ -50,7 +54,8 @@ export const CATALOG = [
         "amount_usd": 0.001,
         "scheme": "exact"
       },
-      "status": "live"
+      "status": "live",
+      "free_tier_daily": 10
     },
     "local": {
       "tool": "pandoc",
@@ -64,8 +69,12 @@ export const CATALOG = [
     "y": "HTML",
     "hosted": {
       "path": "/convert/md-html",
-      "price": "free",
-      "status": "live"
+      "price": {
+        "amount_usd": 0.001,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 10
     },
     "local": {
       "tool": "pandoc",
@@ -167,8 +176,12 @@ export const CATALOG = [
     "y": "YAML",
     "hosted": {
       "path": "/convert/json-yaml",
-      "price": "free",
-      "status": "live"
+      "price": {
+        "amount_usd": 0.001,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 10
     },
     "local": {
       "tool": "yq",
@@ -182,8 +195,12 @@ export const CATALOG = [
     "y": "JSON",
     "hosted": {
       "path": "/convert/yaml-json",
-      "price": "free",
-      "status": "live"
+      "price": {
+        "amount_usd": 0.001,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 10
     },
     "local": {
       "tool": "yq",
@@ -197,8 +214,12 @@ export const CATALOG = [
     "y": "JSON",
     "hosted": {
       "path": "/convert/csv-json",
-      "price": "free",
-      "status": "live"
+      "price": {
+        "amount_usd": 0.001,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 10
     },
     "local": {
       "tool": "csvkit",

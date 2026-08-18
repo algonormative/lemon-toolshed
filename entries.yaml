@@ -10,8 +10,14 @@
 #
 #   hosted:              # present = we run this conversion on our server
 #     path: "/convert/<id>"   # must equal /convert/ + the entry id
-#     price: free             # or {amount_usd: 0.001, scheme: exact}
+#     price: {amount_usd: 0.001, scheme: exact}   # or `free`
 #     status: live            # or planned
+#
+# Every hosted tool is priced, and every hosted tool has the same free tier: the
+# first FREE_TIER_DAILY calls a day per caller are free, and the price below is
+# what a call costs after that. The free-tier number is a build constant in
+# build.mjs, not a per-entry field — one number, published everywhere.
+# OWNER-TUNABLE: the price here and FREE_TIER_DAILY in build.mjs.
 #
 #   local:               # how to run it on your own machine
 #     tool: pandoc            # optional; defaults to the top-level `tool`
@@ -94,8 +100,8 @@ entries:
       keeps the output diff-friendly. Feeding a whole page to a model to "clean it up"
       burns tokens and invents heading levels; pandoc preserves precisely the structure
       that is there. The hosted endpoint runs Turndown instead of pandoc — same job, no
-      install — and is the one priced tool here, so there is a working x402 flow to
-      point at rather than a description of one.
+      install — free to try inside the daily free tier, then a priced x402 call like
+      every other hosted tool here.
     local:
       tool: pandoc
       install: "brew install pandoc"
@@ -137,7 +143,9 @@ entries:
     verified: 2026-08-18
     hosted:
       path: "/convert/md-html"
-      price: free
+      price:
+        amount_usd: 0.001
+        scheme: exact
       status: live
 
   - id: rendered-dom-to-markdown
@@ -313,7 +321,9 @@ entries:
     verified: 2026-08-18
     hosted:
       path: "/convert/json-yaml"
-      price: free
+      price:
+        amount_usd: 0.001
+        scheme: exact
       status: live
 
   - id: yaml-json
@@ -338,7 +348,9 @@ entries:
     verified: 2026-08-18
     hosted:
       path: "/convert/yaml-json"
-      price: free
+      price:
+        amount_usd: 0.001
+        scheme: exact
       status: live
 
   - id: csv-json
@@ -366,7 +378,9 @@ entries:
     verified: 2026-08-18
     hosted:
       path: "/convert/csv-json"
-      price: free
+      price:
+        amount_usd: 0.001
+        scheme: exact
       status: live
 
   - id: json-reshape

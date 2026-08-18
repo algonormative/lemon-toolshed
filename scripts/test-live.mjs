@@ -4,19 +4,28 @@
 //   node scripts/test-live.mjs                        # production
 //   node scripts/test-live.mjs http://localhost:8787  # wrangler dev --local
 //   TOOLSHED_URL=... node scripts/test-live.mjs
+//   node scripts/test-live.mjs --quota                # the free-tier probe, opt-in
 //
 // Zero dependencies — Node 18+ for global fetch, and nothing else. This is the
 // smoke test README.md § Maintenance says is missing: it posts a known payload
 // to every hosted endpoint and checks a distinctive substring came back, so a
 // rotted converter shows up as a red row rather than as a broken product.
 //
-// It exercises the real service, so it writes real rows: ~8 events against the
-// caller's daily rung-1 budget of 100.
+// It exercises the real service, so it writes real rows — and it now spends real
+// free-tier allowance: the default run makes 6 accepted conversions against this
+// caller's FREE_TIER_DAILY (10). TWO DEFAULT RUNS IN ONE UTC DAY FROM ONE IP WILL
+// HIT THE FREE TIER, and the second one reports 429s rather than converter faults.
+//
+// --quota is the free-tier probe and is NOT part of the default run, because it
+// deliberately burns the whole day's allowance plus one. See quotaProbe().
 
-const BASE = (process.argv[2] || process.env.TOOLSHED_URL || 'https://toolshed.lemon-agent.dev').replace(
-  /\/+$/,
-  ''
-);
+const ARGS = process.argv.slice(2);
+const QUOTA = ARGS.includes('--quota');
+const BASE = (
+  ARGS.find((a) => !a.startsWith('--')) ||
+  process.env.TOOLSHED_URL ||
+  'https://toolshed.lemon-agent.dev'
+).replace(/\/+$/, '');
 
 // ---------------------------------------------------------------- harness
 
@@ -43,6 +52,14 @@ function assert(cond, message) {
 const get = (path) => fetch(`${BASE}${path}`);
 const post = (path, body, headers = {}) =>
   fetch(`${BASE}${path}`, { method: 'POST', body, headers });
+
+const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+
+// Rung 0 — the edge rate-limiting rule, 5 requests / 10 s per IP — will block a
+// tight loop before the free tier ever bites, so the probe paces itself. There is
+// no edge in front of `wrangler dev`, so a local run does not wait.
+const LOCAL = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(BASE);
+const PACE_MS = LOCAL ? 0 : 2500;
 
 // ---------------------------------------------------------------- fixtures
 //
@@ -74,12 +91,138 @@ const CONVERSIONS = [
     id: 'html-markdown',
     input: '<h1>Toolshed</h1><p>hello</p>',
     expect: '# Toolshed',
-    priced: true,
   },
 ];
 
 const HOSTED_EXPECTED = 5;
 const BIG_INPUT_BYTES = 300 * 1024;
+
+// Must match FREE_TIER_DAILY in build.mjs. Asserted against the live service by
+// the quota probe, and published in catalog.json — so a drift shows up as a red
+// row rather than as a surprise.
+const FREE_TIER_EXPECT = 10;
+
+// ---------------------------------------------------------------- table
+
+function printTable() {
+  const passed = results.filter((r) => r.ok).length;
+  const failed = results.length - passed;
+  const nameWidth = Math.max(...results.map((r) => r.name.length));
+
+  console.log(`\n${'='.repeat(nameWidth + 10)}`);
+  console.log(`${'TEST'.padEnd(nameWidth)}  RESULT`);
+  console.log('-'.repeat(nameWidth + 10));
+  for (const r of results) console.log(`${r.name.padEnd(nameWidth)}  ${r.ok ? 'PASS' : 'FAIL'}`);
+  console.log('-'.repeat(nameWidth + 10));
+  console.log(`${String(`${passed} passed, ${failed} failed`).padEnd(nameWidth)}  ${failed ? 'FAIL' : 'PASS'}`);
+  console.log(`${'='.repeat(nameWidth + 10)}\n`);
+  return failed;
+}
+
+// ---------------------------------------------------------------- quota probe
+//
+// Opt-in, because it spends the day: FREE_TIER_EXPECT accepted conversions, one
+// refusal, and three more refusals under rotated user-agents. What it proves:
+//
+//   1. beacons are on a separate budget — 5 /b events first, and the free tier
+//      is still whole afterwards;
+//   2. x-free-tier-remaining counts down 9 -> 0 across the free calls;
+//   3. call FREE_TIER_EXPECT + 1 is refused — 429 with the free-tier body and a
+//      sane Retry-After, or 402 with an x402 envelope once PAYTO is set;
+//   4. rotating the user-agent from the same IP does NOT mint a fresh allowance.
+//
+// It needs a caller whose allowance is untouched today. A 429 on the first call
+// means this IP has already converted today; wait for midnight UTC.
+
+const UAS = [
+  'toolshed-quota-probe/1.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36',
+  'curl/8.7.1',
+  'python-requests/2.32.3',
+];
+
+function assertRefusal(res, body) {
+  if (res.status === 402) {
+    const env = JSON.parse(body);
+    const offer = (env.accepts && env.accepts[0]) || {};
+    assert(env.x402Version === 1, 'the 402 body is not an x402 v1 envelope');
+    assert(!!offer.payTo, 'the x402 envelope names no payTo address');
+    return `402 — ${offer.maxAmountRequired} atomic to ${offer.payTo}`;
+  }
+  assert(res.status === 429, `expected 429 or 402, got ${res.status}`);
+  const seen = JSON.parse(body);
+  assert(
+    seen.free_tier_daily === FREE_TIER_EXPECT,
+    `free_tier_daily is ${seen.free_tier_daily}, expected ${FREE_TIER_EXPECT}`
+  );
+  assert(/free tier/.test(String(seen.error)), `unexpected error text: ${seen.error}`);
+  assert(!!seen.paid_tier, 'the 429 body does not name the paid tier');
+  assert(seen.retry === 'tomorrow UTC', `retry is ${JSON.stringify(seen.retry)}`);
+
+  const retryAfter = Number(res.headers.get('retry-after'));
+  assert(Number.isFinite(retryAfter), 'no numeric Retry-After header');
+  assert(retryAfter > 0 && retryAfter <= 86400, `Retry-After ${retryAfter} is not within one day`);
+  return `429 — ${seen.error}, Retry-After ${retryAfter}s`;
+}
+
+async function quotaProbe() {
+  console.log(`Toolshed free-tier probe — ${BASE}`);
+  console.log(
+    `${FREE_TIER_EXPECT} free calls, then one over, then ${UAS.length - 1} rotated user-agents.` +
+      ` Spends this IP's whole allowance for the UTC day.${PACE_MS ? ` Paced ${PACE_MS} ms.` : ''}\n`
+  );
+
+  // (1) Beacons must not touch the conversion budget.
+  await test('5 /b beacons are accepted', async () => {
+    for (let i = 0; i < 5; i++) {
+      const res = await post('/b', JSON.stringify({ t: 'visit' }), { 'content-type': 'text/plain' });
+      assert(res.status === 204, `beacon ${i + 1} answered ${res.status}, expected 204`);
+      await sleep(PACE_MS);
+    }
+    return '5 accepted — the conversion budget should still be whole';
+  });
+
+  // (2) The free tier, counted down.
+  for (let i = 1; i <= FREE_TIER_EXPECT; i++) {
+    await test(`convert ${i}/${FREE_TIER_EXPECT} is served free`, async () => {
+      const res = await post('/convert/md-html', '# hi\n', { 'user-agent': UAS[0] });
+      if (res.status === 429 || res.status === 402) {
+        throw new Error(
+          `refused with ${res.status} on call ${i} — this IP had already spent part of today's free tier` +
+            (i === 1 ? ' (beacons did NOT do it; they are on a separate budget)' : '')
+        );
+      }
+      assert(res.status === 200, `expected 200, got ${res.status}`);
+      const remaining = res.headers.get('x-free-tier-remaining');
+      assert(remaining !== null, 'no x-free-tier-remaining header on a free-tier answer');
+      const want = FREE_TIER_EXPECT - i;
+      assert(Number(remaining) === want, `x-free-tier-remaining is ${remaining}, expected ${want}`);
+      return `x-free-tier-remaining: ${remaining}`;
+    });
+    await sleep(PACE_MS);
+  }
+
+  // (3) One over.
+  await test(`convert ${FREE_TIER_EXPECT + 1} is refused`, async () => {
+    const res = await post('/convert/md-html', '# hi\n', { 'user-agent': UAS[0] });
+    return assertRefusal(res, await res.text());
+  });
+  await sleep(PACE_MS);
+
+  // (4) The spoof-resistance claim: same IP, different user-agent, same refusal.
+  for (const ua of UAS.slice(1)) {
+    await test(`rotated user-agent is still refused — ${ua.slice(0, 28)}`, async () => {
+      const res = await post('/convert/md-html', '# hi\n', { 'user-agent': ua });
+      return assertRefusal(res, await res.text());
+    });
+    await sleep(PACE_MS);
+  }
+}
+
+if (QUOTA) {
+  await quotaProbe();
+  process.exit(printTable() ? 1 : 0);
+}
 
 // ---------------------------------------------------------------- tests
 
@@ -114,19 +257,31 @@ for (const c of CONVERSIONS) {
   await test(`POST /convert/${c.id} converts and returns its own output`, async () => {
     const res = await post(`/convert/${c.id}`, c.input);
 
-    // A priced tool answering 402 is CORRECT behaviour once PAYTO is set — the
-    // envelope is the product, not a fault. Report it, do not fail on it.
-    if (c.priced && res.status === 402) {
+    // A 402 is CORRECT behaviour once PAYTO is set and the free tier is spent —
+    // the envelope is the product, not a fault. Report it, do not fail on it.
+    if (res.status === 402) {
       const env = await res.json();
       const offer = (env.accepts && env.accepts[0]) || {};
-      return `402 x402 envelope (priced gate live) — ${offer.maxAmountRequired} atomic to ${offer.payTo}`;
+      return `402 x402 envelope (paid gate live) — ${offer.maxAmountRequired} atomic to ${offer.payTo}`;
+    }
+
+    // A 429 is not a converter fault either, but it IS a red row: it means this
+    // caller's free tier is already spent, so the run proved nothing about the
+    // converter. Say which, so nobody debugs the wrong thing.
+    if (res.status === 429) {
+      throw new Error(
+        `429 — this IP's ${FREE_TIER_EXPECT}/day free tier is spent (Retry-After ` +
+          `${res.headers.get('retry-after')}s). Re-run after midnight UTC.`
+      );
     }
 
     assert(res.status === 200, `expected 200, got ${res.status}`);
     const out = await res.text();
     assert(out.includes(c.expect), `output did not contain ${JSON.stringify(c.expect)}`);
+    const left = res.headers.get('x-free-tier-remaining');
     const pending = res.headers.get('x-pricing') === 'pending';
-    return `${out.replace(/\s+/g, ' ').trim().slice(0, 48)}${pending ? ' [x-pricing: pending]' : ''}`;
+    const note = left !== null ? ` [free tier: ${left} left]` : pending ? ' [x-pricing: pending]' : '';
+    return `${out.replace(/\s+/g, ' ').trim().slice(0, 48)}${note}`;
   });
 }
 
@@ -153,17 +308,7 @@ await test('POST /b accepts a visit beacon with 204', async () => {
 
 // ---------------------------------------------------------------- table
 
-const passed = results.filter((r) => r.ok).length;
-const failed = results.length - passed;
-const nameWidth = Math.max(...results.map((r) => r.name.length));
-
-console.log(`\n${'='.repeat(nameWidth + 10)}`);
-console.log(`${'TEST'.padEnd(nameWidth)}  RESULT`);
-console.log('-'.repeat(nameWidth + 10));
-for (const r of results) console.log(`${r.name.padEnd(nameWidth)}  ${r.ok ? 'PASS' : 'FAIL'}`);
-console.log('-'.repeat(nameWidth + 10));
-console.log(`${String(`${passed} passed, ${failed} failed`).padEnd(nameWidth)}  ${failed ? 'FAIL' : 'PASS'}`);
-console.log(`${'='.repeat(nameWidth + 10)}\n`);
+const failed = printTable();
 
 // ---------------------------------------------------------------- cost
 //
@@ -186,8 +331,8 @@ const PRICES = {
 const ASSUME = {
   cpuMsPerConvert: 2, // ms
   cpuMsPerOther: 0.5, // ms — /check, /b
-  d1RowsWrittenPerConvert: 2, // the events insert + the counters upsert
-  d1RowsReadPerConvert: 2, // the rung-1 count + the rung-2 counter
+  d1RowsWrittenPerConvert: 3, // the events insert + the counters upsert + the quota claim
+  d1RowsReadPerConvert: 2, // the salt row + the rung-2 counter
   daysPerMonth: 30,
 };
 
@@ -211,7 +356,7 @@ console.log(`  (Workers Paid base ${usd(PRICES.workersPaidBase)}/mo flat — exc
 console.log('Assumptions (labelled: estimates, not measurements)');
 console.log(`  ${ASSUME.cpuMsPerConvert} ms CPU per /convert, ${ASSUME.cpuMsPerOther} ms per /check or /b`);
 console.log(
-  `  ${ASSUME.d1RowsWrittenPerConvert} D1 rows written per /convert (events insert + counters upsert), ${ASSUME.d1RowsReadPerConvert} read`
+  `  ${ASSUME.d1RowsWrittenPerConvert} D1 rows written per /convert (events insert + counters upsert + free-tier claim), ${ASSUME.d1RowsReadPerConvert} read`
 );
 console.log(`  ${ASSUME.daysPerMonth}-day month; one "call" below = one /convert request\n`);
 
@@ -221,7 +366,10 @@ const runConverts = CONVERSIONS.length + 2; // the five happy paths + the 400 + 
 const runOther = results.length - runConverts;
 const runRequests = results.length;
 const runCpuMs = runConverts * ASSUME.cpuMsPerConvert + runOther * ASSUME.cpuMsPerOther;
-const runRowsWritten = CONVERSIONS.length * ASSUME.d1RowsWrittenPerConvert + 1 * ASSUME.d1RowsWrittenPerConvert;
+// Six calls reach the store: the five happy paths plus the malformed one, which
+// claims its free-tier call before the body is read. The 413 is rejected on the
+// declared size, before any D1 work; the beacon writes its own two rows.
+const runRowsWritten = (CONVERSIONS.length + 1) * ASSUME.d1RowsWrittenPerConvert + 2;
 
 console.log('This test run');
 console.log(
