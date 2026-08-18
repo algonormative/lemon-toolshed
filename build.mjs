@@ -1129,7 +1129,7 @@ ${sections.map(renderShelf).join('\n')}
     </div>
 
     <div class="status-box">
-      <p><span class="status-label">Honest status</span>The free tier is <strong>live and enforced</strong>. Payment is <strong>not switched on yet</strong>: no receiving address is configured, so a call past the free tier answers <code>429</code> — the day's free calls are spent, come back tomorrow — rather than the <code>402</code> above. And nothing verifies settlement, so an <code>X-PAYMENT</code> header is never treated as paid; a response that sees one says <code>x-payment-verified: false</code>. When settlement goes live, the 402 is the gate.</p>
+      <p><span class="status-label">Honest status</span>The free tier is <strong>live and enforced</strong>, and the payment surface is <strong>advertised for real</strong>: a receiving address is configured, so a call past the free tier answers the <code>402</code> envelope above with a live USDC address on Base. What is <em>not</em> live yet is settlement verification — nothing checks that a payment actually landed, so an <code>X-PAYMENT</code> header is never treated as paid; a response that sees one says <code>x-payment-verified: false</code> and the call is served unverified. Settlement verification is the next build; until it lands, the 402 is an honest price signal, not a wall.</p>
     </div>
   </section>
 
@@ -1194,7 +1194,7 @@ const catalog = {
     note:
       `Entries with a hosted block run on our server. Every one is free to try — ${FREE_TIER_DAILY} conversions ` +
       'per caller (per IP) per UTC day, reported in an x-free-tier-remaining header — and priced per call past ' +
-      'that: HTTP 402 with an x402 envelope, or HTTP 429 with a Retry-After while payment is switched off. ' +
+      'that: HTTP 402 with an x402 envelope naming a live USDC address on Base (or HTTP 429 if payment were switched off). ' +
       'Entries without a hosted block are local-only references.',
   },
   entries: entries.map(catalogEntry),

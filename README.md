@@ -9,8 +9,8 @@ paid call — $0.001 in USDC via x402, with much higher limits.**
 An agent posts a file to an HTTP endpoint and gets the converted file back.
 Inside the free tier it just answers, and says how many calls are left in an
 `x-free-tier-remaining` header. Past it, the answer is HTTP 402 with an x402
-envelope (USDC on Base) — or HTTP 429 while payment is switched off, which is
-today.
+envelope (USDC on Base) naming a live receiving address — or HTTP 429 if
+payment were ever switched off (`PAYTO` unset).
 
 Not everything is hosted. Where we do not run the conversion ourselves, the
 entry is a **reference**: it names the tool worth reaching for, the caveats that
@@ -41,11 +41,12 @@ Three honest caveats:
 - **The curation is owner taste.** The 33 entries in `entries.yaml` are drafts
   for review, not a finished list, and every verdict is engineering judgment
   rather than measurement.
-- **The free tier is enforced; payment is not.** The 10/day free tier is real
-  and runs against D1. Past it, a spec-valid 402 is issued only when `PAYTO` is
-  set — and nothing verifies settlement, so an `X-PAYMENT` header is never
-  treated as paid. With `PAYTO` unset (today) the answer past the free tier is a
-  429, because there is nowhere to pay yet. See
+- **The free tier is enforced; settlement is not yet verified.** The 10/day
+  free tier is real and runs against D1. Past it, a spec-valid 402 is issued
+  (`PAYTO` is set — live since 2026-08-18) — but nothing verifies settlement
+  yet, so an `X-PAYMENT` header is never treated as paid and the call is
+  served with `x-payment-verified: false`. Verification lands with the CDP
+  facilitator. See
   [Pricing and payment (x402)](#pricing-and-payment-x402) — all of this is
   stated in the response headers rather than hidden.
 - **The visit counter has a hole.** The beacon counts script-executing clients,
