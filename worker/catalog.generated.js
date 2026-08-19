@@ -6,15 +6,33 @@
 
 export const SITE_BASE = "https://toolshed.lemon-agent.dev";
 
-// The free tier, compiled in from build.mjs so the number the site advertises and
-// the number the Worker enforces are the same number. OWNER-TUNABLE in build.mjs.
-export const FREE_TIER_DAILY = 3;
+// The free tier as the STATIC surfaces advertise it. The Worker does NOT enforce
+// this number — it reads env.FREE_TIER_DAILY at runtime and treats that as the
+// only authority, so a dashboard flip takes effect without a rebuild. This
+// export exists so the build constant and the deployed bundle stay legible to
+// each other, and so the suite can assert on what was compiled in.
+// OWNER-TUNABLE in build.mjs.
+export const FREE_TIER_DAILY = 0;
 
+// `xa`/`ya` are the /check alias sets — already normalised (lowercase, no
+// leading dot), so the Worker only has to normalise the incoming query.
+// Short keys because this object ships in the Worker bundle.
 export const CATALOG = [
   {
     "id": "markdown-to-pdf",
     "x": "Markdown (with math, code blocks, citations)",
     "y": "PDF",
+    "xa": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
+    "ya": [
+      "pdf",
+      "application/pdf"
+    ],
     "hosted": null,
     "local": {
       "tool": "pandoc",
@@ -26,6 +44,19 @@ export const CATALOG = [
     "id": "markdown-to-docx",
     "x": "Markdown",
     "y": "DOCX styled to a house template",
+    "xa": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
+    "ya": [
+      "docx",
+      "doc",
+      "word",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ],
     "hosted": null,
     "local": {
       "tool": "pandoc",
@@ -37,6 +68,19 @@ export const CATALOG = [
     "id": "docx-to-markdown",
     "x": "DOCX",
     "y": "Markdown + extracted media",
+    "xa": [
+      "docx",
+      "doc",
+      "word",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ],
+    "ya": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
     "hosted": null,
     "local": {
       "tool": "pandoc",
@@ -48,6 +92,19 @@ export const CATALOG = [
     "id": "html-markdown",
     "x": "Saved HTML page / static HTML file",
     "y": "Markdown",
+    "xa": [
+      "html",
+      "htm",
+      "text/html",
+      "application/xhtml+xml"
+    ],
+    "ya": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
     "hosted": {
       "path": "/convert/html-markdown",
       "price": {
@@ -55,7 +112,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 3
+      "free_tier_daily": 0
     },
     "local": {
       "tool": "pandoc",
@@ -67,6 +124,19 @@ export const CATALOG = [
     "id": "md-html",
     "x": "Markdown",
     "y": "HTML",
+    "xa": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
+    "ya": [
+      "html",
+      "htm",
+      "text/html",
+      "application/xhtml+xml"
+    ],
     "hosted": {
       "path": "/convert/md-html",
       "price": {
@@ -74,7 +144,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 3
+      "free_tier_daily": 0
     },
     "local": {
       "tool": "pandoc",
@@ -86,6 +156,19 @@ export const CATALOG = [
     "id": "rendered-dom-to-markdown",
     "x": "Live DOM in a browser or headless page (JS-rendered)",
     "y": "Markdown",
+    "xa": [
+      "rendered dom",
+      "dom",
+      "url",
+      "webpage"
+    ],
+    "ya": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
     "hosted": null,
     "local": {
       "tool": "turndown",
@@ -97,6 +180,18 @@ export const CATALOG = [
     "id": "markdown-to-epub",
     "x": "Markdown (multi-chapter manuscript)",
     "y": "EPUB 3",
+    "xa": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
+    "ya": [
+      "epub",
+      "application/epub+zip",
+      "ebook"
+    ],
     "hosted": null,
     "local": {
       "tool": "pandoc",
@@ -108,6 +203,19 @@ export const CATALOG = [
     "id": "video-to-portable-mp4",
     "x": "Arbitrary video (any container/codec)",
     "y": "H.264 MP4 that plays everywhere",
+    "xa": [
+      "video",
+      "mp4",
+      "mov",
+      "mkv",
+      "video/mp4"
+    ],
+    "ya": [
+      "mp4",
+      "video/mp4",
+      "h264",
+      "mov"
+    ],
     "hosted": null,
     "local": {
       "tool": "ffmpeg",
@@ -119,6 +227,20 @@ export const CATALOG = [
     "id": "video-to-audio-track",
     "x": "Video file with an audio track",
     "y": "Audio file (m4a/wav)",
+    "xa": [
+      "video",
+      "mp4",
+      "mov",
+      "mkv",
+      "video/mp4"
+    ],
+    "ya": [
+      "audio file",
+      "wav",
+      "mp3",
+      "flac",
+      "audio/mpeg"
+    ],
     "hosted": null,
     "local": {
       "tool": "ffmpeg",
@@ -130,6 +252,21 @@ export const CATALOG = [
     "id": "audio-transcode-and-normalize",
     "x": "WAV / FLAC / arbitrary audio",
     "y": "MP3 or Opus at a fixed sample rate and loudness",
+    "xa": [
+      "audio",
+      "wav",
+      "flac",
+      "aiff",
+      "audio/wav",
+      "audio/x-wav"
+    ],
+    "ya": [
+      "mp3 / opus",
+      "mp3",
+      "opus",
+      "audio/mpeg",
+      "audio/opus"
+    ],
     "hosted": null,
     "local": {
       "tool": "ffmpeg",
@@ -141,6 +278,17 @@ export const CATALOG = [
     "id": "heic-to-jpeg",
     "x": "HEIC/HEIF photos from an iPhone",
     "y": "JPEG",
+    "xa": [
+      "heic photos",
+      "heic",
+      "heif",
+      "image/heic"
+    ],
+    "ya": [
+      "jpeg",
+      "jpg",
+      "image/jpeg"
+    ],
     "hosted": null,
     "local": {
       "tool": "imagemagick",
@@ -152,6 +300,21 @@ export const CATALOG = [
     "id": "bulk-image-resize",
     "x": "Large batch of source images",
     "y": "Web-sized JPEG/WebP/AVIF derivatives",
+    "xa": [
+      "images",
+      "png",
+      "jpeg",
+      "jpg",
+      "image/png",
+      "image/jpeg"
+    ],
+    "ya": [
+      "web images",
+      "webp",
+      "jpeg",
+      "jpg",
+      "image/webp"
+    ],
     "hosted": null,
     "local": {
       "tool": "libvips",
@@ -163,6 +326,14 @@ export const CATALOG = [
     "id": "svg-to-png",
     "x": "Static SVG",
     "y": "PNG at a chosen scale",
+    "xa": [
+      "svg",
+      "image/svg+xml"
+    ],
+    "ya": [
+      "png",
+      "image/png"
+    ],
     "hosted": null,
     "local": {
       "tool": "resvg",
@@ -174,6 +345,18 @@ export const CATALOG = [
     "id": "json-yaml",
     "x": "JSON",
     "y": "YAML",
+    "xa": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "ya": [
+      "yaml",
+      "yml",
+      "application/yaml",
+      "text/yaml",
+      "application/x-yaml"
+    ],
     "hosted": {
       "path": "/convert/json-yaml",
       "price": {
@@ -181,7 +364,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 3
+      "free_tier_daily": 0
     },
     "local": {
       "tool": "yq",
@@ -193,6 +376,18 @@ export const CATALOG = [
     "id": "yaml-json",
     "x": "YAML",
     "y": "JSON",
+    "xa": [
+      "yaml",
+      "yml",
+      "application/yaml",
+      "text/yaml",
+      "application/x-yaml"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
     "hosted": {
       "path": "/convert/yaml-json",
       "price": {
@@ -200,7 +395,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 3
+      "free_tier_daily": 0
     },
     "local": {
       "tool": "yq",
@@ -212,6 +407,16 @@ export const CATALOG = [
     "id": "csv-json",
     "x": "CSV",
     "y": "JSON",
+    "xa": [
+      "csv",
+      "text/csv",
+      "application/csv"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
     "hosted": {
       "path": "/convert/csv-json",
       "price": {
@@ -219,7 +424,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 3
+      "free_tier_daily": 0
     },
     "local": {
       "tool": "csvkit",
@@ -231,6 +436,19 @@ export const CATALOG = [
     "id": "json-reshape",
     "x": "Nested JSON from an API",
     "y": "Flat JSON / NDJSON / CSV rows",
+    "xa": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "ya": [
+      "json / ndjson",
+      "json",
+      "ndjson",
+      "jsonl",
+      "application/json",
+      "application/x-ndjson"
+    ],
     "hosted": null,
     "local": {
       "tool": "jq",
@@ -242,6 +460,16 @@ export const CATALOG = [
     "id": "messy-csv-to-clean-csv",
     "x": "Messy CSV (ragged rows, BOM, mixed quoting, duplicate headers)",
     "y": "Clean, validated UTF-8 CSV",
+    "xa": [
+      "messy csv",
+      "csv",
+      "text/csv"
+    ],
+    "ya": [
+      "clean csv",
+      "csv",
+      "text/csv"
+    ],
     "hosted": null,
     "local": {
       "tool": "qsv",
@@ -253,6 +481,18 @@ export const CATALOG = [
     "id": "xlsx-to-csv",
     "x": "XLSX workbook (specific sheet)",
     "y": "CSV",
+    "xa": [
+      "xlsx",
+      "xls",
+      "excel",
+      "spreadsheet",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ],
+    "ya": [
+      "csv",
+      "text/csv",
+      "application/csv"
+    ],
     "hosted": null,
     "local": {
       "tool": "csvkit",
@@ -264,6 +504,17 @@ export const CATALOG = [
     "id": "csv-to-sqlite",
     "x": "Large CSV",
     "y": "Queryable SQLite database",
+    "xa": [
+      "csv",
+      "text/csv",
+      "application/csv"
+    ],
+    "ya": [
+      "sqlite",
+      "db",
+      "sqlite3",
+      "application/vnd.sqlite3"
+    ],
     "hosted": null,
     "local": {
       "tool": "sqlite3",
@@ -275,6 +526,20 @@ export const CATALOG = [
     "id": "sqlite-to-json",
     "x": "SQLite query result",
     "y": "JSON / NDJSON for an API or an agent",
+    "xa": [
+      "sqlite",
+      "db",
+      "sqlite3",
+      "application/vnd.sqlite3"
+    ],
+    "ya": [
+      "json / ndjson",
+      "json",
+      "ndjson",
+      "jsonl",
+      "application/json",
+      "application/x-ndjson"
+    ],
     "hosted": null,
     "local": {
       "tool": "sqlite3",
@@ -286,6 +551,17 @@ export const CATALOG = [
     "id": "pdf-digital-born-to-text",
     "x": "PDF (digital-born — has a text layer)",
     "y": "Plain text / layout-preserved text",
+    "xa": [
+      "digital-born pdf",
+      "pdf",
+      "application/pdf"
+    ],
+    "ya": [
+      "plain text",
+      "txt",
+      "text",
+      "text/plain"
+    ],
     "hosted": null,
     "local": {
       "tool": "pdftotext",
@@ -297,6 +573,16 @@ export const CATALOG = [
     "id": "pdf-scanned-to-searchable",
     "x": "PDF (scanned — page images, no text layer)",
     "y": "Searchable PDF + extractable text",
+    "xa": [
+      "scanned pdf",
+      "pdf",
+      "application/pdf"
+    ],
+    "ya": [
+      "searchable pdf",
+      "pdf",
+      "application/pdf"
+    ],
     "hosted": null,
     "local": {
       "tool": "ocrmypdf",
@@ -308,6 +594,17 @@ export const CATALOG = [
     "id": "pdf-to-page-images",
     "x": "PDF page(s)",
     "y": "PNG/JPEG page images",
+    "xa": [
+      "pdf",
+      "application/pdf"
+    ],
+    "ya": [
+      "page images",
+      "png",
+      "jpeg",
+      "jpg",
+      "image/png"
+    ],
     "hosted": null,
     "local": {
       "tool": "pdftoppm",
@@ -319,6 +616,16 @@ export const CATALOG = [
     "id": "pdf-tables-to-csv",
     "x": "PDF with ruled or whitespace-aligned tables",
     "y": "CSV / DataFrame",
+    "xa": [
+      "pdf tables",
+      "pdf",
+      "application/pdf"
+    ],
+    "ya": [
+      "csv",
+      "text/csv",
+      "application/csv"
+    ],
     "hosted": null,
     "local": {
       "tool": "camelot",
@@ -330,6 +637,17 @@ export const CATALOG = [
     "id": "office-docs-to-pdf-batch",
     "x": "DOCX/XLSX/PPTX (batch)",
     "y": "PDF",
+    "xa": [
+      "office docs",
+      "docx",
+      "xlsx",
+      "pptx",
+      "office"
+    ],
+    "ya": [
+      "pdf",
+      "application/pdf"
+    ],
     "hosted": null,
     "local": {
       "tool": "libreoffice",
@@ -341,6 +659,16 @@ export const CATALOG = [
     "id": "html-to-paginated-pdf",
     "x": "HTML + CSS (invoice, report, generated page)",
     "y": "Paginated PDF",
+    "xa": [
+      "html",
+      "htm",
+      "text/html",
+      "application/xhtml+xml"
+    ],
+    "ya": [
+      "pdf",
+      "application/pdf"
+    ],
     "hosted": null,
     "local": {
       "tool": "weasyprint",
@@ -352,6 +680,20 @@ export const CATALOG = [
     "id": "image-to-text",
     "x": "Image of text (screenshot, clean scan, photo)",
     "y": "Plain text",
+    "xa": [
+      "image of text",
+      "png",
+      "jpeg",
+      "jpg",
+      "image/png",
+      "image/jpeg"
+    ],
+    "ya": [
+      "plain text",
+      "txt",
+      "text",
+      "text/plain"
+    ],
     "hosted": null,
     "local": {
       "tool": "tesseract",
@@ -363,6 +705,19 @@ export const CATALOG = [
     "id": "speech-audio-to-transcript",
     "x": "Recorded speech (meeting, interview, podcast)",
     "y": "Transcript (text/SRT/VTT)",
+    "xa": [
+      "recorded speech",
+      "wav",
+      "mp3",
+      "audio/wav",
+      "audio/mpeg"
+    ],
+    "ya": [
+      "transcript",
+      "srt",
+      "vtt",
+      "text/vtt"
+    ],
     "hosted": null,
     "local": {
       "tool": "whisper.cpp",
@@ -374,6 +729,12 @@ export const CATALOG = [
     "id": "messy-doc-to-schema",
     "x": "Messy document (invoice, contract, report PDF/DOCX)",
     "y": "Structured records against a schema",
+    "xa": [
+      "messy document"
+    ],
+    "ya": [
+      "structured records"
+    ],
     "hosted": null,
     "local": {
       "tool": "unstructured",
@@ -385,6 +746,17 @@ export const CATALOG = [
     "id": "legacy-ebook-to-epub",
     "x": "MOBI/AZW3/LIT and other legacy ebook formats",
     "y": "EPUB",
+    "xa": [
+      "legacy ebook",
+      "mobi",
+      "azw3",
+      "ebook"
+    ],
+    "ya": [
+      "epub",
+      "application/epub+zip",
+      "ebook"
+    ],
     "hosted": null,
     "local": {
       "tool": "calibre",
@@ -396,6 +768,18 @@ export const CATALOG = [
     "id": "media-to-metadata-json",
     "x": "Photo / video / PDF file",
     "y": "Structured metadata (JSON)",
+    "xa": [
+      "media file",
+      "mp4",
+      "jpeg",
+      "pdf",
+      "heic"
+    ],
+    "ya": [
+      "metadata json",
+      "json",
+      "application/json"
+    ],
     "hosted": null,
     "local": {
       "tool": "exiftool",
@@ -407,6 +791,14 @@ export const CATALOG = [
     "id": "legacy-encoding-to-utf8",
     "x": "Text/CSV in a legacy encoding (CP-1252, Latin-1, Shift-JIS) showing mojibake",
     "y": "Clean UTF-8",
+    "xa": [
+      "legacy encoding"
+    ],
+    "ya": [
+      "utf-8",
+      "txt",
+      "text/plain"
+    ],
     "hosted": null,
     "local": {
       "tool": "iconv",

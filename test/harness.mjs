@@ -46,7 +46,32 @@ const SCHEMA = join(ROOT, 'worker', 'schema.sql');
 // The catalog is plain data with no worker globals, so the tests can import the
 // same module the Worker compiles in — the numbers under test and the numbers
 // asserted are then one source, not two.
+//
+// FREE_TIER_DAILY here is the BUILD constant, i.e. what the static surfaces
+// advertise. It is 0 in production and it is NOT what the Worker enforces —
+// env.FREE_TIER_DAILY is. Assert on it only when the claim is about the static
+// surfaces; for behaviour, use FREE_TIER_ENABLED with TIER_ON_VARS below.
 export { CATALOG, SITE_BASE, FREE_TIER_DAILY } from '../worker/catalog.generated.js';
+
+/**
+ * The width of the free tier in the phase that boots one.
+ *
+ * The tier is off by default now (see freeTierDaily() in worker/beacon.js), so
+ * "no vars" no longer means "free tier". The suites that exist to prove the
+ * tier mechanism — countdown, spoof resistance, per-caller-not-per-tool — boot
+ * a worker with FREE_TIER_DAILY set to this, and keep every assertion they had.
+ * The mechanism stays tested rather than becoming dead env-gated code.
+ *
+ * The fixture suites (convert-*.test.mjs, protocol.test.mjs) boot it too, for a
+ * duller reason: they need conversions actually SERVED, and a free tier is the
+ * only way to be served without a facilitator and a wallet.
+ */
+export const FREE_TIER_ENABLED = 3;
+export const TIER_ON_VARS = { FREE_TIER_DAILY: String(FREE_TIER_ENABLED) };
+
+/** Order-independent identity for a boot config, so a suite can join or not. */
+const varsKey = (vars = {}) =>
+  JSON.stringify(Object.fromEntries(Object.entries(vars).sort(([a], [b]) => a.localeCompare(b))));
 
 // A test-only receiving address. Nothing settles against it; it exists so the
 // 402 envelope has a `payTo` to assert on.
@@ -77,6 +102,7 @@ const SUITE_OCTET = {
   x402: 18,
   'yaml-json': 19,
   settlement: 20,
+  'tier-off': 21,
 };
 
 /**
@@ -325,22 +351,34 @@ export async function d1(persistDir, sql) {
 // invoked directly (`node --test test/quota.test.mjs`) the file boots its own.
 // Either way the file's code is identical, and either way the D1 is fresh.
 
-export async function useWorker({ payTo = null } = {}) {
-  const want = payTo || '';
+/**
+ * Join the phase's worker if its boot config is the one this file asked for,
+ * otherwise boot a private one.
+ *
+ * The match is on the WHOLE var set, not just PAYTO. It used to be PAYTO alone,
+ * which was enough while that was the only var that changed behaviour; then
+ * FREE_TIER_DAILY became the var that decides whether the first call is a 200 or
+ * a 402, and a file that joined a worker configured differently from what it
+ * asked for would fail in a way that looked like a product bug.
+ *
+ * `payTo` is kept as sugar for the common case and merged into `vars`.
+ */
+export async function useWorker({ payTo = null, vars = {} } = {}) {
+  const want = { ...(payTo ? { PAYTO: payTo } : {}), ...vars };
   const shared = process.env.TOOLSHED_TEST_URL;
-  if (shared && (process.env.TOOLSHED_TEST_PAYTO || '') === want) {
+  if (shared && (process.env.TOOLSHED_TEST_VARS || '{}') === varsKey(want)) {
     const persistDir = process.env.TOOLSHED_TEST_PERSIST;
     return {
       baseUrl: shared.replace(/\/+$/, ''),
       persistDir,
-      payTo: want,
+      payTo: want.PAYTO || '',
       owned: false,
       log: () => '',
       d1: (sql) => d1(persistDir, sql),
       stop: async () => {},
     };
   }
-  return bootWorker({ vars: payTo ? { PAYTO: payTo } : {} });
+  return bootWorker({ vars: want });
 }
 
 // ------------------------------------------------------------------ client

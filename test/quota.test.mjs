@@ -1,8 +1,16 @@
 // The free tier, and the claim that makes it worth anything.
 //
-// PHASE: no PAYTO. With no receiving address configured there is nowhere to
-// pay, so the over-tier answer is a 429 rather than a 402. The 402 half lives
-// in x402.test.mjs, which runs against a second worker.
+// PHASE: FREE_TIER_DAILY set, no PAYTO. The free tier is OFF in production as
+// of 2026-08-19 — it survives as an env-gated mechanism, and this suite is what
+// keeps that mechanism from bit-rotting into dead code. It therefore boots a
+// worker with the tier explicitly enabled and asserts exactly what it always
+// did. With no receiving address configured there is nowhere to pay, so the
+// over-tier answer is a 429 rather than a 402; the 402 half lives in
+// x402.test.mjs and tier-off.test.mjs, against a differently configured worker.
+//
+// FREE_TIER_ENABLED is imported AS FREE_TIER_DAILY: every assertion below is
+// about the tier this worker was booted with, and the old name reads correctly
+// in all of them.
 //
 // The product claim under test is not "there is a limit" — it is that a second
 // identity costs a second IP address. The counter key is hash(daily salt + IP)
@@ -15,7 +23,14 @@
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { useWorker, client, callers, FREE_TIER_DAILY, secondsToUtcMidnight } from './harness.mjs';
+import {
+  useWorker,
+  client,
+  callers,
+  FREE_TIER_ENABLED as FREE_TIER_DAILY,
+  TIER_ON_VARS,
+  secondsToUtcMidnight,
+} from './harness.mjs';
 
 let worker;
 let api;
@@ -24,7 +39,7 @@ const ips = callers('quota');
 const RUNG1_PER_ID_PER_DAY = 100; // mirrors worker/beacon.js
 
 before(async () => {
-  worker = await useWorker();
+  worker = await useWorker({ vars: TIER_ON_VARS });
   api = client(worker);
 });
 after(async () => {

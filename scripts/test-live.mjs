@@ -4,41 +4,42 @@
 //   node scripts/test-live.mjs                          # production
 //   node scripts/test-live.mjs http://localhost:8787    # wrangler dev --local
 //   TOOLSHED_URL=... node scripts/test-live.mjs
-//   node scripts/test-live.mjs --tools=csv-json,md-html # spend the free slots here
-//   node scripts/test-live.mjs --quota                  # the free-tier probe, opt-in
 //
-// Zero dependencies — Node 18+ for global fetch, and nothing else. This is the
-// smoke test README.md § Maintenance says is missing: it posts a known payload
-// to every hosted endpoint and checks a distinctive substring came back, so a
-// rotted converter shows up as a red row rather than as a broken product.
+// THIS RUN SERVES NO CONVERSIONS AND SPENDS NOTHING. Not a cent of USDC, and
+// nothing that moves a Cloudflare meter past a couple of dozen requests. That is
+// the whole design of the file, and what makes it possible is that the hosted
+// service HAS NO FREE TIER: POST /convert/<id> with no X-PAYMENT header answers
+// 402 on the very first call, and this script never sends an X-PAYMENT header.
+// Every conversion probe below therefore stops at the paywall — which is exactly
+// the thing being checked.
 //
-// IT SPENDS THE WHOLE DAY'S FREE TIER, AND THE DEFAULT RUN IS DELIBERATELY WIDER
-// THAN IT. The free tier is 3 conversions per caller per UTC day and there are 5
-// converters, so a run cannot check them all for nothing. What it does instead:
+// What that buys, and what it does not:
 //
-//   calls 1..FREE_TIER_EXPECT   served and fully checked — the converter ran, and
-//                               x-free-tier-remaining counted down exactly
-//   every /convert call after   OVER THE TIER, where the paywall is the correct
-//                               answer. The run asserts that transition at exactly
-//                               the call the tier runs out on: a 402 carrying a
-//                               spec-shaped x402 envelope (what the hosted service
-//                               answers), or a 429 where no receiving address is
-//                               configured. Those rows are green because the GATE
-//                               is right, and they say the converter behind them
-//                               was not exercised — they are not converter passes.
+//   checked here      the public gate. GET /check and its aliases, the machine
+//                     -readable surfaces (catalog.json, llms.txt, llms-full.txt,
+//                     openapi.json, robots.txt), and one 402-envelope probe per
+//                     hosted tool — the exact JSON a paying agent reads before it
+//                     signs anything, down to the outputSchema.input.discoverable
+//                     flag that Coinbase's Bazaar discovery index keys on.
+//   NOT checked here  that any converter still converts. No 402 path runs one. A
+//                     green row here says THE GATE IS RIGHT; it says nothing
+//                     about the tool behind the gate.
 //
-// So one default run costs FREE_TIER_EXPECT conversions: the whole allowance for
-// the IP it runs from. A SECOND RUN IN THE SAME UTC DAY FROM THE SAME IP fails on
-// its first conversion, saying the tier was already spent rather than blaming a
-// converter. Only the first FREE_TIER_EXPECT converters in the list get live
-// coverage on a given day — use --tools=<id,...> to aim the free slots elsewhere.
+// Converter coverage lives in `npm test`: the local suite against
+// `wrangler dev --local`, which is free and asserts real output. End-to-end
+// payment coverage lives in scripts/pay-test.mjs, which is OWNER-ONLY and spends
+// real USDC. Those two plus this file are the whole picture; none of them is a
+// substitute for another.
 //
-// --quota is the free-tier probe and is NOT part of the default run, because it
-// deliberately burns the whole day's allowance plus one. See quotaProbe().
+// On the free tier: it still exists as a MECHANISM, behind a FREE_TIER_DAILY env
+// var that is unset in production. This script does not assume it is off. GET
+// /check publishes the runtime value the Worker enforces, and if a deployment has
+// a free tier switched on, the affected rows say so loudly rather than quietly
+// asserting the wrong contract.
+//
+// Zero dependencies — Node 18+ for global fetch, and nothing else.
 
 const ARGS = process.argv.slice(2);
-const QUOTA = ARGS.includes('--quota');
-const TOOLS_ARG = (ARGS.find((a) => a.startsWith('--tools=')) || '').slice('--tools='.length);
 const BASE = (
   ARGS.find((a) => !a.startsWith('--')) ||
   process.env.TOOLSHED_URL ||
@@ -49,17 +50,28 @@ const BASE = (
 
 const results = [];
 
+// Things that are not failures but that a reader must not miss: a deployment
+// with a free tier switched on, or one with no receiving address configured.
+// They are printed again under the table so they cannot scroll past.
+const notes = [];
+const loud = (text) => notes.push(text);
+
 function record(name, ok, detail) {
   results.push({ name, ok, detail });
   process.stdout.write(`${ok ? '  ok  ' : ' FAIL '} ${name}${detail ? ` — ${detail}` : ''}\n`);
 }
 
+// A row returns either a detail string, or `{ name, detail }` when what actually
+// happened is not what the row set out to check. The table is the skim surface,
+// and a row titled "offers an envelope" reading PASS when no envelope was ever
+// offered is a lie however good the detail next to it is.
 async function test(name, fn) {
   try {
-    const detail = await fn();
-    record(name, true, detail);
+    const out = await fn();
+    const detail = typeof out === 'string' ? out : out?.detail;
+    record((typeof out === 'object' && out?.name) || name, true, detail);
   } catch (err) {
-    record(name, false, String((err && err.message) || err).replace(/\s+/g, ' ').slice(0, 160));
+    record(name, false, String((err && err.message) || err).replace(/\s+/g, ' ').slice(0, 200));
   }
 }
 
@@ -67,83 +79,115 @@ function assert(cond, message) {
   if (!cond) throw new Error(message);
 }
 
-const get = (path) => fetch(`${BASE}${path}`);
-const post = (path, body, headers = {}) =>
-  fetch(`${BASE}${path}`, { method: 'POST', body, headers });
+function parseJson(text, what) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${what} is not JSON: ${text.replace(/\s+/g, ' ').slice(0, 120)}`);
+  }
+}
 
 const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
 
 // Rung 0 — the edge rate-limiting rule, 5 requests / 10 s per IP — will block a
-// tight loop before the free tier ever bites, so the probe paces itself. There is
-// no edge in front of `wrangler dev`, so a local run does not wait.
+// tight loop, and this run makes more requests than the old free-tier one did
+// (five envelope probes plus five static files), so every request goes through a
+// pacer rather than each row remembering to sleep. There is no edge in front of
+// `wrangler dev`, so a local run does not wait.
 const LOCAL = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(BASE);
 const PACE_MS = LOCAL ? 0 : 2500;
 
+let requestCount = 0;
+let convertRequestCount = 0;
+let lastRequestAt = 0;
+
+async function paced(path, init) {
+  const wait = PACE_MS - (Date.now() - lastRequestAt);
+  if (wait > 0) await sleep(wait);
+  requestCount += 1;
+  if (path.startsWith('/convert/')) convertRequestCount += 1;
+  try {
+    return await fetch(`${BASE}${path}`, init);
+  } finally {
+    lastRequestAt = Date.now();
+  }
+}
+
+const get = (path) => paced(path);
+const post = (path, body, headers = {}) => paced(path, { method: 'POST', body, headers });
+
 // ---------------------------------------------------------------- fixtures
 //
-// Tiny on purpose: the point is that the converter ran and produced its own
-// characteristic output, not that it handles a large document.
+// Tiny on purpose. Nothing here is converted in a normal run — the payload only
+// has to be a valid body for the tool, so that the 402 that comes back is the
+// paywall answering and not an input rejection. `expect` is used in one case
+// only: a deployment that has a free tier switched on and serves the call.
 
 const CONVERSIONS = [
   {
     id: 'md-html',
     input: '# Hi\n\nHello **world**.\n',
     expect: '<strong>world</strong>',
+    mimeType: 'text/html',
   },
   {
     id: 'json-yaml',
     input: '{"lemon":"toolshed","n":42}',
     expect: 'lemon: toolshed',
+    mimeType: 'application/yaml',
   },
   {
     id: 'yaml-json',
     input: 'lemon: toolshed\nn: 42\n',
     expect: '"lemon": "toolshed"',
+    mimeType: 'application/json',
   },
   {
     id: 'csv-json',
     input: 'name,qty\nlemon,3\n',
     expect: '"name": "lemon"',
+    mimeType: 'application/json',
   },
   {
     id: 'html-markdown',
     input: '<h1>Toolshed</h1><p>hello</p>',
     expect: '# Toolshed',
+    mimeType: 'text/markdown',
   },
 ];
 
 const HOSTED_EXPECTED = 5;
 const BIG_INPUT_BYTES = 300 * 1024;
 
-// Must match FREE_TIER_DAILY in build.mjs. Asserted against the live service by
-// the quota probe, and published in catalog.json — so a drift shows up as a red
-// row rather than as a surprise.
-const FREE_TIER_EXPECT = 3;
+// USDC on Base, and the EIP-712 domain a client signs the transfer authorization
+// over. These two are pinned exactly: a buyer's signature is computed against
+// them, so a drift here does not degrade the product, it makes every payment
+// verify as invalid.
+const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const USDC_EXTRA = { name: 'USD Coin', version: '2' };
 
-// Which converters get the free slots. Default is every one, in order, which
-// means the first FREE_TIER_EXPECT of them are checked and the rest land on the
-// paywall. --tools=<id,...> re-points the scarce slots at whatever you changed.
-const SELECTED_CONVERSIONS = (() => {
-  if (!TOOLS_ARG) return CONVERSIONS;
-  const wanted = TOOLS_ARG.split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const unknown = wanted.filter((id) => !CONVERSIONS.some((c) => c.id === id));
-  if (unknown.length) {
-    console.error(
-      `--tools names ${unknown.join(', ')}, which this file has no fixture for. ` +
-        `Known: ${CONVERSIONS.map((c) => c.id).join(', ')}`
-    );
-    process.exit(2);
-  }
-  return wanted.map((id) => CONVERSIONS.find((c) => c.id === id));
-})();
+// The facilitator rejects paymentRequirements carrying a description longer than
+// this, so an over-long description is not a cosmetic problem — it is an
+// unpayable envelope.
+const MAX_DESCRIPTION_CHARS = 500;
 
-// The ledger the whole run is metered against: how many conversions this caller
-// has actually had SERVED so far. A refused over-tier call claims nothing, so it
-// does not move this — which is what makes the next prediction exact.
-let spent = 0;
-const insideTier = () => spent < FREE_TIER_EXPECT;
+// The runtime free tier, as GET /check reports it. Production is 0. Anything
+// above that is a deployment with FREE_TIER_DAILY set, which changes what the
+// convert probes are allowed to see.
+let runtimeFreeTier = null;
+
+// Filled by the /check row, and reused by the alias rows so they cost no extra
+// requests against rung 0.
+let hostedMatches = null;
+
+// Conversions this run actually had SERVED. It should stay 0 forever; it is a
+// counter rather than a constant so the cost block below reports what happened
+// rather than what was intended.
+let served = 0;
+
+// Which tool claimed which envelope description, so "each tool advertises its
+// own" is checked rather than assumed.
+const descriptionOwners = new Map();
 
 // ---------------------------------------------------------------- table
 
@@ -159,127 +203,229 @@ function printTable() {
   console.log('-'.repeat(nameWidth + 10));
   console.log(`${String(`${passed} passed, ${failed} failed`).padEnd(nameWidth)}  ${failed ? 'FAIL' : 'PASS'}`);
   console.log(`${'='.repeat(nameWidth + 10)}\n`);
+
+  if (notes.length) {
+    console.log('NOTES — not failures, but do not skim past them');
+    for (const n of notes) console.log(`  * ${n}`);
+    console.log('');
+  }
   return failed;
 }
 
-// ---------------------------------------------------------------- quota probe
+// ---------------------------------------------------------------- envelope
 //
-// Opt-in, because it spends the day: FREE_TIER_EXPECT accepted conversions, one
-// refusal, and three more refusals under rotated user-agents. What it proves:
+// The x402 envelope is the product's actual API for a paying agent: it reads
+// this, signs against it, and retries. Everything asserted here is something a
+// buyer or a discovery index depends on.
 //
-//   1. beacons are on a separate budget — 5 /b events first, and the free tier
-//      is still whole afterwards;
-//   2. x-free-tier-remaining counts down FREE_TIER_EXPECT - 1 -> 0 across them;
-//   3. call FREE_TIER_EXPECT + 1 is refused — 429 with the free-tier body and a
-//      sane Retry-After, or 402 with an x402 envelope once PAYTO is set;
-//   4. rotating the user-agent from the same IP does NOT mint a fresh allowance.
-//
-// It needs a caller whose allowance is untouched today. A 429 on the first call
-// means this IP has already converted today; wait for midnight UTC.
+// What is pinned exactly and what is only sanity-checked is a deliberate split.
+// Pinned: the fields a signature is computed over (network, scheme, asset,
+// extra) and the fields that identify the tool (resource, mimeType) — a wrong
+// value there breaks payment or points a buyer at the wrong endpoint. Sanity
+// -checked only: price and timeout, which are owner-tunable, so pinning them
+// would turn a config change into a red row that says nothing.
 
-const UAS = [
-  'toolshed-quota-probe/1.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36',
-  'curl/8.7.1',
-  'python-requests/2.32.3',
-];
-
-function assertRefusal(res, body) {
-  if (res.status === 402) {
-    const env = JSON.parse(body);
-    const offer = (env.accepts && env.accepts[0]) || {};
-    assert(env.x402Version === 1, 'the 402 body is not an x402 v1 envelope');
-    assert(!!offer.payTo, 'the x402 envelope names no payTo address');
-    return `402 — ${offer.maxAmountRequired} atomic to ${offer.payTo}`;
-  }
-  assert(res.status === 429, `expected 429 or 402, got ${res.status}`);
-  const seen = JSON.parse(body);
-  assert(
-    seen.free_tier_daily === FREE_TIER_EXPECT,
-    `free_tier_daily is ${seen.free_tier_daily}, expected ${FREE_TIER_EXPECT}`
-  );
-  assert(/free tier/.test(String(seen.error)), `unexpected error text: ${seen.error}`);
-  assert(!!seen.paid_tier, 'the 429 body does not name the paid tier');
-  assert(seen.retry === 'tomorrow UTC', `retry is ${JSON.stringify(seen.retry)}`);
-
-  const retryAfter = Number(res.headers.get('retry-after'));
-  assert(Number.isFinite(retryAfter), 'no numeric Retry-After header');
-  assert(retryAfter > 0 && retryAfter <= 86400, `Retry-After ${retryAfter} is not within one day`);
-  return `429 — ${seen.error}, Retry-After ${retryAfter}s`;
-}
-
-async function quotaProbe() {
-  console.log(`Toolshed free-tier probe — ${BASE}`);
-  console.log(
-    `${FREE_TIER_EXPECT} free calls, then one over, then ${UAS.length - 1} rotated user-agents.` +
-      ` Spends this IP's whole allowance for the UTC day.${PACE_MS ? ` Paced ${PACE_MS} ms.` : ''}\n`
-  );
-
-  // (1) Beacons must not touch the conversion budget.
-  await test('5 /b beacons are accepted', async () => {
-    for (let i = 0; i < 5; i++) {
-      const res = await post('/b', JSON.stringify({ t: 'visit' }), { 'content-type': 'text/plain' });
-      assert(res.status === 204, `beacon ${i + 1} answered ${res.status}, expected 204`);
-      await sleep(PACE_MS);
+/** Every `description` string anywhere in the envelope, at any depth. */
+function everyDescription(value, out = []) {
+  if (Array.isArray(value)) {
+    for (const v of value) everyDescription(v, out);
+  } else if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === 'description' && typeof v === 'string') out.push(v);
+      everyDescription(v, out);
     }
-    return '5 accepted — the conversion budget should still be whole';
-  });
-
-  // (2) The free tier, counted down.
-  for (let i = 1; i <= FREE_TIER_EXPECT; i++) {
-    await test(`convert ${i}/${FREE_TIER_EXPECT} is served free`, async () => {
-      const res = await post('/convert/md-html', '# hi\n', { 'user-agent': UAS[0] });
-      if (res.status === 429 || res.status === 402) {
-        throw new Error(
-          `refused with ${res.status} on call ${i} — this IP had already spent part of today's free tier` +
-            (i === 1 ? ' (beacons did NOT do it; they are on a separate budget)' : '')
-        );
-      }
-      assert(res.status === 200, `expected 200, got ${res.status}`);
-      const remaining = res.headers.get('x-free-tier-remaining');
-      assert(remaining !== null, 'no x-free-tier-remaining header on a free-tier answer');
-      const want = FREE_TIER_EXPECT - i;
-      assert(Number(remaining) === want, `x-free-tier-remaining is ${remaining}, expected ${want}`);
-      return `x-free-tier-remaining: ${remaining}`;
-    });
-    await sleep(PACE_MS);
   }
-
-  // (3) One over.
-  await test(`convert ${FREE_TIER_EXPECT + 1} is refused`, async () => {
-    const res = await post('/convert/md-html', '# hi\n', { 'user-agent': UAS[0] });
-    return assertRefusal(res, await res.text());
-  });
-  await sleep(PACE_MS);
-
-  // (4) The spoof-resistance claim: same IP, different user-agent, same refusal.
-  for (const ua of UAS.slice(1)) {
-    await test(`rotated user-agent is still refused — ${ua.slice(0, 28)}`, async () => {
-      const res = await post('/convert/md-html', '# hi\n', { 'user-agent': ua });
-      return assertRefusal(res, await res.text());
-    });
-    await sleep(PACE_MS);
-  }
+  return out;
 }
 
-if (QUOTA) {
-  await quotaProbe();
-  process.exit(printTable() ? 1 : 0);
+const canonical = (obj) =>
+  JSON.stringify(
+    Object.fromEntries(Object.entries(obj ?? {}).sort(([a], [b]) => (a < b ? -1 : 1)))
+  );
+
+function assertEnvelope(offer, tool) {
+  assert(offer && typeof offer === 'object', 'accepts[0] is not an object');
+
+  assert(offer.scheme === 'exact', `scheme is ${JSON.stringify(offer.scheme)}, expected "exact"`);
+  assert(offer.network === 'base', `network is ${JSON.stringify(offer.network)}, expected "base"`);
+
+  // The envelope has to name THIS tool. A shared or stale resource means a buyer
+  // signs a payment for one endpoint and spends it at another.
+  assert(typeof offer.resource === 'string', 'the envelope names no resource');
+  assert(/^https?:\/\//.test(offer.resource), `resource ${offer.resource} is not an absolute URL`);
+  assert(
+    offer.resource.endsWith(`/convert/${tool.id}`),
+    `resource is ${offer.resource}, expected it to end /convert/${tool.id}`
+  );
+
+  assert(
+    typeof offer.description === 'string' && offer.description.trim().length > 0,
+    'the envelope carries no description'
+  );
+  const alreadyClaimedBy = descriptionOwners.get(offer.description);
+  assert(
+    !alreadyClaimedBy,
+    `${tool.id} advertises the same description as ${alreadyClaimedBy} — the envelopes are not per-tool`
+  );
+  descriptionOwners.set(offer.description, tool.id);
+
+  assert(
+    offer.mimeType === tool.mimeType,
+    `mimeType is ${JSON.stringify(offer.mimeType)}, expected ${JSON.stringify(tool.mimeType)}`
+  );
+
+  assert(
+    /^0x[0-9a-fA-F]{40}$/.test(String(offer.payTo)),
+    `payTo ${JSON.stringify(offer.payTo)} is not a plausible address`
+  );
+
+  assert(
+    /^[0-9]+$/.test(String(offer.maxAmountRequired)),
+    `maxAmountRequired ${JSON.stringify(offer.maxAmountRequired)} is not a numeric string`
+  );
+  assert(Number(offer.maxAmountRequired) > 0, 'maxAmountRequired is zero');
+
+  assert(
+    String(offer.asset).toLowerCase() === USDC_BASE.toLowerCase(),
+    `asset is ${offer.asset}, expected USDC on Base (${USDC_BASE})`
+  );
+  assert(
+    canonical(offer.extra) === canonical(USDC_EXTRA),
+    `extra is ${JSON.stringify(offer.extra)}, expected ${JSON.stringify(USDC_EXTRA)} — a client that ` +
+      'signs over a different EIP-712 domain produces a signature the facilitator rejects'
+  );
+
+  assert(
+    Number.isInteger(offer.maxTimeoutSeconds) && offer.maxTimeoutSeconds > 0,
+    `maxTimeoutSeconds is ${JSON.stringify(offer.maxTimeoutSeconds)}`
+  );
+
+  // outputSchema is what Coinbase's Bazaar reads to index the endpoint. Without
+  // `discoverable`, the tool is payable but invisible: nothing crawls it.
+  const schema = offer.outputSchema;
+  assert(schema && typeof schema === 'object', 'the envelope has no outputSchema');
+  const input = schema.input;
+  const output = schema.output;
+  assert(input && typeof input === 'object', 'the envelope has no outputSchema.input');
+  assert(
+    input.discoverable === true,
+    `outputSchema.input.discoverable is ${JSON.stringify(input.discoverable)} — Bazaar will not index this tool`
+  );
+  assert(input.type === 'http', `outputSchema.input.type is ${JSON.stringify(input.type)}, expected "http"`);
+  assert(
+    input.method === 'POST',
+    `outputSchema.input.method is ${JSON.stringify(input.method)}, expected "POST"`
+  );
+  assert(
+    input.bodyType === 'text',
+    `outputSchema.input.bodyType is ${JSON.stringify(input.bodyType)}, expected "text"`
+  );
+  assert(output && typeof output === 'object', 'the envelope has no outputSchema.output');
+  assert(
+    output.type === 'string',
+    `outputSchema.output.type is ${JSON.stringify(output.type)}, expected "string"`
+  );
+  assert(
+    typeof output.description === 'string' && output.description.trim().length > 0,
+    'outputSchema.output carries no description'
+  );
+
+  for (const text of everyDescription(offer)) {
+    assert(
+      text.length <= MAX_DESCRIPTION_CHARS,
+      `a description is ${text.length} characters, over the facilitator's ${MAX_DESCRIPTION_CHARS}-character ` +
+        `limit — the envelope is unpayable: "${text.slice(0, 60)}..."`
+    );
+  }
+
+  return (
+    `402 — ${offer.maxAmountRequired} atomic USDC to ${offer.payTo}, discoverable, ` +
+    `${offer.description.length}-char description`
+  );
+}
+
+/**
+ * What a caller that presented no payment is allowed to get back, and what each
+ * answer means. Exactly one of these is the production contract (402); the other
+ * two are real deployment states that must be reported rather than mislabelled.
+ */
+async function probeGate(res, tool) {
+  const text = await res.text();
+
+  if (res.status === 402) {
+    const body = parseJson(text, 'the 402 body');
+    assert(body.x402Version === 1, `x402Version is ${JSON.stringify(body.x402Version)}, expected 1`);
+    assert(Array.isArray(body.accepts), 'accepts is not an array');
+    assert(
+      body.accepts.length === 1,
+      `accepts has ${body.accepts.length} entries, expected exactly 1`
+    );
+    return assertEnvelope(body.accepts[0], tool);
+  }
+
+  if (res.status === 429) {
+    // The only 429 a first, unpaid call can legitimately get: a deployment with
+    // no receiving address, so there is nowhere to pay and no envelope to build.
+    // Nothing resets at midnight — a misconfiguration is not a quota — so this
+    // form deliberately carries no Retry-After.
+    const body = parseJson(text, 'the 429 body');
+    assert(
+      body.free_tier_daily === 0,
+      `429 body says free_tier_daily ${JSON.stringify(body.free_tier_daily)}, expected 0`
+    );
+    assert(
+      typeof body.retry === 'string' && body.retry.trim().length > 0,
+      'the 429 body does not say what has to change'
+    );
+    assert(
+      res.headers.get('retry-after') === null,
+      'the misconfiguration 429 carries a Retry-After — nothing about it resets on a clock'
+    );
+    loud(
+      `${tool.id}: this deployment has NO RECEIVING ADDRESS CONFIGURED, so it cannot sell anything. ` +
+        `The Worker said: ${String(body.retry).slice(0, 120)}`
+    );
+    return {
+      name: `POST /convert/${tool.id} with no payment — NO RECEIVING ADDRESS, no envelope to check`,
+      detail: `429 — ${String(body.error).slice(0, 70)}`,
+    };
+  }
+
+  if (res.status === 200) {
+    // Only reachable with FREE_TIER_DAILY set. Against production that is a
+    // contradiction with what /check just published, and a red row.
+    assert(
+      runtimeFreeTier === null || runtimeFreeTier > 0,
+      `served an unpaid conversion, but GET /check publishes free_tier_daily ${runtimeFreeTier} — ` +
+        'the paywall is not being applied'
+    );
+    const out = text;
+    assert(out.includes(tool.expect), `output did not contain ${JSON.stringify(tool.expect)}`);
+    served += 1;
+    loud(
+      `${tool.id}: this deployment HAS A FREE TIER ENABLED (FREE_TIER_DAILY=${runtimeFreeTier}) and served ` +
+        'the call. No 402 envelope was checked for it, and this run is no longer free of served conversions.'
+    );
+    return {
+      name: `POST /convert/${tool.id} with no payment — FREE TIER ENABLED, converted instead of charging`,
+      detail: `200 — no envelope checked; output: ${out.replace(/\s+/g, ' ').trim().slice(0, 40)}`,
+    };
+  }
+
+  throw new Error(`expected 402, got ${res.status}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
 }
 
 // ---------------------------------------------------------------- tests
 
-// Every queued call that reaches the converter claims an allowance: the selected
-// happy paths plus the malformed-input case. The 413 is refused on the declared
-// size before any of that, so it is free.
-const QUEUED_METERED = SELECTED_CONVERSIONS.length + 1;
-
 console.log(`Toolshed live test — ${BASE}`);
 console.log(
-  `Budget: ${FREE_TIER_EXPECT} free conversions — this IP's whole allowance for the UTC day. ` +
-    `${QUEUED_METERED} calls queued that spend it; the first ${Math.min(FREE_TIER_EXPECT, QUEUED_METERED)} ` +
-    (QUEUED_METERED > FREE_TIER_EXPECT ? 'are checked, the rest land on the paywall.\n' : 'are checked.\n')
+  'This run serves NO conversions and spends NOTHING: it never sends an X-PAYMENT header, so every\n' +
+    '/convert probe stops at the 402 paywall and is checked as an envelope, not as a conversion.\n' +
+    'Converter coverage: `npm test` (local, free). Paid-path coverage: scripts/pay-test.mjs (owner only,\n' +
+    `real USDC).${PACE_MS ? ` Requests paced ${PACE_MS} ms for the 5 req / 10 s edge rule.` : ''}\n`
 );
+
+// ------------------------------------------------------------ 1. /check
 
 await test('GET /check with no parameters lists every hosted tool', async () => {
   const res = await get('/check');
@@ -294,91 +440,181 @@ await test('GET /check with no parameters lists every hosted tool', async () => 
     body.matches.every((m) => m.hosted),
     'a match came back with no hosted block'
   );
-  return `${body.matches.length} hosted: ${body.matches.map((m) => m.id).join(', ')}`;
+  for (const m of body.matches) {
+    assert(m.hosted.path === `/convert/${m.id}`, `${m.id}: path and id disagree`);
+    assert(
+      Number.isInteger(m.hosted.free_tier_daily),
+      `${m.id} publishes no free_tier_daily — /check is meant to report the RUNTIME value the Worker enforces`
+    );
+  }
+
+  const published = [...new Set(body.matches.map((m) => m.hosted.free_tier_daily))];
+  assert(published.length === 1, `the tools disagree about free_tier_daily: ${published.join(', ')}`);
+  runtimeFreeTier = published[0];
+  hostedMatches = body.matches;
+
+  // 0 is the production contract. Anything else is a deployment with the
+  // FREE_TIER_DAILY env var set — legal, and loudly reported, not a failure.
+  if (runtimeFreeTier > 0) {
+    loud(
+      `GET /check publishes free_tier_daily ${runtimeFreeTier} — THIS DEPLOYMENT HAS A FREE TIER ENABLED. ` +
+        'Production runs with FREE_TIER_DAILY unset and publishes 0.'
+    );
+  }
+  return `${body.matches.length} hosted: ${body.matches.map((m) => m.id).join(', ')} — free_tier_daily ${runtimeFreeTier}`;
+});
+
+await test('GET /check entries publish their alias lists', async () => {
+  assert(hostedMatches, 'the /check row above did not complete, so there is nothing to read');
+  for (const m of hostedMatches) {
+    assert(Array.isArray(m.x_aliases), `${m.id} publishes no x_aliases array`);
+    assert(Array.isArray(m.y_aliases), `${m.id} publishes no y_aliases array`);
+  }
+  const md = hostedMatches.find((m) => m.id === 'md-html');
+  assert(md, 'md-html is not in the hosted list');
+  return `md-html: x_aliases [${md.x_aliases.join(', ')}] y_aliases [${md.y_aliases.join(', ')}]`;
 });
 
 await test('GET /check?from=markdown&to=html returns exactly md-html', async () => {
   const res = await get('/check?from=markdown&to=html');
   assert(res.status === 200, `expected 200, got ${res.status}`);
-  const body = await res.json();
-  const ids = body.matches.map((m) => m.id);
+  const ids = (await res.json()).matches.map((m) => m.id);
   assert(ids.length === 1 && ids[0] === 'md-html', `expected [md-html], got [${ids.join(', ')}]`);
   return 'md-html';
 });
 
-// Set when a call this run expected to be free came back refused, which means
-// the allowance was already gone before the run started. It is diagnosed ONCE,
-// as a red row; after that the remaining rows say the same thing the calmer way
-// rather than repeating the same failure six times over one root cause.
-let tierSpentEarly = false;
+// Alias resolution is a MEMBERSHIP claim, not an exclusivity one: the catalog
+// carries plenty of non-hosted markdown-input entries, and an alias query is
+// supposed to find them too. What matters is that the alias resolves at all —
+// `from=md` finding nothing is the bug this row exists to catch.
+const ALIAS_QUERIES = [
+  { query: 'from=md&to=html', want: 'md-html' },
+  { query: 'from=.md&to=html', want: 'md-html' },
+  { query: 'from=text/markdown&to=text/html', want: 'md-html' },
+  { query: 'from=yaml&to=json', want: 'yaml-json' },
+  { query: 'from=.yml&to=application/json', want: 'yaml-json' },
+];
 
-// A conversion the tier could not pay for. The refusal is the RIGHT answer, and
-// it is asserted as one — but it is not evidence that the converter behind it
-// still works, so the row says so out loud.
-const notExercised = async (res, what) => {
-  const detail = assertRefusal(res, await res.text());
-  const why = tierSpentEarly ? 'tier was already spent before this run' : 'over tier';
-  return `${why} — ${detail} — ${what} NOT exercised this run`;
-};
-
-// A call that was predicted free and was refused means one thing only: this IP
-// had already converted today. It is a red row, because the run proved nothing.
-function assertTierWasWhole(res, callNumber) {
-  if (res.status !== 402 && res.status !== 429) return;
-  tierSpentEarly = true;
-  throw new Error(
-    `refused with ${res.status} on free call ${callNumber}/${FREE_TIER_EXPECT} — this IP had already ` +
-      `spent today's ${FREE_TIER_EXPECT}/day free tier before this run. Nothing after this row ` +
-      'exercises a converter. Re-run after midnight UTC (beacons did NOT do it; they are on a ' +
-      'separate budget).'
-  );
-}
-
-for (const c of SELECTED_CONVERSIONS) {
-  await test(`POST /convert/${c.id} converts and returns its own output`, async () => {
-    const free = insideTier() && !tierSpentEarly;
-    const res = await post(`/convert/${c.id}`, c.input);
-
-    if (!free) return notExercised(res, c.id);
-
-    assertTierWasWhole(res, spent + 1);
+for (const { query, want } of ALIAS_QUERIES) {
+  await test(`GET /check?${query} resolves to ${want}`, async () => {
+    const res = await get(`/check?${query}`);
     assert(res.status === 200, `expected 200, got ${res.status}`);
-    const out = await res.text();
-    assert(out.includes(c.expect), `output did not contain ${JSON.stringify(c.expect)}`);
-
-    // Served, so the allowance moved — and the header has to agree, exactly.
-    spent += 1;
-    const left = res.headers.get('x-free-tier-remaining');
-    assert(
-      Number(left) === FREE_TIER_EXPECT - spent,
-      `x-free-tier-remaining is ${left}, expected ${FREE_TIER_EXPECT - spent}`
-    );
-    return `${out.replace(/\s+/g, ' ').trim().slice(0, 48)} [free tier: ${left} left]`;
+    const ids = (await res.json()).matches.map((m) => m.id);
+    assert(ids.includes(want), `expected ${want} among the matches, got [${ids.join(', ')}]`);
+    return ids.length === 1 ? `exactly ${want}` : `${want} + ${ids.length - 1} other catalog entries`;
   });
 }
 
-// A malformed body is rejected AFTER the free-tier call is claimed, so this case
-// costs an allowance like any other — which at 3/day means it usually lands past
-// the tier and cannot run. The local suite (`npm test`) is where it is covered
-// unconditionally; here it is opportunistic and honest about it.
-await test('POST /convert/json-yaml rejects malformed input with 400', async () => {
-  const free = insideTier() && !tierSpentEarly;
-  const res = await post('/convert/json-yaml', '{not json');
-
-  if (!free) return notExercised(res, 'the malformed-input 400');
-
-  assertTierWasWhole(res, spent + 1);
-  assert(res.status === 400, `expected 400, got ${res.status}`);
-  spent += 1; // a rejected conversion still spends its free-tier call
+await test('GET /check with an unknown format is an empty answer, not an error', async () => {
+  const res = await get('/check?from=zzzznotathing');
+  assert(res.status === 200, `expected 200, got ${res.status}`);
   const body = await res.json();
-  assert(typeof body.error === 'string' && body.error.length > 0, 'no error message in the 400 body');
-  return body.error.slice(0, 60);
+  assert(body.matches.length === 0, `expected no matches, got ${body.matches.length}`);
+  return '0 matches';
 });
 
+// ------------------------------------------------------------ 2. machine surfaces
+//
+// Static files at the origin. Unmetered, and the only thing most agents will
+// ever read: if these are stale or missing, the API is undiscoverable however
+// well the Worker behaves.
+
+let apiBase = null;
+
+await test('GET /catalog.json parses and publishes the runtime free tier', async () => {
+  const res = await get('/catalog.json');
+  assert(res.status === 200, `expected 200, got ${res.status}`);
+  const doc = parseJson(await res.text(), 'catalog.json');
+  assert(Array.isArray(doc.entries) && doc.entries.length > 0, 'catalog.json has no entries');
+  assert(doc.api && typeof doc.api === 'object', 'catalog.json has no api block');
+  assert(
+    doc.api.free_tier_daily === 0,
+    `catalog.json publishes api.free_tier_daily ${JSON.stringify(doc.api.free_tier_daily)}, expected 0`
+  );
+  assert(typeof doc.api.base === 'string' && doc.api.base, 'catalog.json names no api base');
+  apiBase = doc.api.base;
+
+  const hosted = doc.entries.filter((e) => e.hosted);
+  assert(hosted.length > 0, 'catalog.json publishes no hosted entries');
+  if (hostedMatches) {
+    const published = hosted.map((e) => e.id).sort();
+    const live = hostedMatches.map((m) => m.id).sort();
+    assert(
+      JSON.stringify(published) === JSON.stringify(live),
+      `catalog.json lists [${published}] but /check answers [${live}]`
+    );
+  }
+  return `${doc.entries.length} entries, ${hosted.length} hosted, api base ${apiBase}`;
+});
+
+for (const path of ['/llms.txt', '/llms-full.txt']) {
+  await test(`GET ${path} is served and names the API base`, async () => {
+    const res = await get(path);
+    assert(res.status === 200, `expected 200, got ${res.status}`);
+    const text = await res.text();
+    assert(text.trim().length > 0, `${path} is empty`);
+    assert(/\/convert\//.test(text), `${path} names no conversion endpoint`);
+    if (apiBase) {
+      assert(text.includes(apiBase), `${path} never names the API base (${apiBase})`);
+    }
+    return `${text.length} bytes`;
+  });
+}
+
+await test('GET /openapi.json is a 3.1 document describing /check and /convert', async () => {
+  const res = await get('/openapi.json');
+  assert(res.status === 200, `expected 200, got ${res.status}`);
+  const doc = parseJson(await res.text(), 'openapi.json');
+  assert(
+    typeof doc.openapi === 'string' && doc.openapi.startsWith('3.1'),
+    `openapi is ${JSON.stringify(doc.openapi)}, expected a 3.1.x document`
+  );
+  assert(doc.paths && typeof doc.paths === 'object', 'openapi.json has no paths object');
+  assert(doc.paths['/check'], 'openapi.json describes no /check path');
+  assert(doc.paths['/check'].get, '/check is described with no GET operation');
+
+  // Either the templated form or one literal path per tool is a fair rendering
+  // of the same endpoint, so both are accepted and the detail says which.
+  const convertPaths = Object.keys(doc.paths).filter((p) => /^\/convert\/(\{[^}]+\}|[\w.-]+)$/.test(p));
+  assert(convertPaths.length > 0, 'openapi.json describes no /convert/{id}-shaped path');
+  assert(
+    convertPaths.every((p) => doc.paths[p].post),
+    `a convert path is described with no POST operation: ${convertPaths.join(', ')}`
+  );
+  return `${Object.keys(doc.paths).length} paths, convert as ${convertPaths.join(', ')}`;
+});
+
+await test('GET /robots.txt is served', async () => {
+  const res = await get('/robots.txt');
+  assert(res.status === 200, `expected 200, got ${res.status}`);
+  const text = await res.text();
+  assert(text.trim().length > 0, 'robots.txt is empty');
+  return `${text.length} bytes, ${res.headers.get('content-type') || 'no content-type'}`;
+});
+
+// ------------------------------------------------------------ 3. the paywall
+//
+// The core of the run: one unpaid probe per hosted tool. No X-PAYMENT header is
+// sent, so the correct answer is 402 with a spec-valid x402 v1 envelope naming
+// that tool. Nothing is converted and nothing is charged — an unpaid 402 does not
+// even touch D1.
+
+for (const tool of CONVERSIONS) {
+  await test(`POST /convert/${tool.id} with no payment offers a payable, discoverable envelope`, async () => {
+    const res = await post(`/convert/${tool.id}`, tool.input);
+    return probeGate(res, tool);
+  });
+}
+
+// ------------------------------------------------------------ 4. cheap guards
+
 await test(`POST /convert/md-html rejects ${BIG_INPUT_BYTES / 1024} KB with 413`, async () => {
+  // The size check runs BEFORE the envelope is built, so an oversize body is an
+  // unpaid, unmetered refusal: it never reaches a paywall or a converter.
   const res = await post('/convert/md-html', 'a'.repeat(BIG_INPUT_BYTES));
   assert(res.status === 413, `expected 413, got ${res.status}`);
   const body = await res.json();
+  assert(typeof body.error === 'string' && body.error.length > 0, 'no error message in the 413 body');
   return body.error.slice(0, 60);
 });
 
@@ -409,11 +645,13 @@ const PRICES = {
   workersPaidBase: 5.0, // USD per month, flat — NOT in the totals below
 };
 
-// Assumptions, labelled because they are guesses rather than measurements.
+// Assumptions, labelled because they are guesses rather than measurements. They
+// all describe a SERVED call, which since the free tier was removed is always a
+// PAID call: an unpaid request never gets that far.
 const ASSUME = {
   cpuMsPerConvert: 2, // ms
-  cpuMsPerOther: 0.5, // ms — /check, /b
-  d1RowsWrittenPerConvert: 3, // the events insert + the counters upsert + the quota claim
+  cpuMsPerOther: 0.5, // ms — /check, /b, a static file, a 402, a 413
+  d1RowsWrittenPerConvert: 3, // the events insert + the counters upsert + the PAID_DAILY ceiling claim
   d1RowsReadPerConvert: 2, // the salt row + the rung-2 counter
   daysPerMonth: 30,
 };
@@ -436,40 +674,47 @@ console.log(
 console.log(`  D1 rows read       ${PRICES.d1RowsReadIncluded.toLocaleString()}/mo included`);
 console.log(`  (Workers Paid base ${usd(PRICES.workersPaidBase)}/mo flat — excluded from the totals below)\n`);
 console.log('Assumptions (labelled: estimates, not measurements)');
-console.log(`  ${ASSUME.cpuMsPerConvert} ms CPU per /convert, ${ASSUME.cpuMsPerOther} ms per /check or /b`);
+console.log(`  ${ASSUME.cpuMsPerConvert} ms CPU per SERVED /convert, ${ASSUME.cpuMsPerOther} ms per unpaid or static request`);
 console.log(
-  `  ${ASSUME.d1RowsWrittenPerConvert} D1 rows written per /convert (events insert + counters upsert + free-tier claim), ${ASSUME.d1RowsReadPerConvert} read`
+  `  ${ASSUME.d1RowsWrittenPerConvert} D1 rows written per SERVED /convert (events insert + counters upsert + ` +
+    `the PAID_DAILY runaway-ceiling claim), ${ASSUME.d1RowsReadPerConvert} read`
 );
-console.log(`  ${ASSUME.daysPerMonth}-day month; one "call" below = one /convert request\n`);
+console.log(
+  '  An UNPAID 402 writes nothing to D1 at all — no salt read, no quota claim, no events row — and a 413 is'
+);
+console.log('  refused on the declared size before any of that. Both are free to the operator as well as the caller.');
+console.log(`  ${ASSUME.daysPerMonth}-day month; one "call" below = one SERVED /convert, which is always a paid one\n`);
 
 // --- this run -----------------------------------------------------------
 
-const runConverts = SELECTED_CONVERSIONS.length + 2; // the happy paths + the 400 + the 413
-const runOther = results.length - runConverts;
-const runRequests = results.length;
-// Only the SERVED conversions cost a converter's worth of CPU and rows — `spent`
-// of them. A refusal past the free tier reads the salt and the global counter and
-// tries the quota claim, but runs no converter, writes no events row and moves no
-// counter; the 413 is rejected on the declared size before any D1 work at all;
-// the beacon writes its own two rows.
-const runRefused = runRequests - spent;
-const runCpuMs = spent * ASSUME.cpuMsPerConvert + runRefused * ASSUME.cpuMsPerOther;
-const runRowsWritten = spent * ASSUME.d1RowsWrittenPerConvert + 2;
+const runOther = requestCount - convertRequestCount;
+// Only SERVED conversions cost a converter's worth of CPU and D1 rows, and this
+// run serves none: it sends no X-PAYMENT header, so every /convert probe stops
+// at the paywall. The beacon writes its own two rows, and nothing else writes.
+const runCpuMs = served * ASSUME.cpuMsPerConvert + (requestCount - served) * ASSUME.cpuMsPerOther;
+const runRowsWritten = served * ASSUME.d1RowsWrittenPerConvert + 2;
 
 console.log('This test run');
 console.log(
-  `  ${runRequests} requests (${runConverts} convert, ${runOther} other) = ${runRequests} / ${PRICES.requestsIncluded.toLocaleString()} of the monthly request allowance`
+  `  ${requestCount} requests (${convertRequestCount} to /convert, ${runOther} other) = ` +
+    `${requestCount} / ${PRICES.requestsIncluded.toLocaleString()} of the monthly request allowance`
 );
 console.log(
-  `  ${spent} of ${FREE_TIER_EXPECT} free-tier conversions spent — the rest of the convert calls were over the tier`
+  served === 0
+    ? '  0 conversions served — every /convert probe stopped at the 402 paywall, so no converter ran'
+    : `  ${served} conversions served — this deployment has a free tier enabled, so probes that should have ` +
+      'stopped at the paywall ran the converter instead'
+);
+console.log(`  ${usd(0)} spent in USDC — no X-PAYMENT header was ever sent, so nothing could be charged`);
+console.log(
+  `  ~${runCpuMs} ms CPU (${served}x${ASSUME.cpuMsPerConvert} served + ${requestCount - served}x${ASSUME.cpuMsPerOther} unpaid or static) = ` +
+    `${runCpuMs} / ${PRICES.cpuMsIncluded.toLocaleString()} ms`
 );
 console.log(
-  `  ${runCpuMs} ms CPU (${spent}x${ASSUME.cpuMsPerConvert} served + ${runRefused}x${ASSUME.cpuMsPerOther} refused or unmetered) = ${runCpuMs} / ${PRICES.cpuMsIncluded.toLocaleString()} ms`
+  `  ~${runRowsWritten} D1 rows written (the beacon's two; the 402s and the 413 write none) = ` +
+    `${runRowsWritten} / ${PRICES.d1RowsWrittenIncluded.toLocaleString()}`
 );
-console.log(
-  `  ~${runRowsWritten} D1 rows written = ${runRowsWritten} / ${PRICES.d1RowsWrittenIncluded.toLocaleString()}`
-);
-console.log(`  Cost of this run: ${usd(0)} — every meter is inside its allowance.\n`);
+console.log(`  Cost of this run: ${usd(0)} in USDC and ${usd(0)} in Cloudflare metering.\n`);
 
 // --- monthly scaling ----------------------------------------------------
 
@@ -499,12 +744,12 @@ const COLS = [
   ['TOTAL/mo', (r) => usd(r.total)],
 ];
 
-const widths = COLS.map(([head, get_], i) =>
+const widths = COLS.map(([head], i) =>
   Math.max(head.length, ...ROWS.map((r) => COLS[i][1](r).length))
 );
 const line = (cells) => cells.map((c, i) => String(c).padStart(widths[i])).join('  ');
 
-console.log('Monthly cost by volume (metered charges only)');
+console.log('Monthly cost by volume (metered charges only; every call below is a SERVED, PAID call)');
 console.log(line(COLS.map(([head]) => head)));
 console.log(widths.map((w) => '-'.repeat(w)).join('  '));
 for (const r of ROWS) console.log(line(COLS.map(([, get_]) => get_(r))));
@@ -516,7 +761,7 @@ const crackRequests = PRICES.requestsIncluded / ASSUME.daysPerMonth;
 const crackCpu = PRICES.cpuMsIncluded / ASSUME.cpuMsPerConvert / ASSUME.daysPerMonth;
 const crackD1 = PRICES.d1RowsWrittenIncluded / ASSUME.d1RowsWrittenPerConvert / ASSUME.daysPerMonth;
 
-console.log('Where each allowance cracks (calls/day at which the first paid unit appears)');
+console.log('Where each allowance cracks (served calls/day at which the first paid unit appears)');
 console.log(
   `  requests    ${PRICES.requestsIncluded.toLocaleString()}/mo / ${ASSUME.daysPerMonth} d = ${Math.round(crackRequests).toLocaleString()}/day   <- first`
 );
@@ -527,8 +772,9 @@ console.log(
   `  D1 writes   ${PRICES.d1RowsWrittenIncluded.toLocaleString()} / ${ASSUME.d1RowsWrittenPerConvert} / ${ASSUME.daysPerMonth} d = ${Math.round(crackD1).toLocaleString()}/day`
 );
 console.log(
-  `\nThe first paid dollar arrives on REQUESTS, above ${PRICES.requestsIncluded.toLocaleString()} req/mo — about ${Math.round(crackRequests).toLocaleString()} calls/day.`
+  `\nThe first paid dollar arrives on REQUESTS, above ${PRICES.requestsIncluded.toLocaleString()} req/mo — about ${Math.round(crackRequests).toLocaleString()} served calls/day.`
 );
-console.log('Everything below that volume is allowance, and costs nothing beyond the flat plan fee.\n');
+console.log('Everything below that volume is allowance, and costs nothing beyond the flat plan fee.');
+console.log('Unpaid traffic — 402s, 413s, /check, the static files — only counts against requests and CPU.\n');
 
 process.exit(failed ? 1 : 0);

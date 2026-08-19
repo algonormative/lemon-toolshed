@@ -1,12 +1,13 @@
 // The 402 envelope, and the paid tier with NO facilitator configured.
 //
-// PHASE: PAYTO set, and deliberately no CDP credentials. This file needs its own
-// worker instance with PAYTO=<test address>, because the over-tier answer is a
-// 402 envelope only when there is somewhere to pay; with PAYTO unset it is a 429
-// (quota.test.mjs). Verification against a real (mock) facilitator is
-// x402-settlement.test.mjs; what is pinned HERE is the envelope itself, and the
-// half-configured deployment — an address to pay to, but no way to check a
-// payment — which is a state a real deploy can be in.
+// PHASE: the production configuration — PAYTO set, free tier off — and
+// deliberately no CDP credentials. This file needs a worker with PAYTO=<test
+// address>, because the unpaid answer is a 402 envelope only when there is
+// somewhere to pay; with PAYTO unset it is a 429 (quota.test.mjs, and the
+// no-address case in tier-off.test.mjs). Verification against a real (mock)
+// facilitator is x402-settlement.test.mjs; what is pinned HERE is the envelope
+// itself, and the half-configured deployment — an address to pay to, but no way
+// to check a payment — which is a state a real deploy can be in.
 //
 // The thing most worth guarding is still the negative: NOTHING IS EVER
 // FAKE-VERIFIED. With no facilitator reachable, `x-payment-verified` must never
@@ -16,16 +17,18 @@
 // WHAT CHANGED when the facilitator landed (2026-08-18), and why these
 // assertions moved with it:
 //
-//   - The free tier is claimed FIRST, always. An X-PAYMENT header presented
-//     inside the free tier no longer moves the caller onto the paid ceiling —
-//     it is a free call that happens to carry a header nobody looked at.
 //   - The paid ceiling keys on a VERIFIED payment. Presenting the header used
 //     to buy PAID_DAILY (5,000) outright; that was a pre-facilitator
 //     placeholder, and it let an unverified claim buy a 500x ceiling for free.
 //   - An X-PAYMENT that is not base64 JSON is now a 402, not a served call.
 //     There is nothing to verify in it, and that is the caller's bug.
-//   - Over-tier calls with a payment are served with `x-payment-error` when the
+//   - Calls with a payment are served with `x-payment-error` when the
 //     facilitator cannot be asked — availability-first, and honest about it.
+//
+// WHAT CHANGED AGAIN when the free tier was retired (2026-08-19): there is no
+// allowance to spend before any of this. The FIRST unauthenticated call is the
+// 402, so every test below that used to open with `await exhaust(ip)` simply
+// makes its call. The assertions are unchanged; only the setup went away.
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -37,7 +40,6 @@ import {
   PAYTO_TEST,
   PAID_DAILY,
   SITE_BASE,
-  FREE_TIER_DAILY,
   secondsToUtcMidnight,
 } from './harness.mjs';
 
@@ -51,12 +53,27 @@ const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 // description, its own mimeType. One shared envelope for every tool would be
 // the regression this catches.
 const TOOLS = {
-  'md-html': { input: '# hi\n', description: 'Markdown to HTML conversion', mimeType: 'text/html' },
-  'csv-json': { input: 'a\n1\n', description: 'CSV to JSON conversion', mimeType: 'application/json' },
-  'json-yaml': { input: '{"a":1}', description: 'JSON to YAML conversion', mimeType: 'application/yaml' },
-  'yaml-json': { input: 'a: 1\n', description: 'YAML to JSON conversion', mimeType: 'application/json' },
-  'html-markdown': { input: '<p>hi</p>', description: 'HTML to Markdown conversion', mimeType: 'text/markdown' },
+  'md-html': { input: '# hi\n', description: 'Markdown to HTML conversion', mimeType: 'text/html', from: 'Markdown', to: 'HTML' },
+  'csv-json': { input: 'a\n1\n', description: 'CSV to JSON conversion', mimeType: 'application/json', from: 'CSV', to: 'JSON' },
+  'json-yaml': { input: '{"a":1}', description: 'JSON to YAML conversion', mimeType: 'application/yaml', from: 'JSON', to: 'YAML' },
+  'yaml-json': { input: 'a: 1\n', description: 'YAML to JSON conversion', mimeType: 'application/json', from: 'YAML', to: 'JSON' },
+  'html-markdown': { input: '<p>hi</p>', description: 'HTML to Markdown conversion', mimeType: 'text/markdown', from: 'HTML', to: 'Markdown' },
 };
+
+/** The outputSchema the envelope must carry for one tool. See §Bazaar in README. */
+const outputSchemaFor = (tool) => ({
+  input: {
+    type: 'http',
+    method: 'POST',
+    discoverable: true,
+    bodyType: 'text',
+    description: `the raw ${tool.from} file as the request body, up to 256 KB`,
+  },
+  output: {
+    type: 'string',
+    description: `the converted ${tool.to} file as the response body (${tool.mimeType})`,
+  },
+});
 
 before(async () => {
   worker = await useWorker({ payTo: PAYTO_TEST });
@@ -96,47 +113,32 @@ function paymentHeader() {
   ).toString('base64');
 }
 
-/** Spend the whole free tier for one caller, asserting it was actually free. */
-async function exhaust(ip) {
-  for (let call = 1; call <= FREE_TIER_DAILY; call++) {
-    const res = await api.convert('md-html', '# hi\n', { ip, ua: 'x402-suite/1' });
-    assert.equal(res.status, 200, `call ${call} answered ${res.status} while spending the free tier`);
-  }
-}
-
-describe('a receiving address does not cancel the free tier', () => {
-  test('the first call is still free and still reports what is left', async () => {
-    const res = await api.convert('md-html', '# hi\n', { ip: ips.pinned(1) });
-    assert.equal(res.status, 200, res.text);
-    assert.equal(res.headers.get('x-free-tier-remaining'), String(FREE_TIER_DAILY - 1));
-    assert.equal(res.headers.get('x-payment-verified'), null, 'a verification claim on a call that saw no payment');
-    assert.equal(res.headers.get('x-pricing'), null, 'a free-tier call was labelled as pricing-pending');
-    assert.ok(res.text.includes('<h1>hi</h1>'), 'the conversion did not run');
+describe('the paid front door', () => {
+  test('the FIRST call from a caller that has never called is the 402', async () => {
+    // The whole 2026-08-19 change, in one assertion. This used to be a 200 with
+    // an allowance countdown, and that 200 is exactly what fails Coinbase's
+    // Bazaar `returns_402` preflight — which is re-probed on an interval, so a
+    // regression here would not merely block listing, it would delist.
+    const res = await api.convert('md-html', '# hi\n', { ip: ips.pinned(1), ua: 'x402-suite/1' });
+    assert.equal(res.status, 402, `a fresh caller was served instead of charged: ${res.status} ${res.text}`);
+    assert.equal(res.headers.get('x-free-tier-remaining'), null, 'a free-tier allowance was reported');
+    assert.ok(!res.text.includes('<h1>'), 'the 402 returned the conversion anyway');
   });
 
-  test('presenting X-PAYMENT inside the free tier is answered, and says it was not checked', async () => {
-    const res = await api.convert('md-html', '# hi\n', {
-      ip: ips.pinned(2),
-      headers: { 'x-payment': 'eyJ1bnZlcmlmaWVkIjp0cnVlfQ==' },
-    });
-    assert.equal(res.status, 200, res.text);
-    assert.equal(res.headers.get('x-payment-verified'), 'false', 'a presented payment was implied to be verified');
-    // CHANGED with the facilitator: this is a FREE-TIER call that happens to
-    // carry a header. It used to be pushed onto the paid ceiling by the mere
-    // presence of X-PAYMENT — no free-tier header, `x-pricing: pending` — which
-    // meant the free tier could be skipped for free. The free tier is now
-    // claimed first and unconditionally, so the call spends its allowance and
-    // reports what is left, and nothing is charged or checked.
-    assert.equal(res.headers.get('x-free-tier-remaining'), String(FREE_TIER_DAILY - 1));
-    assert.equal(res.headers.get('x-pricing'), null, 'a free-tier call was labelled as pricing-pending');
-    assert.equal(res.headers.get('x-payment-error'), null, 'the free tier tried to take a payment');
+  test('there is no allowance to find: repeated calls stay 402', async () => {
+    // A tier of 0 must be 0, not "one if you ask twice" — an off-by-one in the
+    // claim guard would show up here and nowhere else.
+    const ip = ips.pinned(2);
+    for (let call = 1; call <= 5; call++) {
+      const res = await api.convert('md-html', '# hi\n', { ip, ua: 'x402-suite/1' });
+      assert.equal(res.status, 402, `call ${call} was served free`);
+    }
   });
 });
 
 describe('the 402 envelope', () => {
-  test('an over-tier call with no payment is a spec-shaped x402 v1 envelope', async () => {
+  test('an unpaid call is a spec-shaped x402 v1 envelope', async () => {
     const ip = ips.pinned(3);
-    await exhaust(ip);
 
     const res = await api.convert('md-html', '# hi\n', { ip, ua: 'x402-suite/1' });
     assert.equal(res.status, 402, `expected 402, got ${res.status}: ${res.text}`);
@@ -165,14 +167,48 @@ describe('the 402 envelope', () => {
       // `invalid_exact_evm_payload_signature`. "USD Coin" is the token's name(),
       // which is not its ticker.
       extra: { name: 'USD Coin', version: '2' },
+      // ADDED 2026-08-19 for Bazaar discovery. `discoverable` sits INSIDE
+      // `outputSchema.input`, not at the top level — an envelope that hoists it
+      // is spec-shaped and still not indexed, which is a failure with no error
+      // message anywhere.
+      outputSchema: outputSchemaFor(TOOLS['md-html']),
     });
   });
 
+  test('every tool advertises itself as discoverable, honestly described', async () => {
+    for (const [id, tool] of Object.entries(TOOLS)) {
+      const res = await api.convert(id, tool.input, { ip: ips.next(), ua: 'x402-suite/1' });
+      assert.equal(res.status, 402, `${id} answered ${res.status}: ${res.text}`);
+      const schema = res.json().accepts[0].outputSchema;
+
+      assert.ok(schema, `${id} carries no outputSchema — it cannot be indexed`);
+      assert.equal(schema.input.discoverable, true, `${id} is not marked discoverable`);
+      assert.equal(schema.input.type, 'http');
+      assert.equal(schema.input.method, 'POST');
+      // These tools take a raw file body, not JSON fields. Saying so is the
+      // difference between a listing an agent can call and one it cannot.
+      assert.equal(schema.input.bodyType, 'text');
+      assert.match(schema.input.description, new RegExp(`raw ${tool.from} file`));
+      assert.match(schema.output.description, new RegExp(`converted ${tool.to} file`));
+      assert.ok(schema.output.description.includes(tool.mimeType), `${id} output omits its mimeType`);
+
+      // The facilitator rejects a description past 500 characters, and it does
+      // so at listing time rather than at call time — so a too-long string is
+      // invisible until discovery silently stops working.
+      for (const [where, text] of [
+        ['description', res.json().accepts[0].description],
+        ['outputSchema.input.description', schema.input.description],
+        ['outputSchema.output.description', schema.output.description],
+      ]) {
+        assert.ok(text.length <= 500, `${id} ${where} is ${text.length} chars, over the 500 limit`);
+      }
+    }
+  });
+
   test('the envelope names the tool that was actually asked for', async () => {
-    // Probing several tools from the SAME exhausted caller: the free tier is
-    // per caller, not per tool, so one exhaustion covers all of them.
+    // Probing several tools from the same caller. Nothing to set up any more:
+    // with no free tier, every one of these is a 402 on its first call.
     const ip = ips.pinned(4);
-    await exhaust(ip);
 
     for (const [id, tool] of Object.entries(TOOLS)) {
       const res = await api.convert(id, tool.input, { ip, ua: 'x402-suite/1' });
@@ -193,7 +229,6 @@ describe('the 402 envelope', () => {
 
   test('the 402 serves no conversion', async () => {
     const ip = ips.pinned(5);
-    await exhaust(ip);
     const res = await api.convert('md-html', '# hi\n', { ip });
     assert.equal(res.status, 402);
     assert.ok(!res.text.includes('<h1>'), 'a 402 returned the conversion anyway');
@@ -201,9 +236,8 @@ describe('the 402 envelope', () => {
 });
 
 describe('a payment that cannot be checked is never treated as checked', () => {
-  test('an over-tier call presenting X-PAYMENT is served, and says nothing was verified', async () => {
+  test('a call presenting X-PAYMENT is served, and says nothing was verified', async () => {
     const ip = ips.pinned(6);
-    await exhaust(ip);
 
     // Without the header: 402.
     assert.equal((await api.convert('md-html', '# hi\n', { ip })).status, 402);
@@ -221,7 +255,7 @@ describe('a payment that cannot be checked is never treated as checked', () => {
     // — distinct from a facilitator that exists and did not answer.
     assert.equal(res.headers.get('x-payment-error'), 'facilitator-unconfigured');
     assert.equal(res.headers.get('x-pricing'), 'pending');
-    assert.equal(res.headers.get('x-free-tier-remaining'), null, 'a paid-ceiling call reported free-tier remaining');
+    assert.equal(res.headers.get('x-free-tier-remaining'), null, 'a paid call reported a free-tier allowance');
   });
 
   test('an arbitrary X-PAYMENT value is never treated as valid', async () => {
@@ -234,7 +268,6 @@ describe('a payment that cannot be checked is never treated as checked', () => {
     // Coverage is kept, not deleted: the property under test is still "an
     // arbitrary value never buys a verified call". Only the answer moved.
     const ip = ips.pinned(7);
-    await exhaust(ip);
     for (const value of ['x', 'null', '{}', 'Bearer nope', '0'.repeat(500)]) {
       const res = await api.convert('md-html', '# hi\n', { ip, headers: { 'x-payment': value } });
       assert.equal(res.status, 402, `X-PAYMENT ${JSON.stringify(value.slice(0, 12))} answered ${res.status}`);
@@ -245,10 +278,9 @@ describe('a payment that cannot be checked is never treated as checked', () => {
 
   test('an empty X-PAYMENT header does NOT raise the ceiling', async () => {
     // `!!request.headers.get('x-payment')` — an empty value is falsy, so the
-    // caller stays on the free tier and gets the 402. Recorded because it is
-    // the boundary of "presented".
+    // caller counts as having presented nothing and gets the 402 on the
+    // no-store fast path. Recorded because it is the boundary of "presented".
     const ip = ips.pinned(8);
-    await exhaust(ip);
     const res = await api.convert('md-html', '# hi\n', { ip, headers: { 'x-payment': '' } });
     assert.equal(res.status, 402, `an empty X-PAYMENT bought a higher ceiling: ${res.status}`);
   });

@@ -13,16 +13,20 @@
 // bug, fixed in worker/beacon.js (csvToRecords now builds null-prototype
 // records); the test below is the regression guard.
 
+// The free tier is OFF by default now, so a conversion is a paid call and an
+// unauthenticated POST answers 402. This suite is about the CONVERTER, not about
+// payment, so it boots the env-gated free tier and gets served 200s the cheap way.
+
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { useWorker, client, callers } from './harness.mjs';
+import { useWorker, client, callers, TIER_ON_VARS } from './harness.mjs';
 
 let worker;
 let api;
 const ips = callers('csv-json');
 
 before(async () => {
-  worker = await useWorker();
+  worker = await useWorker({ vars: TIER_ON_VARS });
   api = client(worker);
 });
 after(async () => {

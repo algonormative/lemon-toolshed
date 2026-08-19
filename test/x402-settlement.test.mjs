@@ -35,7 +35,6 @@ import {
   PAYTO_TEST,
   PAID_DAILY,
   SITE_BASE,
-  FREE_TIER_DAILY,
 } from './harness.mjs';
 
 const ips = callers('settlement');
@@ -153,14 +152,6 @@ function paymentHeader({ from = CLAIMED_PAYER, value = '1000' } = {}) {
   ).toString('base64');
 }
 
-/** Spend the whole free tier for one caller, asserting it was actually free. */
-async function exhaust(ip) {
-  for (let call = 1; call <= FREE_TIER_DAILY; call++) {
-    const res = await api.convert('md-html', '# hi\n', { ip, ua: 'settlement-suite/1' });
-    assert.equal(res.status, 200, `call ${call} answered ${res.status} while spending the free tier`);
-  }
-}
-
 const settlements = () =>
   worker.d1('SELECT ts, tool, payer, amount, verify_ok, settle_ok, tx_hash, error FROM settlements ORDER BY ts, rowid;');
 
@@ -214,23 +205,23 @@ after(async () => {
 
 // ------------------------------------------------------------------ tests
 
-describe('the free tier is not a payment path', () => {
-  test('a within-tier call presenting X-PAYMENT never reaches the facilitator', async () => {
+describe('an unpaid call never reaches the facilitator', () => {
+  // This describe used to prove "the free tier is not a payment path". The tier
+  // is gone; the negative it was really protecting is not, and it is cheaper to
+  // state now: with no X-PAYMENT there is nothing to verify, so the facilitator
+  // must not be called AT ALL. Zero hits is the assertion — not a header.
+  test('no X-PAYMENT means no verify, no settle, and no ledger row', async () => {
     mock.reset();
     const ip = ips.pinned(1);
 
-    const res = await api.convert('md-html', '# hi\n', { ip, headers: { 'x-payment': paymentHeader() } });
+    const res = await api.convert('md-html', '# hi\n', { ip, ua: 'settlement-suite/1' });
 
-    assert.equal(res.status, 200, res.text);
-    assert.ok(res.text.includes('<h1>hi</h1>'), 'the conversion did not run');
-    // The whole point: a caller inside the free tier is never billed, so it is
-    // never verified either. Zero hits is the assertion — not a header.
-    assert.equal(mock.hits.length, 0, `the facilitator was called inside the free tier: ${JSON.stringify(mock.hits)}`);
-    assert.equal(res.headers.get('x-payment-verified'), 'false', 'an unchecked payment was implied to be verified');
-    assert.equal(res.headers.get('x-free-tier-remaining'), String(FREE_TIER_DAILY - 1));
+    assert.equal(res.status, 402, `expected the 402 front door, got ${res.status}: ${res.text}`);
+    assert.ok(!res.text.includes('<h1>'), 'a 402 returned the conversion anyway');
+    assert.equal(mock.hits.length, 0, `the facilitator was called with no payment: ${JSON.stringify(mock.hits)}`);
 
     const rows = await settlements();
-    assert.equal(rows.length, 0, `a free-tier call wrote a settlements row: ${JSON.stringify(rows)}`);
+    assert.equal(rows.length, 0, `an unpaid call wrote a settlements row: ${JSON.stringify(rows)}`);
   });
 });
 
@@ -238,8 +229,6 @@ describe('verify says yes', () => {
   test('the conversion is served, marked verified, and settles afterwards', async () => {
     mock.reset();
     const ip = ips.pinned(2);
-    await exhaust(ip);
-    assert.equal(mock.hits.length, 0, 'spending the free tier called the facilitator');
 
     const res = await api.convert('md-html', '# hi\n', {
       ip,
@@ -266,8 +255,6 @@ describe('verify says yes', () => {
   test('verify and settle are both called, with our envelope as paymentRequirements', async () => {
     mock.reset();
     const ip = ips.pinned(3);
-    await exhaust(ip);
-
     const res = await api.convert('csv-json', 'a\n1\n', {
       ip,
       ua: 'settlement-suite/1',
@@ -304,6 +291,22 @@ describe('verify says yes', () => {
         // USDC on Base names itself "USD Coin"; omitting this makes every real
         // payment fail signature verification.
         extra: { name: 'USD Coin', version: '2' },
+        // The Bazaar-facing half. It travels to the facilitator too, because
+        // the envelope is built once and used for both — which is the invariant
+        // this deepEqual exists to hold.
+        outputSchema: {
+          input: {
+            type: 'http',
+            method: 'POST',
+            discoverable: true,
+            bodyType: 'text',
+            description: 'the raw CSV file as the request body, up to 256 KB',
+          },
+          output: {
+            type: 'string',
+            description: 'the converted JSON file as the response body (application/json)',
+          },
+        },
       });
     }
   });
@@ -311,7 +314,6 @@ describe('verify says yes', () => {
   test('the request carries a CDP bearer JWT bound to the endpoint it calls', async () => {
     mock.reset();
     const ip = ips.pinned(4);
-    await exhaust(ip);
     const res = await api.convert('md-html', '# hi\n', {
       ip,
       ua: 'settlement-suite/1',
@@ -352,6 +354,112 @@ describe('verify says yes', () => {
   });
 });
 
+describe('the buyer is charged only for a conversion that was served', () => {
+  // THE PAYMENT-FAIRNESS REGRESSION. With a free tier, most malformed input was
+  // absorbed for nothing; with every call paid, a 400 that also billed would be
+  // the worst thing this service could do. The protection is ORDERING — settle
+  // is queued only after the conversion succeeds — and ordering is exactly what
+  // a later refactor breaks silently, because the response looks identical
+  // either way. So the assertion is on the FACILITATOR, not on the response:
+  // verify called, settle not.
+  // The ledger is append-only and shared by every test in this file, so these
+  // two measure the DELTA they caused rather than scanning the whole table.
+  // Written as a delta on purpose: a whole-table assertion here passed or failed
+  // on which tests ran first, which is the kind of green that means nothing.
+  const ledgerSize = async () => (await settlements()).length;
+
+  test('malformed input with a valid payment is a 400, verified but never settled', async () => {
+    mock.reset();
+    const ip = ips.pinned(14);
+    const before = await ledgerSize();
+
+    const res = await api.convert('csv-json', 'a,b\n"unterminated', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+
+    assert.equal(res.status, 400, `expected 400 for malformed input, got ${res.status}: ${res.text}`);
+    assert.match(res.json().error, /unterminated quoted field/, 'the 400 does not say what was wrong');
+
+    // The payment WAS checked — it had to be, to get this far.
+    assert.equal(mock.hitsOn('verify').length, 1, 'the payment was not verified before the attempt');
+    // …and it was never settled. A verified-but-unsettled EIP-3009
+    // authorization moves nothing: nobody submits it, so no transfer happens
+    // and the buyer keeps its money. THIS is the assertion that matters.
+    assert.equal(mock.hitsOn('settle').length, 0, 'THE BUYER WAS CHARGED FOR A 400');
+
+    // Settlement is asynchronous, so give a queued settle time to be WRONG
+    // before believing it was right. Reading once, immediately, would also pass
+    // against a Worker that settles in ctx.waitUntil after sending the 400.
+    await new Promise((r) => setTimeout(r, 1_500));
+    assert.equal(mock.hitsOn('settle').length, 0, 'a settle was queued after the 400 response');
+    assert.equal(await ledgerSize(), before, 'a 400 wrote a settlements row');
+  });
+
+  test('the same tool settles once the input is valid', async () => {
+    // The positive control for the test above. Without it, "settle was not
+    // called" would also pass against a Worker where settlement had stopped
+    // working altogether — a green test proving the opposite of what it claims.
+    mock.reset();
+    const ip = ips.pinned(15);
+    const before = await ledgerSize();
+
+    const res = await api.convert('csv-json', 'a\n1\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.headers.get('x-payment-verified'), 'true');
+    assert.equal(mock.hitsOn('settle').length, 1, 'a served conversion did not settle');
+
+    // Poll for the row this call added, by count: predicating on tool alone
+    // would match a row an earlier test wrote and prove nothing about this one.
+    const deadline = Date.now() + 15_000;
+    let size = await ledgerSize();
+    while (size === before && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      size = await ledgerSize();
+    }
+    assert.equal(size, before + 1, 'the served conversion wrote no settlements row');
+  });
+});
+
+describe('the settle body carries the resource a listing is attached by', () => {
+  test('resource is present even when the client payload omits it', async () => {
+    mock.reset();
+    const ip = ips.pinned(16);
+
+    // The premise, asserted rather than assumed: x402-fetch does not echo
+    // `resource` back in its payment payload, and neither does this fixture. If
+    // it did, the test below would pass without the Worker doing anything.
+    const sent = JSON.parse(Buffer.from(paymentHeader(), 'base64').toString('utf8'));
+    assert.equal(sent.resource, undefined, 'the fixture already carries a resource — it would prove nothing');
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    assert.equal(res.status, 200, res.text);
+    await awaitSettlement((r) => r.settle_ok === 1, 'the settled call');
+
+    const settle = mock.hitsOn('settle')[0];
+    assert.equal(
+      settle.body.paymentPayload.resource,
+      `${SITE_BASE}/convert/md-html`,
+      'the settle body names no resource — the Bazaar has nothing to attach the settlement to'
+    );
+
+    // VERIFY is deliberately left alone: it is the signature check, and the
+    // payload it sees stays byte-for-byte what the client sent.
+    const verify = mock.hitsOn('verify')[0];
+    assert.equal(verify.body.paymentPayload.resource, undefined, 'the verify payload was rewritten');
+  });
+});
+
 describe('verify says no', () => {
   test('a rejected payment is 402 with the envelope and the facilitator reason', async () => {
     mock.reset();
@@ -366,8 +474,6 @@ describe('verify says no', () => {
     };
 
     const ip = ips.pinned(5);
-    await exhaust(ip);
-
     const res = await api.convert('md-html', '# hi\n', {
       ip,
       ua: 'settlement-suite/1',
@@ -402,17 +508,16 @@ describe('verify says no', () => {
   });
 
   test('an unverified X-PAYMENT does not unlock the paid ceiling', async () => {
-    // This is the behaviour change. Presenting a payment header used to buy
-    // PAID_DAILY (5,000) outright; now the higher ceiling is claimed only after
-    // verify returns isValid, so a rejected payment leaves the counter exactly
-    // where the free tier left it.
+    // Presenting a payment header used to buy PAID_DAILY (5,000) outright; the
+    // ceiling is now claimed only after verify returns isValid, so a rejected
+    // payment leaves the counter untouched — at zero, with no free tier to have
+    // moved it first.
     mock.reset();
     mock.state.verify = { status: 200, body: { isValid: false, invalidReason: 'invalid_exact_evm_payload_signature' } };
 
     const ip = ips.pinned(6);
-    await exhaust(ip);
     const before = await usedBy(ip);
-    assert.equal(before, FREE_TIER_DAILY, `the free tier did not land on ${FREE_TIER_DAILY}`);
+    assert.equal(before, 0, 'a caller that has never been served already holds quota');
 
     for (let i = 0; i < 3; i++) {
       const res = await api.convert('md-html', '# hi\n', {
@@ -423,18 +528,12 @@ describe('verify says no', () => {
       assert.equal(res.status, 402, `rejected payment ${i + 1} answered ${res.status}`);
     }
 
-    assert.equal(
-      await usedBy(ip),
-      FREE_TIER_DAILY,
-      'a rejected payment claimed quota against the paid ceiling'
-    );
+    assert.equal(await usedBy(ip), 0, 'a rejected payment claimed quota against the paid ceiling');
   });
 
   test('an X-PAYMENT that is not base64 JSON is rejected without calling the facilitator', async () => {
     mock.reset();
     const ip = ips.pinned(7);
-    await exhaust(ip);
-
     for (const value of ['x', 'not-base64-!!', Buffer.from('[1,2,3]').toString('base64')]) {
       const res = await api.convert('md-html', '# hi\n', {
         ip,
@@ -455,8 +554,6 @@ describe('the facilitator is unavailable', () => {
     mock.state.verify = { status: 500, body: { error: 'internal' } };
 
     const ip = ips.pinned(8);
-    await exhaust(ip);
-
     const res = await api.convert('md-html', '# hi\n', {
       ip,
       ua: 'settlement-suite/1',
@@ -485,8 +582,6 @@ describe('the facilitator is unavailable', () => {
     mock.state.delayMs.verify = 6_000; // well past VERIFY_TIMEOUT_MS
 
     const ip = ips.pinned(9);
-    await exhaust(ip);
-
     const started = Date.now();
     const res = await api.convert('md-html', '# hi\n', {
       ip,
@@ -516,8 +611,6 @@ describe('settlement fails after a good verify', () => {
     };
 
     const ip = ips.pinned(10);
-    await exhaust(ip);
-
     const res = await api.convert('json-yaml', '{"a":1}', {
       ip,
       ua: 'settlement-suite/1',
@@ -542,8 +635,6 @@ describe('settlement fails after a good verify', () => {
     mock.state.settle = { status: 503, body: { error: 'unavailable' } };
 
     const ip = ips.pinned(11);
-    await exhaust(ip);
-
     const res = await api.convert('yaml-json', 'a: 1\n', {
       ip,
       ua: 'settlement-suite/1',
@@ -600,15 +691,11 @@ describe('a real x402 client can pay the envelope we publish', () => {
     });
 
     try {
-      const scratchApi = client(scratch);
       const url = `${scratch.baseUrl}/convert/md-html`;
       const ip = ips.pinned(13);
 
-      for (let i = 0; i < FREE_TIER_DAILY; i++) {
-        const r = await scratchApi.convert('md-html', '# x402\n', { ip });
-        assert.equal(r.status, 200, `burn ${i + 1} answered ${r.status}`);
-      }
-
+      // Nothing to burn through: the first call this client makes is the 402
+      // it has to parse, which is the point of the exercise.
       const account = deps.accounts.privateKeyToAccount(deps.accounts.generatePrivateKey());
       const wallet = deps.viem.createWalletClient({
         account,

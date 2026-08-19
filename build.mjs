@@ -47,28 +47,55 @@ const API_HOST = process.env.API_HOST || HOST;
 const API_SCHEME = /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(API_HOST) ? 'http' : 'https';
 const API_BASE = `${API_SCHEME}://${API_HOST}`;
 
-// The free tier, in one place. This constant is the single source of truth for
-// the number: it is printed on the page, published in catalog.json, llms.txt and
-// llms-full.txt, AND compiled into worker/catalog.generated.js, which is where
-// the Worker reads it to enforce the limit. Change it here and everything the
-// site claims and everything it enforces move together.
+// The free tier, in one place — and as of 2026-08-19 it is OFF.
 //
-// OWNER-TUNABLE. It is deliberately severe: a free tier exists to let an agent
-// try the thing, not to be a free service, and the caller key it is counted
-// against (a daily-salted hash of the IP alone) is the cheapest spoof-resistance
-// available — a fresh identity costs a fresh IP, not a fresh user-agent string.
-const FREE_TIER_DAILY = 3;
+// This constant is what the STATIC surfaces advertise: the page, catalog.json,
+// llms.txt and llms-full.txt. It is no longer what the Worker enforces. The
+// Worker reads `env.FREE_TIER_DAILY` at runtime and treats that as the only
+// authority, so a dashboard flip takes effect without a rebuild, and GET /check
+// reports the runtime number rather than this one.
+//
+// WHY IT IS ZERO. Coinbase's Bazaar discovery index requires that an
+// unauthenticated request answer 402. A free tier serves any fresh IP a 200,
+// which fails the index's `returns_402` preflight — and it health-probes on an
+// interval, so a free tier does not merely block listing, it gets an existing
+// listing dropped. Discoverability beat the trial allowance.
+//
+// TO RE-ENABLE (all three, or the site lies about itself):
+//   1. set this constant to N and `npm run build` — the static copy below is
+//      written to render either state honestly;
+//   2. set the Worker var FREE_TIER_DAILY = "N" (wrangler.toml [vars] or the
+//      dashboard) — this is what actually enforces it;
+//   3. redeploy the Worker AND the Pages site.
+// And know the cost: with a free tier on, fresh-IP probers get a 200 and the
+// service falls out of Bazaar discovery.
+//
+// OWNER-TUNABLE. When it is on it is deliberately severe: a free tier exists to
+// let an agent try the thing, not to be a free service, and the caller key it is
+// counted against (a daily-salted hash of the IP alone) is the cheapest
+// spoof-resistance available — a fresh identity costs a fresh IP, not a fresh
+// user-agent string.
+const FREE_TIER_DAILY = 0;
+
+// Every piece of copy below branches on this. Both branches are live code, not
+// one branch and one comment: the generator has to be able to render either
+// state truthfully, because the re-enable path above depends on it.
+const FREE_TIER_ON = FREE_TIER_DAILY > 0;
 
 const SITE_NAME = 'Toolshed';
 const HOUSE = 'Lemon';
 const KICKER = 'the Lemon';
-const STRAPLINE =
-  'A collection of tools for agents — no install required. Privacy-first: no login, no credit card, ' +
-  'no account. Every tool is free to try.';
+const STRAPLINE = FREE_TIER_ON
+  ? 'A collection of tools for agents — no install required. Privacy-first: no login, no credit card, ' +
+    'no account. Every tool is free to try.'
+  : 'Tools for agents — no install, no login, no account, no card. Pay per call in USDC: $0.001 a ' +
+    'call over x402, where the payment is the auth.';
 const TITLE = `${SITE_NAME} — tools for agents · ${HOUSE}`;
-const META_DESCRIPTION =
-  `Conversion tools an agent can call over HTTP with nothing installed. No login, no credit card. ` +
-  `Every tool is free to try — ${FREE_TIER_DAILY} conversions a day — then priced per call in USDC with x402.`;
+const META_DESCRIPTION = FREE_TIER_ON
+  ? `Conversion tools an agent can call over HTTP with nothing installed. No login, no credit card. ` +
+    `Every tool is free to try — ${FREE_TIER_DAILY} conversions a day — then priced per call in USDC with x402.`
+  : `Conversion tools an agent can call over HTTP with nothing installed. No login, no account, no ` +
+    `card — every call is priced per call in USDC with x402 ($0.001), and the payment is the auth.`;
 
 // Refresh cadence is monthly (~4 h/month, dossier § Estimates). Entries whose
 // `verified` date predates it are flagged in the build (dossier § Components 7).
@@ -178,6 +205,98 @@ const LABEL_RULES = [
 // File extension used in each hosted card's example curl, keyed by the x label.
 const SAMPLE_EXT = { markdown: 'md', html: 'html', json: 'json', yaml: 'yaml', csv: 'csv' };
 
+// The Content-Type each hosted conversion answers with, keyed by the y label.
+//
+// This MUST agree with CONVERTERS[id].mimeType in worker/beacon.js: the Worker
+// publishes that value inside the 402 envelope, and openapi.json publishes this
+// one, so a disagreement is a lie a machine acts on. The suite asserts the two
+// agree per tool rather than trusting this comment.
+const RESPONSE_MIME = {
+  html: 'text/html',
+  markdown: 'text/markdown',
+  json: 'application/json',
+  yaml: 'application/yaml',
+  csv: 'text/csv',
+};
+const responseMime = (e) => RESPONSE_MIME[e._ylabel] || 'text/plain';
+
+// ---------------------------------------------------------------- aliases
+//
+// What an agent actually types. GET /check matched on a case-insensitive
+// SUBSTRING of the prose `x`/`y` fields and nothing else, which meant
+// `?from=markdown` worked and `?from=md`, `?from=.md` and `?from=text/markdown`
+// all returned [] — the three forms a machine is most likely to have on hand,
+// because they are what a filename and a Content-Type header carry. Verified
+// live 2026-08-19 against toolshed.lemon-agent.dev: only the long prose word
+// matched.
+//
+// So every entry gets an alias SET, compiled here, and /check answers on
+// substring OR an exact alias hit. Keyed on the short label rather than on the
+// prose field: the label is already the canonical short name for the format, so
+// the table stays small and a new entry inherits its aliases for free.
+//
+// The label itself is always included, so the table only has to carry what the
+// label does NOT already say. Normalisation (lowercase, leading dots stripped)
+// happens in aliasesFor() and again in the Worker, so `.md`, `MD` and `md` are
+// one key. MIME types keep their slash.
+//
+// MACHINE SURFACE ONLY: aliases go into catalog.json and the Worker's compiled
+// catalog, never onto the page. A human reading a card does not need to be told
+// that Markdown files end in .md.
+const FORMAT_ALIASES = {
+  markdown: ['md', 'mdown', 'text/markdown', 'text/x-markdown'],
+  html: ['htm', 'text/html', 'application/xhtml+xml'],
+  // NOT html/text/html: the input here is a LIVE page in a browser, not an HTML
+  // file you can post. Aliasing it to `html` made `?from=html` offer an entry
+  // that cannot take an HTML file, which is the exact mis-routing /check exists
+  // to prevent.
+  'rendered dom': ['dom', 'url', 'webpage'],
+  json: ['application/json', 'text/json'],
+  'json / ndjson': ['json', 'ndjson', 'jsonl', 'application/json', 'application/x-ndjson'],
+  'metadata json': ['json', 'application/json'],
+  yaml: ['yml', 'application/yaml', 'text/yaml', 'application/x-yaml'],
+  csv: ['text/csv', 'application/csv'],
+  'clean csv': ['csv', 'text/csv'],
+  'messy csv': ['csv', 'text/csv'],
+  pdf: ['application/pdf'],
+  'scanned pdf': ['pdf', 'application/pdf'],
+  'digital-born pdf': ['pdf', 'application/pdf'],
+  'searchable pdf': ['pdf', 'application/pdf'],
+  'pdf tables': ['pdf', 'application/pdf'],
+  'page images': ['png', 'jpeg', 'jpg', 'image/png'],
+  docx: ['doc', 'word', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  'office docs': ['docx', 'xlsx', 'pptx', 'office'],
+  xlsx: ['xls', 'excel', 'spreadsheet', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  epub: ['application/epub+zip', 'ebook'],
+  'legacy ebook': ['mobi', 'azw3', 'ebook'],
+  svg: ['image/svg+xml'],
+  jpeg: ['jpg', 'image/jpeg'],
+  png: ['image/png'],
+  images: ['png', 'jpeg', 'jpg', 'image/png', 'image/jpeg'],
+  'web images': ['webp', 'jpeg', 'jpg', 'image/webp'],
+  'heic photos': ['heic', 'heif', 'image/heic'],
+  mp4: ['video/mp4', 'h264', 'mov'],
+  video: ['mp4', 'mov', 'mkv', 'video/mp4'],
+  audio: ['wav', 'flac', 'aiff', 'audio/wav', 'audio/x-wav'],
+  'audio file': ['wav', 'mp3', 'flac', 'audio/mpeg'],
+  'mp3 / opus': ['mp3', 'opus', 'audio/mpeg', 'audio/opus'],
+  'recorded speech': ['wav', 'mp3', 'audio/wav', 'audio/mpeg'],
+  transcript: ['srt', 'vtt', 'text/vtt'],
+  'plain text': ['txt', 'text', 'text/plain'],
+  'utf-8': ['txt', 'text/plain'],
+  sqlite: ['db', 'sqlite3', 'application/vnd.sqlite3'],
+  'image of text': ['png', 'jpeg', 'jpg', 'image/png', 'image/jpeg'],
+  'media file': ['mp4', 'jpeg', 'pdf', 'heic'],
+};
+
+// Lowercase, trimmed, leading dots stripped — so `.md`, `MD` and `md` collapse
+// to one key. The Worker normalises the incoming query the same way; the two
+// implementations have to agree, which is why the rule is this short.
+const normaliseAlias = (s) => String(s).trim().toLowerCase().replace(/^\.+/, '');
+
+const aliasesFor = (label) =>
+  Array.from(new Set([label, ...(FORMAT_ALIASES[label] || [])].map(normaliseAlias))).filter(Boolean);
+
 // ---------------------------------------------------------------- helpers
 
 const esc = (s) =>
@@ -242,12 +361,12 @@ const priceLabel = (price) =>
 
 const isFree = (hosted) => hosted && hosted.price === 'free';
 
-// What a hosted tool costs, in one phrase: the free tier first, because that is
-// what a caller meets first.
-const tierLabel = (hosted) =>
-  isFree(hosted)
-    ? `free, ${FREE_TIER_DAILY}/day cap`
-    : `${FREE_TIER_DAILY}/day free, then ${priceLabel(hosted.price)}`;
+// What a hosted tool costs, in one phrase. With the free tier off there is only
+// one fact to state, so the phrase is just the price.
+const tierLabel = (hosted) => {
+  if (isFree(hosted)) return FREE_TIER_ON ? `free, ${FREE_TIER_DAILY}/day cap` : 'free';
+  return FREE_TIER_ON ? `${FREE_TIER_DAILY}/day free, then ${priceLabel(hosted.price)}` : priceLabel(hosted.price);
+};
 
 // ---------------------------------------------------------------- load
 
@@ -310,6 +429,8 @@ for (const e of entries) {
 
   e._xlabel = labelOf(e.x, e.id, 'x');
   e._ylabel = labelOf(e.y, e.id, 'y');
+  e._xaliases = aliasesFor(e._xlabel);
+  e._yaliases = aliasesFor(e._ylabel);
 }
 
 if (problems.length) {
@@ -353,13 +474,17 @@ const priceAmounts = Array.from(
 );
 const PRICE_PHRASE =
   priceAmounts.length === 1 ? `$${priceAmounts[0]} in USDC via x402` : 'a per-call price in USDC via x402';
-const PRICING_LINE =
-  `Every tool is free to try: ${FREE_TIER_DAILY} conversions a day, no login. ` +
-  `Past that it's a paid call — ${PRICE_PHRASE}, with much higher limits.`;
+const PRICING_LINE = FREE_TIER_ON
+  ? `Every tool is free to try: ${FREE_TIER_DAILY} conversions a day, no login. ` +
+    `Past that it's a paid call — ${PRICE_PHRASE}, with much higher limits.`
+  : `Every call is a paid call — ${PRICE_PHRASE}. No account, no key, no card: the 402 is the ` +
+    `front door, and the payment is the auth.`;
 
-const SUMMARY =
-  `${hostedEntries.length} hosted · ${localOnly.length} local references. ` +
-  `${FREE_TIER_DAILY} free conversions a day on every hosted tool.`;
+const SUMMARY = FREE_TIER_ON
+  ? `${hostedEntries.length} hosted · ${localOnly.length} local references. ` +
+    `${FREE_TIER_DAILY} free conversions a day on every hosted tool.`
+  : `${hostedEntries.length} hosted · ${localOnly.length} local references. ` +
+    `Every hosted call is priced per call — ${PRICE_PHRASE}.`;
 
 const BUILD_DATE = new Date().toISOString().slice(0, 10);
 
@@ -883,10 +1008,13 @@ const X402_SNIPPET = [
   'console.log(await res.text());',
 ].join('\n');
 
-// Two pills, because there are two facts and the first one is the offer: what it
-// costs to try (nothing, FREE_TIER_DAILY a day) and what a call costs past that.
+// One pill per fact. With the free tier on there are two — what it costs to try
+// (nothing, FREE_TIER_DAILY a day) and what a call costs past that. With it off
+// there is one fact, so the x402 price pill stands alone.
 function pricePills(h) {
   if (h.status === 'planned') return '<span class="pill pill-planned">planned</span>';
+  const paid = `<span class="pill pill-paid">$${esc(h.price.amount_usd)} x402</span>`;
+  if (!FREE_TIER_ON) return isFree(h) ? '<span class="pill pill-free">free</span>' : paid;
   const free = `<span class="pill pill-free">${FREE_TIER_DAILY}/day free</span>`;
   if (isFree(h)) return free;
   return `${free}
@@ -981,6 +1109,7 @@ const NAV = [
   ['#how-we-count', 'How we count'],
   ['#privacy', 'Privacy'],
   ['catalog.json', 'catalog.json'],
+  ['openapi.json', 'openapi.json'],
   ['llms.txt', 'llms.txt'],
   ['llms-full.txt', 'llms-full.txt'],
 ];
@@ -1070,17 +1199,25 @@ ${sections.map(renderShelf).join('\n')}
     <h4>1. Check what is available, then convert</h4>
     <div class="agent-row">
       ${cmdRow(`curl "${API_BASE}/check?from=markdown&to=html"`, 'Copy the availability check command')}
-      <p class="note">Returns the matching pairs with their endpoint, price, free-tier allowance and status. <code>from</code> is matched against what you have, <code>to</code> against what you need. No parameters returns every hosted tool.</p>
+      <p class="note">Returns the matching pairs with their endpoint, price and status. <code>from</code> is matched against what you have, <code>to</code> against what you need — as a substring of the name, or as an extension or MIME type: <code>md</code>, <code>.md</code> and <code>text/markdown</code> all find the same tool. No parameters returns every hosted tool.</p>
     </div>
     <div class="agent-row">
       ${cmdRow(`curl -X POST "${API_BASE}/convert/md-html" --data-binary @README.md`, 'Copy the convert command')}
-      <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB. The first ${FREE_TIER_DAILY} calls a day are free and say how many are left in <code>x-free-tier-remaining</code>; past that the answer is a <code>402</code> carrying an x402 envelope to pay against.</p>
+      <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB. ${
+        FREE_TIER_ON
+          ? `The first ${FREE_TIER_DAILY} calls a day are free and say how many are left in <code>x-free-tier-remaining</code>; past that the answer is a <code>402</code> carrying an x402 envelope to pay against.`
+          : 'An unpaid call answers <code>402</code> carrying an x402 envelope to pay against — or a <code>429</code> on a deployment with no receiving address configured.'
+      }</p>
     </div>
 
     <h4>2. The whole catalog as files</h4>
     <div class="agent-row">
       ${cmdRow(`curl ${BASE}/catalog.json`, 'Copy catalog.json fetch command')}
       <p class="note">Structured entries — every field, including the hosted endpoint.</p>
+    </div>
+    <div class="agent-row">
+      ${cmdRow(`curl ${BASE}/openapi.json`, 'Copy openapi.json fetch command')}
+      <p class="note">OpenAPI 3.1 — every route, every response, including the <code>402</code>.</p>
     </div>
     <div class="agent-row">
       ${cmdRow(`curl ${BASE}/llms.txt`, 'Copy llms.txt fetch command')}
@@ -1111,8 +1248,13 @@ ${sections.map(renderShelf).join('\n')}
   <section class="prose" id="pay-with-usdc">
     <h2>Pricing, and paying with USDC</h2>
     <p>${esc(PRICING_LINE)}</p>
-    <p>The free tier needs no account, no key and no wallet — just call the endpoint. Every free-tier answer carries an <code>x-free-tier-remaining</code> header saying how many of the day's ${FREE_TIER_DAILY} are left, and the count resets at midnight UTC. It is counted per caller, where a caller is an IP address: rotating your user-agent does not get you a second ${FREE_TIER_DAILY}.</p>
-    <p>Past the free tier, a call answers <strong>HTTP 402</strong>, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation.</p>
+${
+  FREE_TIER_ON
+    ? `    <p>The free tier needs no account, no key and no wallet — just call the endpoint. Every free-tier answer carries an <code>x-free-tier-remaining</code> header saying how many of the day's ${FREE_TIER_DAILY} are left, and the count resets at midnight UTC. It is counted per caller, where a caller is an IP address: rotating your user-agent does not get you a second ${FREE_TIER_DAILY}.</p>
+    <p>Past the free tier, a call answers <strong>HTTP 402</strong>, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation.</p>`
+    : `    <p>There is no trial and no sign-up, because there is nothing to sign up to. A call with no payment answers <strong>HTTP 402</strong> straight away, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation, and it is the front door rather than a rejection.</p>
+    <p>You are charged only for conversions that are actually served. A payment is verified before the conversion runs and settled after it is delivered, so input we cannot convert — a <code>400</code> — costs you nothing, and a body over the 256 KB cap is refused with a <code>413</code> before an envelope is even built.</p>`
+}
 
     <p>Your agent needs two things to answer it:</p>
     <ol>
@@ -1134,11 +1276,20 @@ ${sections.map(renderShelf).join('\n')}
       settle_ok = 1). The standing rule is the same in reverse: if settlement
       ever breaks, this box goes back to naming what is broken.
 
+      2026-08-19: free tier retired in favour of 402-first discoverability.
+      Coinbase's Bazaar index requires an unauthenticated request to answer 402
+      and health-probes on an interval, so a free tier that serves fresh IPs a
+      200 keeps the service out of the index — and drops it once listed. The
+      mechanism is intact behind the FREE_TIER_DAILY env var; only the default
+      changed.
+
       NOTE FOR EDITORS: this comment lives inside a JS template literal, so it
       must contain no backticks and no dollar-brace sequences.
     -->
     <div class="status-box">
-      <p><span class="status-label">Honest status</span>The free tier is
+${
+  FREE_TIER_ON
+    ? `      <p><span class="status-label">Honest status</span>The free tier is
       <strong>live and enforced</strong>, and payment is <strong>live and
       verified</strong>: a call past the free tier answers the <code>402</code>
       envelope above, and a payment presented against it is checked with the
@@ -1147,7 +1298,18 @@ ${sections.map(renderShelf).join('\n')}
       immediately afterwards. If the facilitator cannot be reached, the call is
       served anyway and says so with <code>x-payment-error</code>: at $0.001 the
       price is a signal, and an outage on our side should not turn a paying
-      caller away.</p>
+      caller away.</p>`
+    : `      <p><span class="status-label">Honest status</span>The free tier is
+      <strong>switched off</strong>: every conversion is a paid call, at $0.001.
+      Payment is <strong>live and verified</strong> — a payment presented
+      against the <code>402</code> envelope above is checked with the Coinbase
+      CDP facilitator before the conversion is served, a verified call comes
+      back with <code>x-payment-verified: true</code>, and it settles on Base
+      immediately afterwards. If the facilitator cannot be reached, the call is
+      served anyway and says so with <code>x-payment-error</code>: at $0.001 the
+      price is a signal, and an outage on our side should not turn a paying
+      caller away.</p>`
+}
     </div>
   </section>
 
@@ -1155,15 +1317,28 @@ ${sections.map(renderShelf).join('\n')}
     <h2>How we count</h2>
     <p>This page runs a small script that reports two things: that the page loaded, and which outbound link was clicked. Nothing else is collected — filtering and copying send nothing — and links are plain links, so they work with the script blocked.</p>
     <p>Conversion calls are counted too: one row per call, recording that a call happened and which tool it used. The file you send is not stored and not logged.</p>
-    <p>The free-tier counter is separate, and it is the one place a caller is identified across calls: it is keyed on a daily-salted hash of the IP address alone — no user-agent, so rotating one does not mint a fresh allowance — which makes it unlinkable across days once the salt is replaced, and it is kept on the same retention as every other counter here.</p>
+${
+  FREE_TIER_ON
+    ? `    <p>The free-tier counter is separate, and it is the one place a caller is identified across calls: it is keyed on a daily-salted hash of the IP address alone — no user-agent, so rotating one does not mint a fresh allowance — which makes it unlinkable across days once the salt is replaced, and it is kept on the same retention as every other counter here.</p>`
+    : `    <p>One more counter is separate, and it is the one place a caller is identified across calls: a daily ceiling on served calls, there so a runaway client cannot bill us into a hole. It is keyed on a daily-salted hash of the IP address alone — no user-agent, so rotating one does not mint a fresh allowance — which makes it unlinkable across days once the salt is replaced, and it is kept on the same retention as every other counter here. An unpaid call never reaches it: the <code>402</code> is answered before anything is read or written.</p>
+    <p>Paid calls also write a settlements row — which tool, the paying wallet address, the amount, whether it verified and settled, and the transaction hash. A payer address is public on-chain data, but we hold a copy, so it is named here rather than left to be discovered.</p>`
+}
     <p>Here is the counting policy in full: ${esc(BOT_POLICY)}. Click delivery is best-effort, so the click number is a floor rather than a total.</p>
   </section>
 
   <section class="prose" id="privacy">
     <h2>Privacy</h2>
-    <p>There are two stores here, and they answer a "what do you hold on me" request differently.</p>
-    <p><strong>The counting store</strong> holds a short hash, not an address. The hash is salted with random bytes that are replaced at the first request of each UTC day, and replacing them is the deletion: once the old salt is gone, nothing in the store points back to anyone. Rows are kept 90 days at most, then reduced to daily totals and deleted. Files you send to a conversion endpoint are never written to it. The free-tier counter lives in the same store under the same rules — a daily-salted hash of the IP alone, one row per caller per day, pruned on the same 90-day chore.</p>
-    <p><strong>An IP blocklist</strong> exists to stop abuse. It is keyed on the address, so it does identify a requester, and we delete an address on request; rows expire 90 days after they were last seen.</p>
+    <p>There are ${FREE_TIER_ON ? 'two' : 'three'} stores here, and they answer a "what do you hold on me" request differently.</p>
+    <p><strong>The counting store</strong> holds a short hash, not an address. The hash is salted with random bytes that are replaced at the first request of each UTC day, and replacing them is the deletion: once the old salt is gone, nothing in the store points back to anyone. Rows are kept 90 days at most, then reduced to daily totals and deleted. Files you send to a conversion endpoint are never written to it. ${
+      FREE_TIER_ON
+        ? 'The free-tier counter lives in the same store under the same rules — a daily-salted hash of the IP alone, one row per caller per day, pruned on the same 90-day chore.'
+        : 'The daily ceiling on served calls lives in the same store under the same rules — a daily-salted hash of the IP alone, one row per caller per day, pruned on the same 90-day chore.'
+    }</p>
+${
+  FREE_TIER_ON
+    ? ''
+    : `    <p><strong>The settlements ledger</strong> is the one store that holds something durable about a person: one row per payment attempt, recording the tool, the paying wallet address, the amount, whether verification and settlement succeeded, and the transaction hash. Those addresses are public on-chain data — a payment is a public act — but we hold them, and they are not salted away nightly, because a payment ledger you cannot reconcile is not a ledger.</p>\n`
+}    <p><strong>An IP blocklist</strong> exists to stop abuse. It is keyed on the address, so it does identify a requester, and we delete an address on request; rows expire 90 days after they were last seen.</p>
   </section>
 
   <footer>
@@ -1189,6 +1364,10 @@ const catalogEntry = (e) => ({
   y: oneLine(e.y),
   xlabel: e._xlabel,
   ylabel: e._ylabel,
+  // What GET /check will also match this entry on, beyond a substring of x/y.
+  // Published so an agent can see the accepted spellings rather than guess them.
+  x_aliases: e._xaliases,
+  y_aliases: e._yaliases,
   tool: e.tool,
   kind: e.kind,
   verdict: oneLine(e.verdict),
@@ -1208,13 +1387,23 @@ const catalog = {
     base: API_BASE,
     check: `${API_BASE}/check?from=<what you have>&to=<what you need>`,
     convert: `${API_BASE}/convert/<id>`,
+    openapi: `${BASE}/openapi.json`,
+    // The number the STATIC surfaces advertise. GET /check reports what the
+    // Worker actually enforces at runtime, which is authoritative if they ever
+    // disagree — see the FREE_TIER_DAILY note in build.mjs.
     free_tier_daily: FREE_TIER_DAILY,
-    note:
-      `Entries with a hosted block run on our server. Every one is free to try — ${FREE_TIER_DAILY} conversions ` +
-      'per caller (per IP) per UTC day, reported in an x-free-tier-remaining header — and priced per call past ' +
-      'that: HTTP 402 with an x402 envelope naming a live USDC address on Base. A payment presented against that ' +
-      'envelope is verified with the Coinbase CDP facilitator before the conversion is served, and settles on Base ' +
-      'immediately afterwards. Entries without a hosted block are local-only references.',
+    note: FREE_TIER_ON
+      ? `Entries with a hosted block run on our server. Every one is free to try — ${FREE_TIER_DAILY} conversions ` +
+        'per caller (per IP) per UTC day, reported in an x-free-tier-remaining header — and priced per call past ' +
+        'that: HTTP 402 with an x402 envelope naming a live USDC address on Base. A payment presented against that ' +
+        'envelope is verified with the Coinbase CDP facilitator before the conversion is served, and settles on Base ' +
+        'immediately afterwards. Entries without a hosted block are local-only references.'
+      : 'Entries with a hosted block run on our server, and every one is a paid call — there is no free tier. An ' +
+        'unauthenticated POST answers HTTP 402 immediately, carrying an x402 envelope that names a live USDC ' +
+        'address on Base and the per-call price. A payment presented against that envelope is verified with the ' +
+        'Coinbase CDP facilitator before the conversion is served, and settles on Base immediately afterwards. You ' +
+        'are charged only for conversions that are actually served: a 400 on input we cannot convert settles ' +
+        'nothing. Entries without a hosted block are local-only references.',
   },
   entries: entries.map(catalogEntry),
 };
@@ -1224,25 +1413,58 @@ const catalog = {
 const hostedLine = (e) =>
   e._hosted ? `hosted ${e._hosted.status}, ${tierLabel(e._hosted)}, at POST ${e._hosted.path}` : 'local only';
 
+const TIER_LINES = FREE_TIER_ON
+  ? [
+      `Tiers: every hosted tool is free to try — ${FREE_TIER_DAILY} conversions per caller per UTC day, no login —`,
+      `  and priced per call past that. A caller is an IP address (rotating the user-agent does not reset it);`,
+      `  every free-tier response carries x-free-tier-remaining: <n>, and the count resets at midnight UTC.`,
+    ]
+  : [
+      `Tiers: there is no free tier. Every hosted call is a paid call, priced per call, and an`,
+      `  unauthenticated POST answers HTTP 402 immediately with the envelope to pay against — the 402`,
+      `  is the front door, not a rejection. You are charged only for conversions actually served.`,
+    ];
+
+const PAYMENT_LINES = FREE_TIER_ON
+  ? [
+      `Payment: past the free tier a call answers HTTP 402 with an x402 envelope — exact scheme, USDC`,
+      `  on Base — naming the price and the payTo address. No accounts, no keys, per-call pricing. Pay`,
+      `  with an x402-capable client (x402-fetch, the x402 SDK, Coinbase AgentKit) holding a wallet key`,
+      `  with USDC on Base; it signs and retries with an X-PAYMENT header. The payment is verified with`,
+      `  the Coinbase CDP facilitator before the conversion is served: a verified call comes back with`,
+      `  x-payment-verified: true and settles on Base immediately afterwards; a payment the facilitator`,
+      `  rejects gets the 402 again with an invalidReason and no conversion; and if the facilitator`,
+      `  cannot be reached the call is served anyway, saying so with x-payment-verified: false and`,
+      `  x-payment-error. Inside the free tier nothing is checked or charged. On a deployment with no`,
+      `  receiving address configured, over-tier calls answer HTTP 429 with a Retry-After, not a 402.`,
+    ]
+  : [
+      `Payment: an unpaid call answers HTTP 402 with an x402 envelope — exact scheme, USDC on Base —`,
+      `  naming the price, the payTo address and an outputSchema describing the request body and the`,
+      `  response. No accounts, no keys, per-call pricing. Pay with an x402-capable client (x402-fetch,`,
+      `  the x402 SDK, Coinbase AgentKit) holding a wallet key with USDC on Base; it signs and retries`,
+      `  with an X-PAYMENT header. The payment is verified with the Coinbase CDP facilitator before the`,
+      `  conversion is served: a verified call comes back with x-payment-verified: true and settles on`,
+      `  Base immediately afterwards; a payment the facilitator rejects gets the 402 again with an`,
+      `  invalidReason and no conversion; and if the facilitator cannot be reached the call is served`,
+      `  anyway, saying so with x-payment-verified: false and x-payment-error. Settlement is queued only`,
+      `  for a conversion that was actually served, so a 400 on input we cannot convert is never charged,`,
+      `  and a body over the 256 KB cap is refused with 413 before an envelope is built. On a deployment`,
+      `  with no receiving address configured, calls answer HTTP 429 instead of 402.`,
+    ];
+
 const API_HEADER = [
   `Availability check: GET ${API_BASE}/check?from=<what you have>&to=<what you need>`,
-  `  Field-bound substring match, case-insensitive: from is matched against the "have" side only,`,
-  `  to against the "need" side only. No parameters returns every hosted tool.`,
+  `  Field-bound match, case-insensitive: from is matched against the "have" side only, to against`,
+  `  the "need" side only. A parameter matches on a substring of the prose name OR on an exact`,
+  `  alias — extensions and MIME types both work, with or without a leading dot (md, .md,`,
+  `  text/markdown, yml, .yaml, text/html). Every match carries its own x_aliases and y_aliases, so`,
+  `  the accepted spellings can be read rather than guessed. No parameters returns every hosted tool.`,
   `Convert: POST ${API_BASE}/convert/<id> with the raw file as the body (256 KB cap).`,
   `  The converted file comes back as the body, with the right Content-Type.`,
-  `Tiers: every hosted tool is free to try — ${FREE_TIER_DAILY} conversions per caller per UTC day, no login —`,
-  `  and priced per call past that. A caller is an IP address (rotating the user-agent does not reset it);`,
-  `  every free-tier response carries x-free-tier-remaining: <n>, and the count resets at midnight UTC.`,
-  `Payment: past the free tier a call answers HTTP 402 with an x402 envelope — exact scheme, USDC`,
-  `  on Base — naming the price and the payTo address. No accounts, no keys, per-call pricing. Pay`,
-  `  with an x402-capable client (x402-fetch, the x402 SDK, Coinbase AgentKit) holding a wallet key`,
-  `  with USDC on Base; it signs and retries with an X-PAYMENT header. The payment is verified with`,
-  `  the Coinbase CDP facilitator before the conversion is served: a verified call comes back with`,
-  `  x-payment-verified: true and settles on Base immediately afterwards; a payment the facilitator`,
-  `  rejects gets the 402 again with an invalidReason and no conversion; and if the facilitator`,
-  `  cannot be reached the call is served anyway, saying so with x-payment-verified: false and`,
-  `  x-payment-error. Inside the free tier nothing is checked or charged. On a deployment with no`,
-  `  receiving address configured, over-tier calls answer HTTP 429 with a Retry-After, not a 402.`,
+  ...TIER_LINES,
+  ...PAYMENT_LINES,
+  `OpenAPI: ${BASE}/openapi.json`,
   `Skill: npx skills add chronick/lemon-toolshed`,
   `MCP: claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed`,
   `  Tools: toolshed_check, toolshed_convert, toolshed_catalog. Base URL via TOOLSHED_URL.`,
@@ -1295,10 +1517,16 @@ const llmsFull = [
           ? [
               `hosted_path: POST ${e._hosted.path}`,
               `hosted_price: ${priceLabel(e._hosted.price)}`,
-              `hosted_free_tier: ${e._hosted.free_tier_daily} conversions per caller per UTC day`,
+              // Stated only when there IS one. A "hosted_free_tier: 0" line
+              // reads as a broken template rather than as a fact.
+              ...(e._hosted.free_tier_daily > 0
+                ? [`hosted_free_tier: ${e._hosted.free_tier_daily} conversions per caller per UTC day`]
+                : []),
               `hosted_status: ${e._hosted.status}`,
             ]
           : []),
+        `aliases_from: ${e._xaliases.join(', ')}`,
+        `aliases_to: ${e._yaliases.join(', ')}`,
         `local_tool: ${e._local.tool}`,
         `local_install: ${e._local.install}`,
         `kind: ${e.kind}`,
@@ -1313,6 +1541,308 @@ const llmsFull = [
   ),
 ].join('\n');
 
+// ---------------------------------------------------------------- openapi.json
+//
+// A real OpenAPI 3.1 description of the API, emitted as a static file.
+//
+// x402scan and friends look for it at GET {origin}/openapi.json. dist/ is served
+// by Pages AT the origin, so writing the file is the whole implementation: a
+// real file beats the SPA fallback that currently answers unknown paths.
+//
+// It describes what the Worker actually does, including the failure modes. An
+// OpenAPI document that lists only the 200 is worse than none — the 402 is the
+// interesting response here, and it is the one a machine has to handle.
+
+const X402_ENVELOPE_SCHEMA = {
+  type: 'object',
+  description: 'An x402 v1 payment requirements envelope — the terms to pay against.',
+  required: ['scheme', 'network', 'maxAmountRequired', 'resource', 'payTo', 'asset'],
+  properties: {
+    scheme: { type: 'string', enum: ['exact'] },
+    network: { type: 'string', enum: ['base'] },
+    maxAmountRequired: {
+      type: 'string',
+      description: 'Price in atomic units of `asset`. USDC has 6 decimals, so "1000" is $0.001.',
+      examples: ['1000'],
+    },
+    resource: { type: 'string', format: 'uri', description: 'The URL being paid for.' },
+    description: { type: 'string' },
+    mimeType: { type: 'string', description: 'Content type of the conversion this pays for.' },
+    payTo: { type: 'string', description: 'The receiving address.' },
+    maxTimeoutSeconds: { type: 'integer', examples: [60] },
+    asset: {
+      type: 'string',
+      description: 'USDC on Base.',
+      examples: ['0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'],
+    },
+    extra: {
+      type: 'object',
+      description:
+        "The EIP-712 domain the client signs over. USDC's on-chain name() is \"USD Coin\", which is " +
+        'not its ticker; a client that signs over the wrong domain produces a payment the ' +
+        'facilitator cannot recover.',
+      properties: { name: { type: 'string' }, version: { type: 'string' } },
+    },
+    outputSchema: {
+      type: 'object',
+      description: 'How to call the resource and what comes back. `input.discoverable` marks it for indexing.',
+      properties: {
+        input: {
+          type: 'object',
+          properties: {
+            type: { type: 'string', enum: ['http'] },
+            method: { type: 'string', enum: ['POST'] },
+            discoverable: { type: 'boolean' },
+            bodyType: { type: 'string' },
+            description: { type: 'string' },
+          },
+        },
+        output: {
+          type: 'object',
+          properties: { type: { type: 'string' }, description: { type: 'string' } },
+        },
+      },
+    },
+  },
+};
+
+const ERROR_SCHEMA = {
+  type: 'object',
+  required: ['error'],
+  properties: { error: { type: 'string', description: 'A plain sentence naming what went wrong.' } },
+};
+
+const paymentRequiredResponse = {
+  description:
+    'Payment required. The body is an x402 v1 envelope naming the terms; pay it with an ' +
+    'x402-capable client and retry the same request with an X-PAYMENT header. A body that also ' +
+    'carries `invalidReason` means a payment WAS presented and the facilitator rejected it — ' +
+    'retrying the same payload will fail identically.',
+  content: {
+    'application/json': {
+      schema: {
+        type: 'object',
+        required: ['x402Version', 'accepts'],
+        properties: {
+          x402Version: { type: 'integer', enum: [1] },
+          error: { type: 'string' },
+          invalidReason: { type: 'string' },
+          invalidMessage: { type: ['string', 'null'] },
+          accepts: { type: 'array', minItems: 1, items: X402_ENVELOPE_SCHEMA },
+        },
+      },
+    },
+  },
+};
+
+const convertPaths = Object.fromEntries(
+  hostedLive.map((e) => [
+    e._hosted.path,
+    {
+      post: {
+        operationId: `convert_${e.id.replace(/-/g, '_')}`,
+        summary: `${oneLine(e.x)} to ${oneLine(e.y)}`,
+        description:
+          `${firstSentence(e.verdict)} POST the raw file as the request body — no JSON wrapper, no ` +
+          `multipart — and the converted file comes back as the response body. Input is capped at ` +
+          `256 KB. ${
+            FREE_TIER_ON
+              ? `The first ${FREE_TIER_DAILY} calls per caller per UTC day are free; past that a call is priced at ${priceLabel(e._hosted.price)}.`
+              : `Every call is priced at ${priceLabel(e._hosted.price)}; a call with no X-PAYMENT header answers 402 with the envelope to pay against.`
+          }`,
+        tags: ['convert'],
+        parameters: [
+          {
+            name: 'X-PAYMENT',
+            in: 'header',
+            required: false,
+            description: 'A base64-encoded x402 payment payload, signed against the 402 envelope.',
+            schema: { type: 'string' },
+          },
+        ],
+        requestBody: {
+          required: true,
+          description: `The raw ${oneLine(e.x)} file, as the body. Up to 256 KB.`,
+          content: { 'text/plain': { schema: { type: 'string' } } },
+        },
+        responses: {
+          200: {
+            description: `The converted ${oneLine(e.y)} file.`,
+            headers: {
+              'x-payment-verified': {
+                description: 'true when the payment was checked with the facilitator before serving.',
+                schema: { type: 'string', enum: ['true', 'false'] },
+              },
+              'x-payment-error': {
+                description: 'Present when the call was served WITHOUT its payment being verified.',
+                schema: { type: 'string' },
+              },
+            },
+            content: { [responseMime(e)]: { schema: { type: 'string' } } },
+          },
+          400: {
+            description:
+              'The input could not be converted. Never charged: settlement is queued only for a ' +
+              'conversion that was actually served.',
+            content: { 'application/json': { schema: ERROR_SCHEMA } },
+          },
+          402: paymentRequiredResponse,
+          413: {
+            description: 'The body is larger than the 256 KB cap. Refused on the declared size, before any work.',
+            content: { 'application/json': { schema: ERROR_SCHEMA } },
+          },
+          429: {
+            description:
+              'Either this deployment has no receiving address configured (nothing to pay, so nothing ' +
+              'to offer), or the per-caller daily ceiling on served calls is reached.',
+            content: { 'application/json': { schema: ERROR_SCHEMA } },
+          },
+          503: {
+            description: 'The rate-limit store is unreachable. /convert fails closed rather than open.',
+            content: { 'application/json': { schema: ERROR_SCHEMA } },
+          },
+        },
+      },
+    },
+  ])
+);
+
+const openapi = {
+  openapi: '3.1.0',
+  info: {
+    title: `${SITE_NAME} — tools for agents`,
+    version: BUILD_DATE,
+    summary: 'Hosted file conversions an agent can call over HTTP with nothing installed.',
+    description:
+      `${STANCE}\n\n` +
+      (FREE_TIER_ON
+        ? `Every hosted tool is free to try — ${FREE_TIER_DAILY} conversions per caller per UTC day — and priced per call past that.`
+        : 'Every hosted call is a paid call. There is no account and no key: a call with no payment ' +
+          'answers HTTP 402 with an x402 envelope, and paying it is the whole authentication story. ' +
+          'You are charged only for conversions that are actually served.') +
+      `\n\nThe same catalog is published as ${BASE}/catalog.json, ${BASE}/llms.txt and ${BASE}/llms-full.txt.`,
+    license: { name: 'Proprietary', identifier: 'LicenseRef-Proprietary' },
+  },
+  servers: [{ url: API_BASE, description: 'Production' }],
+  tags: [
+    { name: 'catalog', description: 'What this service can convert.' },
+    { name: 'convert', description: 'The hosted conversions. Priced per call in USDC via x402.' },
+  ],
+  paths: {
+    '/check': {
+      get: {
+        operationId: 'check',
+        summary: 'List the conversions available for a pair.',
+        description:
+          'Field-bound match: `from` is tested against the "have" side only, `to` against the "need" ' +
+          'side only. Each parameter matches on a case-insensitive substring of the prose name OR on ' +
+          'an exact alias, so extensions and MIME types work with or without a leading dot — `md`, ' +
+          '`.md`, `text/markdown`. With no parameters the answer is every hosted tool. Touches no ' +
+          'store, so it is exempt from every rate limit and costs nothing.',
+        tags: ['catalog'],
+        parameters: [
+          {
+            name: 'from',
+            in: 'query',
+            required: false,
+            description: 'What you have. Max 64 characters.',
+            schema: { type: 'string', maxLength: 64 },
+            examples: {
+              prose: { value: 'markdown' },
+              extension: { value: 'md' },
+              dotted: { value: '.md' },
+              mime: { value: 'text/markdown' },
+            },
+          },
+          {
+            name: 'to',
+            in: 'query',
+            required: false,
+            description: 'What you need. Max 64 characters.',
+            schema: { type: 'string', maxLength: 64 },
+            examples: { prose: { value: 'html' }, mime: { value: 'text/html' } },
+          },
+        ],
+        responses: {
+          200: {
+            description: 'The matching entries. An empty `matches` array is a valid answer, not an error.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['query', 'matches'],
+                  properties: {
+                    query: {
+                      type: 'object',
+                      properties: {
+                        from: { type: ['string', 'null'] },
+                        to: { type: ['string', 'null'] },
+                      },
+                    },
+                    matches: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        required: ['id', 'x', 'y', 'hosted', 'local', 'url'],
+                        properties: {
+                          id: { type: 'string', description: 'The id to POST to /convert/{id}.' },
+                          x: { type: 'string', description: 'What it takes, in prose.' },
+                          y: { type: 'string', description: 'What it produces, in prose.' },
+                          hosted: {
+                            type: ['object', 'null'],
+                            description: 'Null for a local-only reference — there is no endpoint to call.',
+                            properties: {
+                              path: { type: 'string' },
+                              status: { type: 'string', enum: ['live', 'planned'] },
+                              free_tier_daily: {
+                                type: 'integer',
+                                description:
+                                  'Free conversions per caller per UTC day, as the Worker enforces it ' +
+                                  'right now. 0 means every call is a paid call.',
+                              },
+                              price: {
+                                oneOf: [
+                                  { type: 'string', enum: ['free'] },
+                                  {
+                                    type: 'object',
+                                    properties: {
+                                      amount_usd: { type: 'number' },
+                                      scheme: { type: 'string' },
+                                    },
+                                  },
+                                ],
+                              },
+                            },
+                          },
+                          local: {
+                            type: ['object', 'null'],
+                            description: 'The tool to run yourself instead.',
+                            properties: { tool: { type: 'string' }, install: { type: 'string' } },
+                          },
+                          url: { type: 'string', format: 'uri' },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          400: {
+            description: 'A parameter is longer than 64 characters.',
+            content: { 'application/json': { schema: ERROR_SCHEMA } },
+          },
+          405: {
+            description: 'GET only.',
+            content: { 'application/json': { schema: ERROR_SCHEMA } },
+          },
+        },
+      },
+    },
+    ...convertPaths,
+  },
+};
+
 // ---------------------------------------------------------------- worker catalog
 
 // The Worker answers GET /check out of this file. Compiling the catalog into the
@@ -1326,15 +1856,24 @@ const workerCatalog = `// GENERATED by build.mjs from entries.yaml. Do not edit 
 
 export const SITE_BASE = ${JSON.stringify(BASE)};
 
-// The free tier, compiled in from build.mjs so the number the site advertises and
-// the number the Worker enforces are the same number. OWNER-TUNABLE in build.mjs.
+// The free tier as the STATIC surfaces advertise it. The Worker does NOT enforce
+// this number — it reads env.FREE_TIER_DAILY at runtime and treats that as the
+// only authority, so a dashboard flip takes effect without a rebuild. This
+// export exists so the build constant and the deployed bundle stay legible to
+// each other, and so the suite can assert on what was compiled in.
+// OWNER-TUNABLE in build.mjs.
 export const FREE_TIER_DAILY = ${FREE_TIER_DAILY};
 
+// \`xa\`/\`ya\` are the /check alias sets — already normalised (lowercase, no
+// leading dot), so the Worker only has to normalise the incoming query.
+// Short keys because this object ships in the Worker bundle.
 export const CATALOG = ${JSON.stringify(
   entries.map((e) => ({
     id: e.id,
     x: oneLine(e.x),
     y: oneLine(e.y),
+    xa: e._xaliases,
+    ya: e._yaliases,
     hosted: e._hosted,
     local: e._local,
     url: e.url,
@@ -1346,10 +1885,17 @@ export const CATALOG = ${JSON.stringify(
 
 // ---------------------------------------------------------------- emit
 
+// robots.txt: allow everything. It exists so a prober gets a real 200 with a
+// real answer instead of the SPA fallback, which is indistinguishable from a
+// misconfigured site to anything that checks.
+const robots = ['User-agent: *', 'Allow: /', '', `Sitemap: ${BASE}/`, ''].join('\n');
+
 rmSync(DIST, { recursive: true, force: true });
 mkdirSync(DIST, { recursive: true });
 writeFileSync(join(DIST, 'index.html'), html);
 writeFileSync(join(DIST, 'catalog.json'), `${JSON.stringify(catalog, null, 2)}\n`);
+writeFileSync(join(DIST, 'openapi.json'), `${JSON.stringify(openapi, null, 2)}\n`);
+writeFileSync(join(DIST, 'robots.txt'), robots);
 writeFileSync(join(DIST, 'llms.txt'), llms);
 writeFileSync(join(DIST, 'llms-full.txt'), llmsFull);
 writeFileSync(join(ROOT, 'worker', 'catalog.generated.js'), workerCatalog);
@@ -1368,4 +1914,15 @@ if (HOST !== HOST_DEFAULT) {
   );
 }
 console.log(`build: stale entries ${stale.length}`);
-console.log('build: wrote dist/index.html dist/catalog.json dist/llms.txt dist/llms-full.txt worker/catalog.generated.js');
+console.log(
+  FREE_TIER_ON
+    ? `build: FREE TIER ON — static copy advertises ${FREE_TIER_DAILY}/day free. The Worker enforces ` +
+        'env.FREE_TIER_DAILY, so set that var too or the site claims a tier it does not honour. ' +
+        'WARNING: a free tier serves fresh IPs a 200, which drops this service from Bazaar discovery.'
+    : 'build: FREE TIER OFF — every hosted call is a paid call; static copy says so. The Worker ' +
+        'enforces env.FREE_TIER_DAILY (unset = off).'
+);
+console.log(
+  'build: wrote dist/index.html dist/catalog.json dist/openapi.json dist/robots.txt dist/llms.txt ' +
+    'dist/llms-full.txt worker/catalog.generated.js'
+);

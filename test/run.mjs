@@ -3,10 +3,16 @@
 //
 // Two things make this a script rather than a bare `node --test test/`:
 //
-// 1. PHASES. One dev var changes the product's answer past the free tier — with
-//    PAYTO unset it is a 429, with PAYTO set it is a 402 envelope — and a dev
-//    var is fixed for the life of a `wrangler dev` process. So the run is two
-//    phases against two workers, booted and torn down in turn.
+// 1. PHASES. Dev vars change the product's answer, and a dev var is fixed for
+//    the life of a `wrangler dev` process, so each configuration needs its own
+//    worker. Two vars matter:
+//      FREE_TIER_DAILY  unset (production) = every call is a paid call and the
+//                       FIRST unauthenticated call is the 402; set to N = the
+//                       legacy free tier of N calls per caller per UTC day.
+//      PAYTO            unset = 429 where a 402 would otherwise go, because
+//                       there is nowhere to pay.
+//    So the run is three phases against three workers, booted and torn down in
+//    turn.
 //
 // 2. ONE WORKER PER PHASE. Booting is the expensive part (~2 s), and a shared
 //    instance is safe here because every suite addresses its own band of
@@ -21,12 +27,18 @@
 // runner has not already exported one.
 
 import { spawn } from 'node:child_process';
-import { bootWorker, PAYTO_TEST } from './harness.mjs';
+import { bootWorker, PAYTO_TEST, TIER_ON_VARS } from './harness.mjs';
 
 const PHASES = [
   {
-    name: 'free tier (PAYTO unset)',
-    vars: {},
+    // The env-gated free tier. These suites need conversions actually SERVED —
+    // the converter fixtures because that is what they assert on, the quota and
+    // spoof suites because the tier IS what they assert on — and with no
+    // facilitator and no wallet in the loop, a free tier is the only way to be
+    // served. It is booted explicitly rather than inherited, so the file that
+    // reads these assertions can see which configuration produced them.
+    name: `free tier enabled (FREE_TIER_DAILY=${TIER_ON_VARS.FREE_TIER_DAILY}, PAYTO unset)`,
+    vars: TIER_ON_VARS,
     files: [
       'test/convert-md-html.test.mjs',
       'test/convert-json-yaml.test.mjs',
@@ -41,9 +53,12 @@ const PHASES = [
     ],
   },
   {
-    name: 'paid tier (PAYTO set)',
+    // THE PRODUCTION CONFIGURATION: no free tier, a receiving address set. The
+    // first unauthenticated call is the 402, which is both the product and the
+    // thing Coinbase's Bazaar index probes for.
+    name: 'production default (free tier off, PAYTO set)',
     vars: { PAYTO: PAYTO_TEST },
-    files: ['test/x402.test.mjs'],
+    files: ['test/tier-off.test.mjs', 'test/x402.test.mjs'],
   },
   {
     // STANDALONE, and it has to be: this suite runs a mock facilitator on a
@@ -80,7 +95,11 @@ for (const phase of PHASES) {
   try {
     const code = await runNodeTest(files, {
       TOOLSHED_TEST_URL: worker.baseUrl,
-      TOOLSHED_TEST_PAYTO: phase.vars.PAYTO || '',
+      // The WHOLE var set, canonically ordered: useWorker() joins this worker
+      // only when the config it asked for is the config that was booted.
+      TOOLSHED_TEST_VARS: JSON.stringify(
+        Object.fromEntries(Object.entries(phase.vars).sort(([a], [b]) => a.localeCompare(b)))
+      ),
       TOOLSHED_TEST_PERSIST: worker.persistDir,
     });
     if (code !== 0) failed = true;

@@ -55,15 +55,37 @@ routes = [
   { pattern = "toolshed.lemon-agent.dev/convert/*", zone_name = "lemon-agent.dev" }
 ]
 
-# Payment configuration. Both are UNSET by default, and unset is a working
-# state: the priced conversion is served free with `x-pricing: pending` until
-# PAYTO holds a real receiving address. See README.md § Payment (x402).
+# Payment configuration. All three are UNSET by default, and unset is a working
+# state — see README.md § Payment (x402).
 #
 # [vars]
 # PAYTO = "0x..."            # receiving address for USDC on Base
 # FACILITATOR_URL = "..."    # OPTIONAL override; defaults to the CDP facilitator
 #                            # (https://api.cdp.coinbase.com/platform/v2/x402).
 #                            # Only the test suite sets it, to reach a local mock.
+# FREE_TIER_DAILY = "3"      # OPTIONAL. Free conversions per caller per UTC day.
+#                            # UNSET = 0 = OFF, which is the production default
+#                            # and the only Bazaar-discoverable configuration.
+#
+# ON FREE_TIER_DAILY, before you uncomment it. This var is the ONLY runtime
+# authority for the free tier — the Worker no longer reads the number compiled
+# into worker/catalog.generated.js — so setting it here (or in the dashboard)
+# takes effect on the next request, and GET /check starts reporting it
+# immediately without a rebuild.
+#
+# Turning it on has a cost that is not obvious: it makes this service fall OUT
+# of Coinbase's Bazaar discovery index. The index requires that an
+# unauthenticated request answer 402, and it health-probes on an interval — a
+# free tier hands any fresh IP a 200, which fails that check and delists an
+# endpoint that was already listed. That is why the tier was retired on
+# 2026-08-19; the mechanism is kept, the default is not.
+#
+# And it is only half the switch. The STATIC surfaces — the page, catalog.json,
+# llms.txt, llms-full.txt — are generated from FREE_TIER_DAILY in build.mjs, so
+# re-enabling means: set this var, set that constant to the same N, run
+# `npm run build`, and redeploy BOTH the Worker and the Pages site. Set one
+# without the other and the site advertises a tier it does not honour, or
+# honours one it does not advertise.
 #
 # The two CDP credentials are SECRETS, not vars — they never belong in this
 # file, which is committed. Set them once per environment:

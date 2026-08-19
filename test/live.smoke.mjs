@@ -5,33 +5,33 @@
 //   TOOLSHED_URL=http://localhost:8787 npm run test:live
 //   node test/live.smoke.mjs https://toolshed.lemon-agent.dev
 //
-// The budget is the whole design of this file: it spends AT MOST ONE free-tier
-// conversion, and it never depends on how much allowance is left. Everything
-// else it touches — GET /check, catalog.json, llms.txt, llms-full.txt — is
-// unmetered static or the in-memory catalog filter, so a run costs one
-// conversion whatever else it asserts.
+// The budget is the whole design of this file, and against production it is
+// ZERO: there is no free tier, so the one conversion it posts answers 402 at the
+// paywall and no converter runs. Everything else it touches — GET /check,
+// catalog.json, llms.txt, llms-full.txt — is unmetered static or the in-memory
+// catalog filter. It never depends on quota state, so it can be repeated as
+// often as you like and still tell the truth.
 //
 // The one conversion accepts 200, 402 and 429 as PASSES, labelled differently:
 //
-//   200  the converter ran
-//   402  the paid gate is live and this caller's free tier is spent — correct
-//   429  the free tier is spent on a deployment with no receiving address, or the
-//        paid ceiling is reached — also correct
+//   402  the paid gate is live — the production answer to an unpaid call
+//   200  a deployment with FREE_TIER_DAILY set served it; the converter ran
+//   429  either no receiving address is configured (nothing to pay to), or this
+//        caller has hit the daily paid ceiling — both correct answers
 //
 // Only a 5xx, a wrong content-type, or output that does not look like the
-// conversion is a failure. That is what "never depends on quota state" means
-// here: the run can be repeated on a spent day and still tell the truth.
+// conversion is a failure.
 //
 // The deep behavioural coverage is the LOCAL suite (`npm test`), which runs
-// against a throwaway `wrangler dev --local` and can burn as much allowance as
-// it likes. This file only checks that what is deployed is the same product.
+// against a throwaway `wrangler dev --local` and is free. This file only checks
+// that what is deployed is the same product.
 //
 // Zero dependencies. Node 18+ for global fetch.
 //
-// (`npm run test:live:full` runs scripts/test-live.mjs, the older and much
-// hungrier probe: it spends the caller's WHOLE daily allowance — all three free
-// conversions — plus a cost estimate, and its remaining convert calls land on
-// the paywall by design. Use it deliberately, once a day, not in a loop.)
+// (`npm run test:live:full` runs scripts/test-live.mjs, the wider probe: it
+// checks the 402 envelope of every hosted tool, the alias matching and the
+// machine-readable surfaces, and adds a cost estimate. It serves no conversions
+// and spends nothing either, but it makes ~20 requests, so it paces itself.)
 
 const ARG = process.argv.slice(2).find((a) => !a.startsWith('--'));
 const BASE = (ARG || process.env.TOOLSHED_URL || 'https://toolshed.lemon-agent.dev').replace(/\/+$/, '');
@@ -53,12 +53,14 @@ async function check(name, fn) {
 }
 
 console.log(`Toolshed live smoke — ${BASE}`);
-console.log('Budget: at most ONE free-tier conversion. Nothing else here is metered.\n');
+console.log('Budget: zero conversions and zero USDC against production — the one convert call hits the paywall.\n');
 
 // ------------------------------------------------------------------ /check
 
 let hostedIds = [];
 let freeTierDaily = null;
+// Should stay 0 against production: the one convert call stops at the paywall.
+let servedHere = 0;
 
 await check('GET /check lists the hosted tools with prices and free tiers', async () => {
   const res = await fetch(`${BASE}/check`);
@@ -83,8 +85,9 @@ await check('GET /check lists the hosted tools with prices and free tiers', asyn
   }
 
   hostedIds = body.matches.map((m) => m.id);
+  // The RUNTIME value the Worker enforces, not a build constant: 0 in production.
   freeTierDaily = body.matches[0].hosted.free_tier_daily;
-  return `${hostedIds.length} hosted (${hostedIds.join(', ')}), free tier ${freeTierDaily}/day`;
+  return `${hostedIds.length} hosted (${hostedIds.join(', ')}), free_tier_daily ${freeTierDaily}`;
 });
 
 await check('GET /check matching is field-bound', async () => {
@@ -180,23 +183,36 @@ await check('POST /convert/md-html answers correctly for whatever tier this call
     assert(JSON.parse(text).x402Version === 1, 'the 402 body is not an x402 v1 envelope');
     assert(!!offer.payTo, 'the x402 envelope names no payTo address');
     assert(offer.resource?.endsWith('/convert/md-html'), `envelope resource is ${offer.resource}`);
-    return `402 — paid gate live, ${offer.maxAmountRequired} atomic to ${offer.payTo} (free tier spent for this caller)`;
+    return `402 — paid gate live on the first call, ${offer.maxAmountRequired} atomic to ${offer.payTo}`;
   }
 
+  // Two surviving 429 forms, told apart by the header: the daily paid ceiling
+  // resets at midnight and says so with a Retry-After; a deployment with no
+  // receiving address does not reset on any clock, and carries none.
   if (res.status === 429) {
     const body = JSON.parse(text);
-    assert(/free tier|ceiling/.test(String(body.error)), `unexpected 429 body: ${text.slice(0, 120)}`);
-    const retryAfter = Number(res.headers.get('retry-after'));
-    assert(Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 86_400, 'no sane Retry-After');
-    return `429 — free tier spent for this caller, resets in ${retryAfter}s (correct, not a fault)`;
+    const retryAfter = res.headers.get('retry-after');
+
+    if (retryAfter === null) {
+      assert(body.free_tier_daily === 0, `unexpected 429 body: ${text.slice(0, 120)}`);
+      assert(typeof body.retry === 'string' && body.retry.trim(), 'the 429 does not say what has to change');
+      return `429 — NO RECEIVING ADDRESS configured on this deployment: ${String(body.retry).slice(0, 80)}`;
+    }
+
+    assert(/ceiling/.test(String(body.error)), `unexpected 429 body: ${text.slice(0, 120)}`);
+    const seconds = Number(retryAfter);
+    assert(Number.isFinite(seconds) && seconds > 0 && seconds <= 86_400, 'no sane Retry-After');
+    return `429 — daily paid ceiling reached for this caller, resets in ${seconds}s (correct, not a fault)`;
   }
 
   assert(res.status === 200, `expected 200, 402 or 429, got ${res.status}: ${text.slice(0, 160)}`);
   assert(/text\/html/.test(res.headers.get('content-type') || ''), 'md-html did not answer as HTML');
   assert(text.includes('<h1>Toolshed</h1>'), 'the heading did not convert');
   assert(text.includes('<strong>world</strong>'), 'the emphasis did not convert');
+  // Only reachable with FREE_TIER_DAILY set, which production does not have.
+  servedHere += 1;
   const left = res.headers.get('x-free-tier-remaining');
-  return `200 — converted${left !== null ? `, ${left} free calls left for this caller` : ''}`;
+  return `200 — converted; this deployment has a free tier enabled${left !== null ? ` (${left} calls left for this caller)` : ''}`;
 });
 
 // ------------------------------------------------------------------ cheap guards
@@ -232,6 +248,8 @@ for (const r of results) console.log(`${r.name.padEnd(width)}  ${r.ok ? 'PASS' :
 console.log('-'.repeat(width + 10));
 console.log(`${`${passed} passed, ${failedCount} failed`.padEnd(width)}  ${failedCount ? 'FAIL' : 'PASS'}`);
 console.log(`${'='.repeat(width + 10)}`);
-console.log(`Free-tier conversions spent by this run: 1 of ${freeTierDaily ?? '?'}\n`);
+console.log(
+  `Conversions served to this run: ${servedHere} (free_tier_daily on this deployment: ${freeTierDaily ?? '?'})\n`
+);
 
 process.exit(failedCount ? 1 : 0);

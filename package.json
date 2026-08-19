@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Toolshed — tools for agents, no install required. Hosted conversion endpoints with an x402 payment path and a free tier, under the Lemon house brand. Static read surface, an API Worker, and an MCP server.",
+  "description": "Toolshed — tools for agents, no install required. Hosted conversion endpoints priced per call in USDC over x402, under the Lemon house brand. Static read surface, an API Worker, and an MCP server.",
   "bin": {
     "lemon-toolshed": "mcp/server.mjs"
   },

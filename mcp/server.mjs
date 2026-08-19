@@ -32,20 +32,16 @@ const VERSION = '0.1.0';
 // divided down before it is shown to anyone as a price.
 const USDC_DECIMALS = 6;
 
-// Wording only — mirrors FREE_TIER_DAILY in build.mjs so the tool descriptions can
-// state the tier before any HTTP call has happened. The service enforces its own
-// number and publishes it per tool in /check as `hosted.free_tier_daily`, which is
-// authoritative; this constant never gates anything.
-const FREE_TIER_DAILY = 3;
-
-// How few free calls have to be left before a successful conversion carries a
-// warning. Below this the note is worth the noise; above it, the caller gets
-// clean output, because the converted file is the product.
+// How many calls have to be left on a deployment-enabled free tier before a
+// successful conversion carries a warning. At or below this the note is worth the
+// noise; above it, the caller gets clean output, because the converted file is
+// the product.
 //
-// Bounded by the tier itself: a flat 3 would warn on EVERY call of a 3/day tier,
-// which is the noise this threshold exists to avoid. At 3/day it warns on the
-// last two calls; at 10/day it is the flat 3 it has always been.
-const LOW_TIER_WARN = Math.min(3, FREE_TIER_DAILY - 1);
+// A flat number rather than a fraction of the tier: the tier width is a per
+// deployment setting this file has no way to know, and the hosted service has no
+// tier at all — so nothing here may state one. The only number that gets printed
+// is the one the response itself reported.
+const LOW_TIER_WARN = 1;
 
 const TOOLS = [
   {
@@ -53,10 +49,11 @@ const TOOLS = [
     description:
       'List the conversions Toolshed can run. `from` is matched against what you have, ' +
       '`to` against what you need — case-insensitive substrings, each bound to its own ' +
-      'side. Omit both to get every hosted tool. Call this before toolshed_convert rather ' +
-      `than guessing a tool_id. Every hosted tool is free to try — ${FREE_TIER_DAILY} conversions ` +
-      'per caller per UTC day — and priced per call past that; each match carries its own ' +
-      '`hosted.price` and `hosted.free_tier_daily`.',
+      'side, and extensions and MIME types hit too ("md", ".md", "text/markdown", "yml", ' +
+      '"text/html"). Omit both to get every hosted tool. Call this before toolshed_convert ' +
+      'rather than guessing a tool_id. Each match carries its own `hosted.price` — every ' +
+      'hosted tool is $0.001 a call — and `hosted.free_tier_daily`, which is 0 unless that ' +
+      'deployment has enabled a free tier.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -71,11 +68,12 @@ const TOOLS = [
     description:
       'Run a hosted conversion. `tool_id` is an id from toolshed_check (for example ' +
       '"md-html"); `input` is the file content, sent as the request body. The converted ' +
-      `text comes back. Input is capped at 256 KB. The first ${FREE_TIER_DAILY} conversions ` +
-      'a day are free, counted per caller (per IP, so rotating the user-agent does not ' +
-      'reset it); a 402 or a 429 means the day\'s free calls are spent — 402 asks you to pay ' +
-      '(payment is live: USDC on Base via x402), 429 means this deployment has nowhere to ' +
-      'take payment. Both come back explained, not raw.',
+      'text comes back. Input is capped at 256 KB. The first call answers HTTP 402 with an ' +
+      'x402 envelope — payment is the front door, $0.001 in USDC on Base per call. A 402 is ' +
+      'not an error: it is the price. You are only charged for conversions that are actually ' +
+      'served — a 400 on malformed input costs nothing. A 429 means either that deployment ' +
+      'has no receiving address to take payment, or this caller hit the daily conversion ' +
+      'ceiling. Both 402 and 429 come back explained, not raw.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -141,24 +139,34 @@ async function convert(args) {
   });
   const body = await res.text();
 
-  if (res.status === 402) return fail(explainPayment(id, body, res));
+  // A 402 is NOT an error result. On this service the 402 is the front door —
+  // every unpaid call meets it first — and an agent whose very first contact
+  // with the shed reads `isError: true` learns "broken tool", not "priced
+  // tool". The text is a price quote; it comes back as an ordinary result.
+  if (res.status === 402) return text(explainPayment(id, body, res));
   if (res.status === 429) return fail(explainQuota(id, body, res));
   if (!res.ok) return fail(`POST /convert/${id} answered ${res.status}: ${body.trim()}`);
 
   // The converted file is the product, so it comes back clean. Two things are
-  // worth interrupting it for: the free tier running out, and a call that was
-  // served without its payment being verified.
-  const left = Number(res.headers.get('x-free-tier-remaining'));
-  if (Number.isFinite(left) && left < LOW_TIER_WARN) {
-    return text(
-      `${body}\n\n[toolshed: free tier — ${left} of ${FREE_TIER_DAILY} conversions left today for this caller. ` +
-        'At zero, calls answer 402 and payment is live: pay per call in USDC on Base via x402.]'
-    );
+  // worth interrupting it for: a deployment-enabled free tier running out, and a
+  // call that was served without its payment being verified.
+  //
+  // The header is absent on the hosted service, which has no free tier — and
+  // absent is not zero, so presence is checked before the number is read.
+  const remaining = res.headers.get('x-free-tier-remaining');
+  if (remaining !== null) {
+    const left = Number(remaining);
+    if (Number.isFinite(left) && left <= LOW_TIER_WARN) {
+      return text(
+        `${body}\n\n[toolshed: free tier — ${left} conversions left today for this caller. ` +
+          'At zero, calls answer 402 and payment is live: $0.001 in USDC on Base via x402.]'
+      );
+    }
   }
   if (res.headers.get('x-pricing') === 'pending') {
-    // Over the tier, served, but nothing was checked — the facilitator could not
-    // be reached (or is not configured on the service). Worth interrupting the
-    // product for, because the caller may believe it just paid and it did not.
+    // Served, but nothing was checked — the facilitator could not be reached (or
+    // is not configured on the service). Worth interrupting the product for,
+    // because the caller may believe it just paid and it did not.
     const why = res.headers.get('x-payment-error') || 'unknown';
     return text(
       `${body}\n\n[toolshed: x-pricing: pending — this call was served WITHOUT its payment being ` +
@@ -173,8 +181,10 @@ async function convert(args) {
   return text(body);
 }
 
-// A 429 is the free tier, spent — an answer with a shape, not a failure to relay
-// verbatim. Quote what the service actually said, then say what to do about it.
+// A 429 is not a spent allowance. It is one of two things: a deployment with no
+// receiving address configured, so there is nowhere to pay at all, or the
+// per-caller daily ceiling that bounds a runaway loop. They want opposite advice,
+// so quote what the service actually said, then say which one it is.
 function explainQuota(id, body, res) {
   let seen;
   try {
@@ -184,24 +194,53 @@ function explainQuota(id, body, res) {
   }
 
   const retryAfter = Number(res.headers.get('retry-after'));
-  const lines = [`POST /convert/${id} answered HTTP 429 — this caller's free calls for today are spent.`];
+  const reason = (seen && seen.error) || '';
+  // The two cases are told apart by the body text: the misconfiguration names the
+  // missing address, the ceiling names the ceiling. A Retry-After is only sent for
+  // the ceiling, but it is a hint, not the discriminator.
+  const misconfigured = /receiving address/i.test(reason);
+  const tier = seen ? Number(seen.free_tier_daily) : NaN;
+
+  const lines = [
+    `POST /convert/${id} answered HTTP 429 — ${
+      misconfigured
+        ? 'this deployment has no receiving address configured.'
+        : 'this caller reached the daily conversion ceiling.'
+    }`,
+  ];
   if (seen) {
+    lines.push('', `  reason      ${reason || 'daily limit reached'}`);
+    // Only reported when a deployment actually set one. The hosted service
+    // publishes 0, and printing that as a "tier" would describe a pricing model
+    // this service does not have.
+    if (Number.isFinite(tier) && tier > 0) {
+      lines.push(`  free tier   ${tier} conversions per caller per UTC day`);
+    }
+    if (seen.paid_tier) lines.push(`  paid tier   ${seen.paid_tier}`);
     lines.push(
-      '',
-      `  reason      ${seen.error || 'daily limit reached'}`,
-      `  free tier   ${seen.free_tier_daily ?? FREE_TIER_DAILY} conversions per caller per UTC day`,
-      `  paid tier   ${seen.paid_tier || 'per-call USDC via x402'}`,
       `  retry       ${seen.retry || 'tomorrow UTC'}${Number.isFinite(retryAfter) ? ` (${formatDuration(retryAfter)})` : ''}`
     );
   } else {
     lines.push('', 'The 429 body could not be parsed:', body.trim());
   }
-  lines.push(
-    '',
-    'The counter is keyed on the IP address, so retrying with a different user-agent',
-    'changes nothing, and neither does retrying in a loop. Either wait for the reset at',
-    'midnight UTC, or run toolshed_check and use the local tool it names for this pair.'
-  );
+
+  lines.push('');
+  if (misconfigured) {
+    lines.push(
+      'There is nowhere to send payment on this deployment, so this is a misconfiguration',
+      'and not a quota: retrying changes nothing, now or tomorrow, and no Retry-After is',
+      'sent because waiting cannot help. Run toolshed_check and use the local tool it names',
+      'for this pair.'
+    );
+  } else {
+    const when = Number.isFinite(retryAfter) ? formatDuration(retryAfter) : 'at midnight UTC';
+    lines.push(
+      'This is a runaway bound on one caller, not an allowance you spent converting for',
+      'nothing. It is keyed on the IP address, so retrying with a different user-agent',
+      `changes nothing, and neither does retrying in a loop. Wait for the reset ${when}, or`,
+      'run toolshed_check and use the local tool it names for this pair.'
+    );
+  }
   return lines.join('\n');
 }
 
@@ -211,9 +250,10 @@ function formatDuration(seconds) {
   return h ? `in about ${h}h ${m}m` : `in about ${m}m`;
 }
 
-// A 402 is the payment envelope, not an error to swallow. Quote the terms the
-// envelope actually names, then say plainly what the caller has to do — and, if
-// the service rejected a payment it was given, exactly why.
+// A 402 is the front door, not an error to swallow: an unpaid call is answered
+// with the terms to pay against. Quote the terms the envelope actually names,
+// then say plainly what the caller has to do — and, if the service rejected a
+// payment it was given, exactly why.
 function explainPayment(id, body, res) {
   let envelope;
   try {
@@ -224,8 +264,8 @@ function explainPayment(id, body, res) {
   const offer = (envelope && Array.isArray(envelope.accepts) && envelope.accepts[0]) || null;
 
   const lines = [
-    `POST /convert/${id} answered HTTP 402 — this caller's ${FREE_TIER_DAILY} free calls for today are`,
-    'spent, and the tool is priced past them.',
+    `POST /convert/${id} answered HTTP 402 — the ordinary answer to a call that carried no`,
+    'payment. Every conversion is priced; this is the price, quoted in a form a client can pay.',
   ];
   if (offer) {
     lines.push(
@@ -269,8 +309,9 @@ function explainPayment(id, body, res) {
     'is checked with the Coinbase CDP facilitator before the conversion is served, and a',
     'verified call comes back with x-payment-verified: true. If the facilitator cannot be',
     'reached the call is served anyway, unverified and uncharged, and says so with',
-    'x-payment-error. If you have no x402 client, wait for the free tier to reset at',
-    'midnight UTC, or run toolshed_check and use the local tool it names instead.'
+    'x-payment-error. You are only charged for conversions that are actually served: a 400',
+    'on malformed input settles nothing, even when the payment verified. If you have no x402',
+    'client, run toolshed_check and use the local tool it names instead.'
   );
   if (res.headers.get('x-pricing')) lines.push('', `Response header x-pricing: ${res.headers.get('x-pricing')}`);
   return lines.join('\n');

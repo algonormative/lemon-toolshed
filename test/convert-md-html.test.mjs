@@ -7,16 +7,20 @@
 // construct they wrote came out as the element it means, entities are escaped,
 // and nothing they wrote leaked through as raw markdown syntax.
 
+// The free tier is OFF by default now, so a conversion is a paid call and an
+// unauthenticated POST answers 402. This suite is about the CONVERTER, not about
+// payment, so it boots the env-gated free tier and gets served 200s the cheap way.
+
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { useWorker, client, callers } from './harness.mjs';
+import { useWorker, client, callers, TIER_ON_VARS } from './harness.mjs';
 
 let worker;
 let api;
 const ips = callers('md-html');
 
 before(async () => {
-  worker = await useWorker();
+  worker = await useWorker({ vars: TIER_ON_VARS });
   api = client(worker);
 });
 after(async () => {

@@ -9,8 +9,10 @@
 //                      bundle at build time (worker/catalog.generated.js). No
 //                      fetch, no KV, no D1 — so it is cheap, and it is exempt
 //                      from the rungs below.
-//   POST /convert/<id> the hosted conversions. Metered on their OWN budget — the
-//                      free tier below — with rung 2 as the outer bound.
+//   POST /convert/<id> the hosted conversions. Priced per call in USDC via x402,
+//                      metered on their OWN budget — the paid ceiling below —
+//                      with rung 2 as the outer bound. An unpaid call answers a
+//                      402 envelope without touching any store.
 //
 // The file keeps its name because the beacon is still the thing that has to keep
 // working byte-for-byte; the conversions grew around it.
@@ -21,10 +23,14 @@
 //   1  per-identifier token count, 100 events / identifier / UTC day   [below]
 //      /b ONLY. Convert rows are excluded from the count, so a busy converting
 //      caller no longer spends the beacon's budget, and vice versa.
-//   1c the conversion free tier, FREE_TIER_DAILY calls / caller / UTC day  [below]
-//      Its caller key is hash(daily salt + IP) with NO user-agent, on purpose:
-//      rotating a UA string must not mint a fresh allowance. A second identity
-//      costs a second IP, which is the cheapest spoof-resistance available here.
+//   1c the paid ceiling, PAID_DAILY served calls / caller / UTC day    [below]
+//      A runaway bound on calls we actually serve. Its caller key is
+//      hash(daily salt + IP) with NO user-agent, on purpose: rotating a UA
+//      string must not mint a fresh identity. A second identity costs a second
+//      IP, which is the cheapest spoof-resistance available here.
+//      OPTIONAL, env-gated: setting FREE_TIER_DAILY = N restores a free tier of
+//      N calls / caller / UTC day on the same counter and the same key. Unset
+//      (the production default) means every call is a paid call.
 //   2  global fail-closed, 200,000 events / UTC day                    [below]
 //   3  the residual — priced, not bounded by mechanism; detective controls
 //      are the $25 billing alert plus the route-disable runbook in README.md
@@ -47,11 +53,10 @@ import { marked } from 'marked';
 import yaml from 'js-yaml';
 import TurndownService from 'turndown';
 import domino from '@mixmark-io/domino';
-// FREE_TIER_DAILY is generated, not typed here: it lives in build.mjs and is
-// compiled into catalog.generated.js, so the number the page advertises, the
-// number catalog.json publishes and the number enforced below cannot drift
-// apart. OWNER-TUNABLE — edit build.mjs and rebuild.
-import { CATALOG, SITE_BASE, FREE_TIER_DAILY } from './catalog.generated.js';
+// The catalog is compiled in at build time. FREE_TIER_DAILY is deliberately NOT
+// imported: the build constant is what the STATIC surfaces advertise, and the
+// only runtime authority is env.FREE_TIER_DAILY — see freeTierDaily() below.
+import { CATALOG, SITE_BASE } from './catalog.generated.js';
 
 const MAX_BODY = 1024; // bytes; a legitimate beacon body is ~40
 const MAX_ENTRY_ID = 64;
@@ -62,6 +67,30 @@ const RUNG2_GLOBAL_PER_DAY = 200_000;
 // absent from the catalog, the page and the machine files, because publishing it
 // would read as a promise. OWNER-TUNABLE.
 const PAID_DAILY = 5000;
+
+/**
+ * The free tier, per caller per UTC day. 0 (the default) means there is none.
+ *
+ * THE ENV VAR IS THE ONLY AUTHORITY, and unset is off. This is the whole
+ * mechanism behind the 2026-08-19 decision to retire the free tier: Coinbase's
+ * Bazaar discovery index requires that an unauthenticated request answer 402,
+ * and it health-probes on an interval — so a tier that serves any fresh IP a
+ * 200 keeps us out of the index and drops us once listed. Discoverability beat
+ * the trial allowance.
+ *
+ * The mechanism stays alive rather than being deleted: a deployment that wants
+ * a trial sets FREE_TIER_DAILY = "N" and gets exactly the old behaviour back,
+ * and the suite exercises both paths so neither bit-rots.
+ *
+ * Anything unparseable, negative or fractional-below-one reads as 0. A
+ * misconfigured var must fail towards "charge for it", never towards "give it
+ * away" — a typo in a dashboard field should not become an unbounded free
+ * service.
+ */
+function freeTierDaily(env) {
+  const raw = Number(env?.FREE_TIER_DAILY ?? 0);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+}
 
 const SECONDS_PER_DAY = 86_400;
 
@@ -124,7 +153,7 @@ export default {
   // the /b path uses it.
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
-    if (path === '/check') return handleCheck(request);
+    if (path === '/check') return handleCheck(request, env);
     if (path.startsWith('/convert/')) return handleConvert(request, env, path, ctx);
     return handleBeacon(request, env, path);
   },
@@ -196,11 +225,31 @@ async function handleBeacon(request, env, path) {
 // ------------------------------------------------------------------ /check
 //
 // A pure in-memory filter over the compiled catalog. No D1, so no rungs.
+//
 // Matching is field-BOUND: `from` is tested against the have side only, `to`
-// against the need side only, both as case-insensitive substrings. With no
-// parameters at all, the answer is every hosted entry.
+// against the need side only. With no parameters at all, the answer is every
+// hosted entry.
+//
+// Each side matches on EITHER a case-insensitive substring of the prose name
+// (the original rule) OR an exact hit in that entry's alias set. The alias half
+// is why `?from=md`, `?from=.md` and `?from=text/markdown` work: verified live
+// 2026-08-19, all three used to return [] while only `?from=markdown` matched —
+// and an extension and a Content-Type are exactly what a machine has on hand.
+// Aliases are compiled per entry in build.mjs, already normalised.
+//
+// The reported free_tier_daily is the RUNTIME value this Worker enforces, not
+// the one compiled into the catalog: flipping the env var has to be visible
+// here immediately, without a rebuild, or /check starts advertising a tier that
+// does not exist.
 
-function handleCheck(request) {
+// Lowercase, trimmed, leading dots stripped — matching normaliseAlias() in
+// build.mjs. The two have to agree; keeping the rule to one line is how.
+const normaliseAlias = (s) => s.trim().toLowerCase().replace(/^\.+/, '');
+
+const sideMatches = (prose, aliases, needle, alias) =>
+  prose.toLowerCase().includes(needle) || (aliases || []).includes(alias);
+
+function handleCheck(request, env) {
   if (request.method !== 'GET') {
     return json({ error: 'GET only' }, 405, { ...CORS, allow: 'GET' });
   }
@@ -214,13 +263,18 @@ function handleCheck(request) {
 
   const f = from ? from.trim().toLowerCase() : '';
   const t = to ? to.trim().toLowerCase() : '';
+  const fAlias = from ? normaliseAlias(from) : '';
+  const tAlias = to ? normaliseAlias(to) : '';
 
   const matches =
     !f && !t
       ? CATALOG.filter((e) => e.hosted)
       : CATALOG.filter(
-          (e) => (!f || e.x.toLowerCase().includes(f)) && (!t || e.y.toLowerCase().includes(t))
+          (e) =>
+            (!f || sideMatches(e.x, e.xa, f, fAlias)) && (!t || sideMatches(e.y, e.ya, t, tAlias))
         );
+
+  const tier = freeTierDaily(env);
 
   return json(
     {
@@ -229,7 +283,16 @@ function handleCheck(request) {
         id: e.id,
         x: e.x,
         y: e.y,
-        hosted: e.hosted,
+        // The spellings this entry answers to, published so a caller that had
+        // to guess once can stop guessing. Machine surface only — the page
+        // never shows these; a human does not need telling that Markdown files
+        // end in .md.
+        x_aliases: e.xa,
+        y_aliases: e.ya,
+        // The field stays present at 0 rather than disappearing: explicit beats
+        // absent, and a reader that has to distinguish "no free tier" from "this
+        // build forgot to say" will guess wrong.
+        hosted: e.hosted ? { ...e.hosted, free_tier_daily: tier } : null,
         local: e.local,
         url: e.url,
       })),
@@ -241,9 +304,15 @@ function handleCheck(request) {
 
 // ------------------------------------------------------------------ /convert
 //
-// Order of checks is the reject discipline: method, then whether the id exists,
-// then the declared size — all before the rate-limit round trip, the body read
-// and the conversion itself.
+// Order of checks is the reject discipline, cheapest first: method, then whether
+// the id exists, then the declared size, then — for the unpaid call, which is
+// now the common one — the 402 envelope. All of that happens before the
+// rate-limit round trip, the body read and the conversion itself.
+//
+// The 402 sits AFTER the size check and BEFORE any store access on purpose:
+// rejecting on a declared content-length is cheaper than building an envelope,
+// and building an envelope is cheaper than deriving a caller identity for a
+// call that is not going to be served.
 
 async function handleConvert(request, env, path, ctx) {
   if (request.method !== 'POST') {
@@ -260,6 +329,28 @@ async function handleConvert(request, env, path, ctx) {
   const declared = Number(request.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > MAX_CONVERT_BODY) return tooLarge();
 
+  // The paid tier needs BOTH halves: an address to pay to, and a payment
+  // presented. Either alone leaves the caller unpaid.
+  const payTo = env.PAYTO || '';
+  const presented = !!request.headers.get('x-payment');
+  const tier = freeTierDaily(env);
+
+  // THE 402 IS THE FRONT DOOR, and answering it is the cheapest thing this
+  // route does. With no free tier configured and no payment presented there is
+  // nothing to meter — no allowance to claim, no identity to derive — so the
+  // envelope goes out with NO salt read, NO quota claim and NO D1 write at all.
+  //
+  // Ordering matters twice over. It is the CPU-minimal reject discipline this
+  // file is built on: the 413 above stays in front of it because rejecting on a
+  // declared size is cheaper still than constructing an envelope. And it is what
+  // makes the service discoverable — Coinbase's Bazaar health-probes an
+  // unauthenticated request and expects a 402, on an interval, forever.
+  //
+  // Rung 2 is deliberately NOT consulted here. It is a bound on D1 writes, and
+  // this path performs none; making a doomsday day answer 503 instead of 402
+  // would trade a free, correct answer for an expensive, wrong one.
+  if (tier === 0 && !presented) return overQuota(entry, conv, { payTo, tier });
+
   // --- the conversion budget ---------------------------------------------
   const db = env.DB;
   if (!db) return json({ error: 'conversion is unavailable' }, 503);
@@ -268,14 +359,9 @@ async function handleConvert(request, env, path, ctx) {
   const day = new Date(now * 1000).toISOString().slice(0, 10); // UTC
   const dayStart = Math.floor(Date.parse(`${day}T00:00:00Z`) / 1000);
 
-  // The paid tier needs BOTH halves: an address to pay to, and a payment
-  // presented. Either alone leaves the caller on the free tier.
-  const payTo = env.PAYTO || '';
-  const presented = !!request.headers.get('x-payment');
-
   // What the response will say about payment, decided below and rendered by
   // servedHeaders(). `settle` is the deferred half of a verified payment.
-  let tier = { kind: 'free', remaining: 0, presented };
+  let outcome = { kind: 'free', remaining: 0, presented };
   let settle = null;
 
   try {
@@ -299,25 +385,28 @@ async function handleConvert(request, env, path, ctx) {
       return json({ error: 'daily call limit reached' }, 429);
     }
 
-    // THE FREE TIER IS CLAIMED FIRST, ALWAYS — and that ordering is the whole
-    // "never bill inside the free tier" rule, expressed as control flow rather
-    // than as a promise. A caller with allowance left takes this branch and the
-    // facilitator is never reached, whatever it presented; the payment path
-    // below is only reachable once the free claim has actually failed.
+    // WHEN A FREE TIER IS CONFIGURED IT IS CLAIMED FIRST, ALWAYS — and that
+    // ordering is the whole "never bill inside the free tier" rule, expressed as
+    // control flow rather than as a promise. A caller with allowance left takes
+    // this branch and the facilitator is never reached, whatever it presented;
+    // the payment path below is only reachable once the free claim has actually
+    // failed. With the tier off (the default) there is no claim to make and
+    // every caller goes straight to the payment path.
     //
     // It also fixes what the ceiling keys on. It used to key on the PRESENCE of
     // an X-PAYMENT header, so any caller that sent one got PAID_DAILY (5,000)
     // instead of the free tier — a pre-facilitator placeholder that let an
     // unverified claim buy a vastly higher ceiling for free. Now it is
     // claimed only after the facilitator says isValid, further down.
-    const free = await claimConvertQuota(db, day, ipHash, FREE_TIER_DAILY);
+    const free = tier > 0 ? await claimConvertQuota(db, day, ipHash, tier) : null;
 
     if (free !== null) {
-      tier = { kind: 'free', remaining: FREE_TIER_DAILY - free, presented };
+      outcome = { kind: 'free', remaining: tier - free, presented };
     } else {
-      // OVER THE FREE TIER. Without somewhere to pay, or without a payment,
-      // there is nothing to verify and the answer is the 402/429 as before.
-      if (!payTo || !presented) return overQuota(entry, conv, { payTo, now, dayStart });
+      // NOTHING FREE LEFT — either the tier is spent or there is no tier.
+      // Without somewhere to pay, or without a payment, there is nothing to
+      // verify and the answer is the 402/429.
+      if (!payTo || !presented) return overQuota(entry, conv, { payTo, tier, now, dayStart });
 
       const price = entry.hosted.price;
       const requirements = paymentRequirements(entry, conv, price, payTo);
@@ -349,14 +438,14 @@ async function handleConvert(request, env, path, ctx) {
       if (paidUsed === null) return paidCeilingReached({ now, dayStart });
 
       if (verdict.verified) {
-        tier = { kind: 'paid', presented };
+        outcome = { kind: 'paid', presented };
         settle = { requirements, payload: verdict.payload, payer: verdict.payer, tool: id };
       } else {
         // UNREACHABLE / UNCONFIGURED. Availability-first: the price is a signal
         // until the payment infrastructure is reliable, so the caller is served
         // rather than turned away for our dependency's outage — and the
         // response says plainly that nothing was checked.
-        tier = { kind: 'unverified', presented, error: publicReason(verdict.unavailable) };
+        outcome = { kind: 'unverified', presented, error: publicReason(verdict.unavailable) };
         await recordSettlementSafely(db, {
           now,
           tool: id,
@@ -388,6 +477,17 @@ async function handleConvert(request, env, path, ctx) {
   }
 
   // --- read, convert -----------------------------------------------------
+  //
+  // PAYMENT FAIRNESS, and it is load-bearing ordering rather than a promise:
+  // every exit between here and the settle block below is a 4xx, and `settle` is
+  // only ever queued AFTER a conversion actually succeeded. Verify-yes /
+  // settle-no leaves the signed authorization simply unused — an EIP-3009
+  // authorization moves nothing until someone submits it, and nobody does — so a
+  // buyer whose input we could not convert is not charged. The rule stated
+  // outwards: YOU ARE ONLY CHARGED FOR CONVERSIONS THAT ARE SERVED.
+  //
+  // This mattered less when the free tier absorbed most malformed input. With
+  // every call paid, a 400 that billed would be the service's worst behaviour.
   let input;
   try {
     const buf = await request.arrayBuffer();
@@ -421,7 +521,7 @@ async function handleConvert(request, env, path, ctx) {
 
   return new Response(output, {
     status: 200,
-    headers: { 'content-type': conv.contentType, ...servedHeaders(tier) },
+    headers: { 'content-type': conv.contentType, ...servedHeaders(outcome) },
   });
 }
 
@@ -430,21 +530,21 @@ const tooLarge = () =>
 
 // ------------------------------------------------------------------ tiers & x402
 //
-// Every hosted tool is priced, and every hosted tool is free to try:
-// FREE_TIER_DAILY calls per caller per UTC day, no login. What happens on call
-// FREE_TIER_DAILY + 1 is the only question, and it has two answers:
+// Every hosted tool is priced, and as of 2026-08-19 that is ALL it is: an
+// unauthenticated call answers immediately, and the answer has two forms:
 //
-//   PAYTO unset (today)  → HTTP 429. There is nowhere to pay yet, so the answer
-//                          says exactly that instead of sending a 402 nobody can
-//                          satisfy.
-//   PAYTO set            → HTTP 402 with a spec-valid x402 v1 envelope: pay to
-//                          continue.
+//   PAYTO set (production) → HTTP 402 with a spec-valid x402 v1 envelope: pay
+//                            to continue. The first call, not the fourth.
+//   PAYTO unset            → HTTP 429. There is nowhere to pay, so the answer
+//                            says exactly that instead of sending a 402 nobody
+//                            can satisfy.
 //
-// Inside the free tier the conversion is simply served, with the count that is
-// left in `x-free-tier-remaining`.
+// A deployment that sets FREE_TIER_DAILY = N gets the old behaviour back: N
+// calls per caller per UTC day are simply served, with the count that is left
+// in `x-free-tier-remaining`, and the two answers above move to call N + 1.
 //
-// Settlement IS implemented now, against the CDP facilitator, and the three
-// outcomes past the free tier are distinct:
+// Settlement IS implemented, against the CDP facilitator, and the three
+// outcomes on the payment path are distinct:
 //
 //   verified            → the conversion, `x-payment-verified: true`, and the
 //                         on-chain settlement runs after the response
@@ -456,9 +556,16 @@ const tooLarge = () =>
 //                         paying callers away because OUR dependency is down is
 //                         the worse failure. Every one of these is recorded.
 //
-// The rule that has not changed, and is the one worth protecting: NOTHING IS
-// EVER FAKE-VERIFIED. `x-payment-verified: true` appears only after a
-// facilitator round trip that returned isValid.
+// Two rules have not changed, and they are the ones worth protecting:
+//
+//   NOTHING IS EVER FAKE-VERIFIED. `x-payment-verified: true` appears only
+//   after a facilitator round trip that returned isValid.
+//
+//   NOBODY IS CHARGED FOR A CONVERSION THAT WAS NOT SERVED. Settlement is
+//   queued only after the conversion succeeds — see the note above the body
+//   read in handleConvert. It mattered less when a free tier absorbed most
+//   malformed input; with every call paid, it is the rule the service would be
+//   most unforgivable for breaking.
 
 function servedHeaders({ kind, presented, remaining, error }) {
   const headers = {};
@@ -472,7 +579,7 @@ function servedHeaders({ kind, presented, remaining, error }) {
   } else if (kind === 'paid') {
     headers['x-payment-verified'] = 'true';
   } else {
-    // Served, over the tier, unverified.
+    // Served, unverified — a payment was presented and could not be checked.
     headers['x-payment-verified'] = 'false';
     headers['x-payment-error'] = error;
     headers['x-pricing'] = 'pending';
@@ -480,10 +587,21 @@ function servedHeaders({ kind, presented, remaining, error }) {
   return headers;
 }
 
-function overQuota(entry, conv, { payTo, now, dayStart }) {
-  // Seconds to the next UTC midnight, which is when every counter resets.
-  const retryAfter = String(Math.max(1, dayStart + SECONDS_PER_DAY - now));
-
+/**
+ * The answer to a call with nothing free left to spend and no payment presented.
+ *
+ * The 402 is the normal path and needs no clock at all. The 429 is the fallback
+ * for a deployment with nowhere to take money, and it splits on WHY there is
+ * nothing free left, because the two cases want opposite advice:
+ *
+ *   tier > 0   an allowance was spent. Waiting works, so Retry-After points at
+ *              the next UTC midnight when the counter resets.
+ *   tier === 0 there was never an allowance, and there is no receiving address:
+ *              the deployment is misconfigured. Waiting does NOT work, so there
+ *              is deliberately no Retry-After — a header promising that midnight
+ *              fixes this would be a lie a client would obey.
+ */
+function overQuota(entry, conv, { payTo, tier, now, dayStart }) {
   const price = entry.hosted.price;
   if (payTo && price !== 'free') {
     return paymentRequired(paymentRequirements(entry, conv, price, payTo), {
@@ -491,15 +609,45 @@ function overQuota(entry, conv, { payTo, now, dayStart }) {
     });
   }
 
+  if (tier > 0) {
+    return json(
+      {
+        error: `free tier is ${tier} conversions per day per caller`,
+        free_tier_daily: tier,
+        paid_tier: 'per-call USDC via x402 — activating soon',
+        retry: 'tomorrow UTC',
+      },
+      429,
+      // Seconds to the next UTC midnight, which is when every counter resets.
+      { 'retry-after': String(Math.max(1, dayStart + SECONDS_PER_DAY - now)) }
+    );
+  }
+
+  // A `price: free` entry has no paid path to fall back on — there is nothing
+  // to charge for — so with the tier off it has no answer left to give. Naming
+  // that specifically matters: the generic message below blames a missing
+  // receiving address, which for this entry may well be set, sending an operator
+  // to fix the wrong thing. No entry in entries.yaml uses `price: free` today.
+  if (price === 'free') {
+    return json(
+      {
+        error: 'this conversion is configured as free, but this deployment enables no free tier',
+        free_tier_daily: 0,
+        paid_tier: 'not applicable — this entry carries no price',
+        retry: 'not until this deployment sets FREE_TIER_DAILY, or the entry is given a price',
+      },
+      429
+    );
+  }
+
   return json(
     {
-      error: `free tier is ${FREE_TIER_DAILY} conversions per day per caller`,
-      free_tier_daily: FREE_TIER_DAILY,
-      paid_tier: 'per-call USDC via x402 — activating soon',
-      retry: 'tomorrow UTC',
+      error: 'this conversion is a paid call, and this deployment has no receiving address configured',
+      free_tier_daily: 0,
+      paid_tier: 'per-call USDC via x402 — no payTo configured on this deployment',
+      retry: 'not until this deployment configures a receiving address',
     },
-    429,
-    { 'retry-after': retryAfter }
+    429
   );
 }
 
@@ -526,6 +674,18 @@ function paidCeilingReached({ now, dayStart }) {
  * that signature against what we send it; any field that differs between the
  * two makes a perfectly good payment verify as invalid. Building them in one
  * place is the only way that drift cannot happen.
+ *
+ * `outputSchema` is what makes the resource INDEXABLE rather than merely
+ * payable. Two details in it are easy to get wrong and silent when you do:
+ * `discoverable` lives inside `outputSchema.input`, not at the top level; and
+ * these are v1 field names, which is why no v2 migration is needed — the shape
+ * is copied from a resource already carrying an x402 v1 listing.
+ *
+ * It describes what these tools ACTUALLY take, which is a raw file body rather
+ * than a JSON object of named fields. Saying `bodyType: "text"` and describing
+ * the body in a sentence is honest; inventing an input object would advertise a
+ * calling convention that would fail on first use. Descriptions are kept short
+ * — the facilitator rejects anything past 500 characters.
  */
 function paymentRequirements(entry, conv, price, payTo) {
   return {
@@ -540,6 +700,19 @@ function paymentRequirements(entry, conv, price, payTo) {
     asset: USDC_BASE,
     // The EIP-712 domain the client must sign over — see USDC_BASE_EIP712.
     extra: USDC_BASE_EIP712,
+    outputSchema: {
+      input: {
+        type: 'http',
+        method: 'POST',
+        discoverable: true,
+        bodyType: 'text',
+        description: `the raw ${conv.inputFormat} file as the request body, up to ${MAX_CONVERT_BODY / 1024} KB`,
+      },
+      output: {
+        type: 'string',
+        description: `the converted ${conv.outputFormat} file as the response body (${conv.mimeType})`,
+      },
+    },
   };
 }
 
@@ -626,8 +799,24 @@ async function settleAndRecord(env, db, { requirements, payload, payer, tool }) 
   let txHash = null;
   let error = null;
 
+  // `resource` on the SETTLE payload, and only there.
+  //
+  // The Bazaar attaches a settlement to a listing by reading `resource` off the
+  // settle body, and an x402 client is not obliged to echo it back — x402-fetch
+  // does not. So a settlement from a perfectly ordinary client would land with
+  // no resource attached and index against nothing. The value is our own
+  // envelope's, which the client signed against, so this adds nothing it did not
+  // already agree to.
+  //
+  // It is spread in rather than assigned so a client that DID send one keeps its
+  // own, and it is deliberately absent from the verify call: verify is the
+  // signature check, and the payload it sees stays byte-for-byte what arrived.
+  // `resource` is envelope metadata and is not covered by the EIP-712
+  // signature, so adding it here cannot invalidate anything.
+  const settlePayload = payload?.resource ? payload : { ...payload, resource: requirements.resource };
+
   try {
-    const call = await facilitatorCall(env, 'settle', payload, requirements, SETTLE_TIMEOUT_MS);
+    const call = await facilitatorCall(env, 'settle', settlePayload, requirements, SETTLE_TIMEOUT_MS);
     if (!call.ok) {
       error = call.reason;
     } else if (call.data?.success === true) {
@@ -832,6 +1021,8 @@ const CONVERTERS = {
   'md-html': {
     description: 'Markdown to HTML conversion',
     mimeType: 'text/html',
+    inputFormat: 'Markdown',
+    outputFormat: 'HTML',
     contentType: 'text/html; charset=utf-8',
     run: (input) => marked.parse(input),
   },
@@ -839,6 +1030,8 @@ const CONVERTERS = {
   'json-yaml': {
     description: 'JSON to YAML conversion',
     mimeType: 'application/yaml',
+    inputFormat: 'JSON',
+    outputFormat: 'YAML',
     contentType: 'application/yaml; charset=utf-8',
     run: (input) => {
       let parsed;
@@ -854,6 +1047,8 @@ const CONVERTERS = {
   'yaml-json': {
     description: 'YAML to JSON conversion',
     mimeType: 'application/json',
+    inputFormat: 'YAML',
+    outputFormat: 'JSON',
     contentType: 'application/json; charset=utf-8',
     run: (input) => {
       let docs;
@@ -871,6 +1066,8 @@ const CONVERTERS = {
   'csv-json': {
     description: 'CSV to JSON conversion',
     mimeType: 'application/json',
+    inputFormat: 'CSV',
+    outputFormat: 'JSON',
     contentType: 'application/json; charset=utf-8',
     run: (input) => `${JSON.stringify(csvToRecords(input), null, 2)}\n`,
   },
@@ -878,6 +1075,8 @@ const CONVERTERS = {
   'html-markdown': {
     description: 'HTML to Markdown conversion',
     mimeType: 'text/markdown',
+    inputFormat: 'HTML',
+    outputFormat: 'Markdown',
     contentType: 'text/markdown; charset=utf-8',
     run: (input) => {
       // Turndown's browser build reaches for a global `document` that workerd

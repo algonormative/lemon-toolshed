@@ -13,11 +13,11 @@
 #     price: {amount_usd: 0.001, scheme: exact}   # or `free`
 #     status: live            # or planned
 #
-# Every hosted tool is priced, and every hosted tool has the same free tier: the
-# first FREE_TIER_DAILY calls a day per caller are free, and the price below is
-# what a call costs after that. The free-tier number is a build constant in
-# build.mjs, not a per-entry field — one number, published everywhere.
-# OWNER-TUNABLE: the price here and FREE_TIER_DAILY in build.mjs.
+# Every hosted tool is priced, and the price below is what every call costs:
+# there is no free tier as of 2026-08-19 (see FREE_TIER_DAILY in build.mjs for
+# why, and for how to put one back). The tier, when one exists, is a single
+# build constant rather than a per-entry field — one number, published
+# everywhere. OWNER-TUNABLE: the price here and FREE_TIER_DAILY in build.mjs.
 #
 #   local:               # how to run it on your own machine
 #     tool: pandoc            # optional; defaults to the top-level `tool`
@@ -100,8 +100,7 @@ entries:
       keeps the output diff-friendly. Feeding a whole page to a model to "clean it up"
       burns tokens and invents heading levels; pandoc preserves precisely the structure
       that is there. The hosted endpoint runs Turndown instead of pandoc — same job, no
-      install — free to try inside the daily free tier, then a priced x402 call like
-      every other hosted tool here.
+      install — as a priced x402 call, like every other hosted tool here.
     local:
       tool: pandoc
       install: "brew install pandoc"

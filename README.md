@@ -3,16 +3,25 @@
 **A collection of tools for agents — no install required.** Privacy-first: no
 login, no credit card, no account.
 
-**Every tool is free to try: 3 conversions a day, no login. Past that it's a
-paid call — $0.001 in USDC via x402, with much higher limits.**
+**Every hosted tool is a paid call: $0.001 in USDC via x402. There is no free
+tier — the 402 is the front door, and the payment is the auth.**
 
-An agent posts a file to an HTTP endpoint and gets the converted file back.
-Inside the free tier it just answers, and says how many calls are left in an
-`x-free-tier-remaining` header. Past it, the answer is HTTP 402 with an x402
-envelope (USDC on Base) naming a live receiving address, and a payment
-presented against that envelope is verified with the Coinbase CDP facilitator
-before the conversion is served — or HTTP 429 on a deployment with no receiving
-address configured (`PAYTO` unset).
+An agent posts a file to an HTTP endpoint and gets the converted file back. A
+call carrying no `X-PAYMENT` header answers HTTP 402 on the *first* request,
+and the body of that 402 is an x402 envelope (USDC on Base) naming a live
+receiving address — or HTTP 429 on a deployment with no receiving address
+configured (`PAYTO` unset). A payment presented against that envelope is
+verified with the Coinbase CDP facilitator before the conversion is served, and
+settled on Base immediately afterwards. **You are only charged for conversions
+that are actually served**: a `400` on input we cannot convert settles nothing,
+and a body over the 256 KB cap is refused with a `413` before an envelope is
+even built.
+
+The free tier was **retired on 2026-08-19**, in exchange for discoverability —
+see [Discoverability (Bazaar)](#discoverability-bazaar). The mechanism survives
+behind the `FREE_TIER_DAILY` env var and is off by default;
+[Re-enabling the free tier](#re-enabling-the-free-tier) is the runbook, and
+says what turning it back on costs.
 
 Not everything is hosted. Where we do not run the conversion ourselves, the
 entry is a **reference**: it names the tool worth reaching for, the caveats that
@@ -43,10 +52,10 @@ Three honest caveats:
 - **The curation is owner taste.** The 33 entries in `entries.yaml` are drafts
   for review, not a finished list, and every verdict is engineering judgment
   rather than measurement.
-- **The free tier is enforced and payment is live; exactly one real payment has
-  settled, and it was ours.** The 3/day free tier is real and runs against D1.
-  Past it, a spec-valid 402 is issued (`PAYTO` is set — live since 2026-08-18),
-  and a payment presented against it is verified and settled with the Coinbase
+- **Payment is live; exactly one real payment has settled, and it was ours.**
+  Every call is a paid call, and a spec-valid 402 is issued on the first
+  unauthenticated request (`PAYTO` is set — live since 2026-08-18). A payment
+  presented against it is verified and settled with the Coinbase
   CDP facilitator. Proven end to end on 2026-08-18 by a real payment in real
   USDC on Base (tx `0xe2c8bb8d…`, `verify_ok = 1`, `settle_ok = 1`) — made by
   `scripts/pay-test.mjs`, which is to say by us, not by a stranger. Two honest
@@ -77,7 +86,7 @@ worker/schema.sql           D1 schema — events / daily_aggregates / blocklist 
 mcp/server.mjs              the MCP server — thin stdio wrapper over the HTTP API
 skills/toolshed/SKILL.md    the agent skill — check availability, convert, x402
 test/                       the e2e suite — `npm test`, local only; see § Testing
-scripts/test-live.mjs       the older live probe + cost estimate; spends the whole 3/day tier
+scripts/test-live.mjs       the wide live probe + cost estimate; serves no conversions, spends nothing
 scripts/create-test-buyer.mjs  OWNER ONLY — makes a throwaway buyer key (.buyer.env)
 scripts/pay-test.mjs        OWNER ONLY — SPENDS REAL USDC; one paid call end to end
 wrangler.toml               Worker config; routes are live, database_id filled in at deploy
@@ -93,8 +102,8 @@ Two optional blocks decide what an entry is:
 ```yaml
 hosted:                      # present = we run this conversion
   path: "/convert/md-html"   # must equal /convert/ + the entry id
-  price:                     # what a call costs PAST the free tier
-    amount_usd: 0.001        # (`free` is still accepted, and still capped daily)
+  price:                     # what every call costs
+    amount_usd: 0.001        # (see the note on `price: free` below)
     scheme: exact
   status: live               # or planned
 
@@ -107,13 +116,28 @@ No `hosted:` block means a local-only reference entry. A bare top-level
 `install:` still works and is read as `local.install`, so entries written before
 the split need no edit. The build fails if `hosted.path` and the id disagree.
 
-**The free tier is not a per-entry field.** It is one build constant,
-`FREE_TIER_DAILY` in `build.mjs` (owner-tunable, currently **3**). The build
-stamps it onto every hosted entry as `hosted.free_tier_daily` — so it reaches
-`catalog.json`, `llms.txt`, `llms-full.txt` and `GET /check` — *and* exports it
-into `worker/catalog.generated.js`, which is where the Worker reads it to
-enforce the limit. One number: what the site advertises and what the Worker
-enforces cannot drift apart.
+**`price: free` is accepted by the build and is currently a dead end.** All five
+hosted entries are priced, and nothing exercises the other branch: `overQuota()`
+skips building an envelope when the price is `free`, so with the tier off such an
+entry would answer the no-receiving-address 429 to every call — the wrong
+sentence for what is actually a free tool. The page would meanwhile render it as
+`free`. Nothing is broken today because no entry uses it; it is named here so the
+next person to reach for it knows it needs the Worker changed first.
+
+**The free tier is not a per-entry field, and it is not on.** `FREE_TIER_DAILY`
+in `build.mjs` is **0**, and that constant now drives only the *static*
+surfaces: it is stamped onto every hosted entry as `hosted.free_tier_daily`, so
+it reaches `catalog.json`, `llms.txt` and `llms-full.txt`, and it is exported
+into `worker/catalog.generated.js` so the compiled bundle stays legible.
+
+**The Worker does not read it.** The only runtime authority is the
+`FREE_TIER_DAILY` *env var*, read per request by `freeTierDaily()` in
+`worker/beacon.js`; unset means 0 means no free tier. `GET /check` reports that
+runtime value rather than the compiled one, so flipping the var in a dashboard
+shows up immediately with no rebuild. The two halves can therefore disagree —
+which is the price of a dashboard flip taking effect at once, and why
+[Re-enabling the free tier](#re-enabling-the-free-tier) is a runbook with three
+steps rather than one.
 
 ## Worker dependencies
 
@@ -185,8 +209,10 @@ warning saying so.
 
 ## Deploy runbook
 
-Verbatim from the dossier hand-back. Nothing below has been run — no repo has
-been created, nothing is deployed, no Cloudflare login has happened.
+Verbatim from the dossier hand-back (2026-08-18), preserved as provenance. At
+hand-back time nothing below had been run; since then every step has been
+executed and the service is live at toolshed.lemon-agent.dev — read the list
+as the record of how it got there, with the deviations noted after it.
 
 ```text
 DEPLOY, in order:
@@ -206,8 +232,8 @@ DEPLOY, in order:
  6. Edge abuse control — OWNER-VERIFIED 2026-08-18: the dashboard gates
     rate-limiting rules behind a higher plan for this account, so the edge
     rate rule is DROPPED from this runbook. The deployed in-Worker tiers
-    (3/day free per IP-hash, 100/day beacon identifier, 200k/day global
-    fail-closed) are the abuse bound, the $25 Usage-Based Billing
+    (5,000 served calls/day per IP-hash, 100/day beacon identifier, 200k/day
+    global fail-closed) are the abuse bound, the $25 Usage-Based Billing
     notification (step 8 — free on every plan) is the bill bound, and the
     reactive edge control is a free WAF CUSTOM rule when the blocklist
     identifies abusers: expression `(ip.src in {<addresses>})`, action
@@ -243,12 +269,15 @@ npx wrangler deploy                                     # routes are live in wra
 node scripts/test-live.mjs                              # smoke-test the deployed API
 ```
 
-### Migration — the free-tier table (existing databases)
+### Migration — the conversion-quota table (existing databases)
 
 `worker/schema.sql` is all `CREATE TABLE IF NOT EXISTS`, so re-running the whole
-file is safe. But the production database already exists, and the free tier
-needs one new table, so **run this before deploying a Worker that enforces it**
-— the Worker fails closed, and a missing table means 503s, not free conversions:
+file is safe. But the production database already exists, and the per-caller
+conversion counter needs one new table, so **run this before deploying a Worker
+that meters conversions** — the Worker fails closed, and a missing table means
+503s, not unmetered conversions. `convert_quota` is what `PAID_DAILY` (the
+runaway bound on served calls) is claimed against, so it is required whether or
+not a free tier is configured:
 
 ```bash
 npx wrangler d1 execute DB --remote --command "CREATE TABLE IF NOT EXISTS convert_quota (day TEXT, ip_hash TEXT, used INTEGER, PRIMARY KEY (day, ip_hash));"
@@ -343,16 +372,25 @@ public API, and it holds no state, no key and no wallet. Three tools:
 
 `BASE` is `TOOLSHED_URL`, defaulting to `https://toolshed.lemon-agent.dev`.
 Neither refusal is swallowed. On a `402`, `toolshed_convert` returns a readable
-explanation quoting the price, the asset and the `payTo` address, says what an
-x402 client would do with it, and states that payments are verified with the CDP
-facilitator and settled — including what a `402` carrying an `invalidReason`
-means, which is that a payment was rejected and resending it will fail the same
-way. On a `429` it says the day's free calls are spent, quotes the free tier, the
-paid tier and the reset time in hours, and says plainly that a different
-user-agent will not help because the counter is keyed on the IP. A successful
-call comes back clean unless the free tier is nearly out — `LOW_TIER_WARN`,
-which is `min(3, FREE_TIER_DAILY - 1)`, so the last two calls of a 3/day tier —
-in which case it carries a one-line warning. A verified paid call, and a call
+explanation quoting the price, the asset, the `payTo` address and the resource,
+says what an x402 client would do with it, and states that payments are verified
+with the CDP facilitator and settled — including what a `402` carrying an
+`invalidReason` means, which is that a payment was rejected and resending the
+same payload will fail the same way. On a `429` it tells the two forms apart by
+what the body says and gives opposite advice for each: a deployment with no
+receiving address is a misconfiguration, so retrying changes nothing ever and
+there is no `Retry-After` to wait on; the per-caller daily ceiling is a runaway
+bound that resets, quoted with the reset time in hours, and it says plainly that
+a different user-agent will not help because the counter is keyed on the IP.
+
+**The MCP server holds no free-tier number of its own.** It reads
+`hosted.free_tier_daily` from `/check` and the `x-free-tier-remaining` header
+from a response, and prints only what the service reported — the hosted service
+publishes 0, and the header is absent there entirely. On a deployment that *has*
+enabled a tier, a successful call comes back clean unless the header says
+`LOW_TIER_WARN` (**1**) or fewer are left, in which case it carries a one-line
+warning. A flat number rather than a fraction, because the tier's width is a
+per-deployment setting this file cannot know. A verified paid call, and a call
 served without verification because the facilitator was unreachable, each carry
 their own one-liner too.
 
@@ -372,16 +410,34 @@ printf '%s\n' \
 
 ## Pricing and payment (x402)
 
-**All five hosted tools are priced, and all five are free to try.** The first
-`FREE_TIER_DAILY` — currently **3** — conversions per caller per UTC day cost
-nothing and need no login; past that a call costs **$0.001 in USDC on Base**,
-per call, negotiated with x402.
+**All five hosted tools are priced, and none of them has a trial.** A call costs
+**$0.001 in USDC on Base**, per call, negotiated with x402 — and the call that
+gets asked is the first one, not the fourth.
 
-### The free tier, and its caller key
+### The free tier, retired
 
-The point of a free tier is to let an agent try the thing without an account.
-The point of *this* free tier's key is that trying it a second time should cost
-something real:
+Until 2026-08-19 the first three conversions per caller per UTC day were served
+for nothing. They are not any more, and the reason is discoverability rather
+than money: Coinbase's Bazaar index requires that an unauthenticated request
+answer 402, and it **health-probes on an interval** — so a tier that hands any
+fresh IP a 200 does not merely fail the listing preflight, it drops a listing
+that already exists. Discoverability beat the trial allowance. See
+[Discoverability (Bazaar)](#discoverability-bazaar).
+
+**The mechanism was kept; only the default changed.** Setting the Worker var
+`FREE_TIER_DAILY = "N"` restores exactly the old behaviour — N calls per caller
+per UTC day simply served, with an `x-free-tier-remaining` header, and the 402
+or 429 moving to call N + 1. Phase 1 of `npm test` boots a worker with it on and
+keeps every assertion the tier ever had, so the path stays tested rather than
+rotting into dead env-gated code. [Re-enabling the free
+tier](#re-enabling-the-free-tier) is the runbook, and it names the cost.
+
+### The caller key
+
+The counter itself did not go anywhere. `convert_quota` is what `PAID_DAILY` —
+the runaway bound of 5,000 **served** calls per caller per UTC day — is claimed
+against, and an env-enabled free tier claims against the same row with the same
+key. So the key still matters, and the reasoning behind it is unchanged:
 
 | | |
 | --- | --- |
@@ -389,15 +445,16 @@ something real:
 | **not counted per** | user-agent, header set, TLS fingerprint, anything else spoofable for free |
 | **window** | one UTC day; the counter resets at midnight UTC |
 | **stored as** | one D1 row, `convert_quota(day, ip_hash, used)` |
-| **reported as** | `x-free-tier-remaining: <n>` on every free-tier answer |
+| **claimed for** | calls that are actually SERVED. An unpaid 402 never reaches it |
+| **reported as** | `x-free-tier-remaining: <n>`, only on a deployment that enabled a tier. Absent in production — and absent is not zero |
 
 Deliberately **no user-agent in the key**. Including it is the obvious mistake:
-a UA string is a header a caller writes, so a UA-keyed free tier is an infinite
-free tier for anyone who can type. Keying on the IP alone means a second
-identity costs a second address — not free, and that is the whole point. It is
-not unspoofable (proxy pools exist, and shared NAT undercounts real people in
-the other direction); it is the cheapest control that makes the abuse cost more
-than the abuse is worth at $0.001 a call.
+a UA string is a header a caller writes, so a UA-keyed counter is an infinite
+one for anyone who can type. Keying on the IP alone means a second identity
+costs a second address — not free, and that is the whole point. It is not
+unspoofable (proxy pools exist, and shared NAT undercounts real people in the
+other direction); it is the cheapest control that makes the abuse cost more than
+the abuse is worth at $0.001 a call.
 
 The claim is spendable per call, not read-then-written: `claimConvertQuota()`
 upserts with a guard — `ON CONFLICT … DO UPDATE SET used = used + 1 WHERE used <
@@ -409,10 +466,18 @@ reached.
 
 | var | read? | effect |
 | --- | --- | --- |
-| `PAYTO` | yes | the receiving address (USDC on Base) named in the 402 envelope. **Unset = there is nowhere to pay**, so over-tier calls answer 429 instead of 402. |
+| `PAYTO` | yes | the receiving address (USDC on Base) named in the 402 envelope. **Unset = there is nowhere to pay**, so unpaid calls answer 429 instead of 402. |
+| `FREE_TIER_DAILY` | yes | free conversions per caller per UTC day. **Unset = 0 = off**, which is the production default. This var is the **only runtime authority** — the Worker does not read the compiled constant — so setting it takes effect on the next request and `GET /check` reports it immediately, with no rebuild. Anything unparseable, negative or below 1 reads as 0: a misconfigured var must fail towards charging, never towards giving the service away. |
 | `FACILITATOR_URL` | yes | the x402 facilitator base URL. Defaults to `https://api.cdp.coinbase.com/platform/v2/x402`; overridden only by the test suite, which points it at a local mock. |
 | `CDP_API_KEY_ID` | yes | CDP API key id. A **Worker secret**, not a var. |
-| `CDP_API_KEY_SECRET` | yes | CDP API key secret (base64 Ed25519). A **Worker secret**. Without both keys nothing can be verified, and over-tier paid calls are served with `x-payment-error: facilitator-unconfigured`. |
+| `CDP_API_KEY_SECRET` | yes | CDP API key secret (base64 Ed25519). A **Worker secret**. Without both keys nothing can be verified, and paid calls are served with `x-payment-error: facilitator-unconfigured`. |
+
+**`FREE_TIER_DAILY` is only half the switch.** It is what the *Worker* enforces;
+the *static* copy — the page, `catalog.json`, `llms.txt`, `llms-full.txt`,
+`openapi.json` — is generated from the separate `FREE_TIER_DAILY` constant in
+`build.mjs`, which is `0`. Set one without the other and the site advertises a
+tier it does not honour, or honours one it does not advertise.
+[Re-enabling the free tier](#re-enabling-the-free-tier) moves both.
 
 Set the two secrets with `wrangler secret put`, never in `wrangler.toml`:
 
@@ -423,34 +488,57 @@ npx wrangler secret put CDP_API_KEY_SECRET
 
 ### Behaviour, exactly as implemented
 
-| calls today | `PAYTO` | `X-PAYMENT` | facilitator says | response |
-| --- | --- | --- | --- | --- |
-| ≤ 3 | unset | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` |
-| ≤ 3 | unset | yes | *not asked* | **200**, plus `x-payment-verified: false` — the free tier is not a payment path |
-| ≤ 3 | set | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` — a receiving address does not cancel the free tier |
-| ≤ 3 | set | yes | *not asked* | **200**, `x-free-tier-remaining: <n>` + `x-payment-verified: false`. **Never billed inside the free tier** |
-| > 3 | unset | either | *not asked* | **429**, `{"error": "free tier is 3 conversions per day per caller", …}` + `Retry-After` |
-| > 3 | set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool |
-| > 3 | set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable to send |
-| > 3 | set | yes | `isValid` | **200**, `x-payment-verified: true`, and settlement runs after the response |
-| > 3 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served |
-| > 3 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served free, recorded |
-| > 5,000 | set | yes | — | **429** + `Retry-After` — the runaway bound, not a price gate |
+**The reject order on `POST /convert/<id>` is method → unknown id →
+unimplemented → declared size → 402**, and the last two are in that order on
+purpose: rejecting on a declared `content-length` is cheaper than constructing
+an envelope, so a caller sending 300 KB is told the size is the problem rather
+than asked to pay for a call that could never have run.
 
-Three rows deserve saying out loud:
+| checked | when it fires | answer |
+| --- | --- | --- |
+| method | anything but `POST` | **405** + `Allow: POST` |
+| id | no hosted entry with that id | **404**, pointing at `GET /check` |
+| implementation | listed `live` with no converter behind it | **501** |
+| declared size | `content-length` over 256 KB | **413** — before the envelope, before any D1, before the body is read |
 
-- **The free tier is never a payment path.** The free allowance is claimed
-  *first*, before anything looks at `X-PAYMENT`, so a caller with allowance left
-  is never verified and never billed — and the facilitator is not called at
-  all. That ordering is the rule, expressed as control flow rather than as a
-  promise, and `test/x402-settlement.test.mjs` asserts it as **zero** calls to
-  the facilitator rather than as a header.
-- **The paid ceiling now keys on a VERIFIED payment.** *Changed 2026-08-18.*
-  `PAID_DAILY` (5,000/day per caller) used to be unlocked by the mere
-  **presence** of an `X-PAYMENT` header — a pre-facilitator placeholder that let
-  any caller who could type a header buy a 500× higher ceiling for free. The
-  higher ceiling is now claimed only after the facilitator returns `isValid`. A
-  rejected payment leaves the counter exactly where the free tier left it.
+Past those guards, the answer is the paywall, and **it is the first call, not
+the fourth**:
+
+| `PAYTO` | `X-PAYMENT` | facilitator says | response |
+| --- | --- | --- | --- |
+| set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool. **No salt read, no quota claim, no D1 write of any kind** |
+| set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable to send |
+| set | yes | `isValid` | **200**, the conversion, `x-payment-verified: true`, and settlement runs after the response |
+| set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served, and nothing settles |
+| set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served unverified, recorded |
+| set | yes | `isValid`, but the input will not convert | **400** — verified and **never settled**, so not charged |
+| set | yes | `isValid`, past 5,000 served calls today | **429** + `Retry-After` — the runaway bound, not a price gate |
+| unset | either | *not asked* | **429** naming the missing receiving address, `free_tier_daily: 0`, and **no `Retry-After`** |
+| either | either | — | **503** when the rate-limit store is unreachable. `/convert` fails closed |
+
+Four rows deserve saying out loud:
+
+- **The 402 is the cheapest answer this Worker gives.** With no tier configured
+  and no payment presented there is nothing to meter — no allowance to claim, no
+  identity to derive — so the envelope goes out before the store is touched at
+  all. `test/tier-off.test.mjs` measures that as row counts across `events`,
+  `convert_quota` and `settlements` before and after five probes, rather than as
+  a reading of the code. It is what makes the endpoint safe to hand to an indexer
+  that will ask forever, for free.
+- **Rung 2 is deliberately not consulted on the 402 path.** The global
+  fail-closed counter is a bound on D1 writes, and this path performs none;
+  making a doomsday day answer 503 instead of 402 would trade a free, correct
+  answer for an expensive, wrong one.
+- **You are only charged for conversions that are actually served.** Settlement
+  is queued only after the converter returns, and every exit between the payment
+  check and that point is a 4xx. Verify-yes / settle-no leaves the signed
+  EIP-3009 authorization simply unused — an authorization moves nothing until
+  someone submits it, and nobody does — so a buyer whose input we could not
+  convert is not billed. This was already the ordering and needed no code change;
+  what is new is the named regression test and its positive control in
+  `test/x402-settlement.test.mjs`. It mattered less when a free tier absorbed most
+  malformed input; with every call paid, a 400 that billed would be the service's
+  worst behaviour.
 - **An unreachable facilitator serves the call.** Availability-first, and it is
   a deliberate trade: at $0.001 a call the price is a signal, and turning paying
   callers away because *our* dependency is down is the worse failure. Every one
@@ -459,22 +547,59 @@ Three rows deserve saying out loud:
   `facilitator-*` rows, the dependency is broken and revenue is quietly zero —
   see [Operator queries](#operator-queries-kc-cur).
 
-And the invariant that has not changed: **nothing is ever fake-verified.**
-`x-payment-verified: true` appears only after a facilitator round trip that
-returned `isValid`. There is no code path that infers it from a header.
+**The 429s are not one refusal**, and the two on the payment path want opposite
+advice:
+
+| form | body | `Retry-After` |
+| --- | --- | --- |
+| no `PAYTO` | `{"error": "this conversion is a paid call, and this deployment has no receiving address configured", "free_tier_daily": 0, "paid_tier": …, "retry": "not until this deployment configures a receiving address"}` | **none** |
+| `PAID_DAILY` reached | `{"error": "the daily conversion ceiling for this caller is reached", "retry": "tomorrow UTC"}` | seconds to the next UTC midnight |
+| rung 2 tripped | `{"error": "daily call limit reached"}` | none — see [Limits](#limits-as-built) |
+
+The missing `Retry-After` on the first is the point of it. Waiting does not fix
+a misconfiguration, and a header saying otherwise is a lie a client obeys — it
+would come back at midnight, nightly, forever. The second genuinely resets, so it
+says when. The third is the global fail-closed bound and is reachable only on a
+call that got past the paywall — an unpaid 402 never consults it, because it
+writes nothing.
 
 **The paid ceiling answers 429, not 402.** `PAID_DAILY` (5,000/day per caller,
 in `worker/beacon.js`, owner-tunable) is a runaway bound rather than a quota to
 advertise — so it is deliberately absent from the catalog and the page. A caller
 that already paid cannot buy its way past it, and answering "pay to continue"
-would be a lie; it gets the plain rate-limit answer with a `Retry-After`.
+would be a lie; it gets the plain rate-limit answer with a `Retry-After`. It is
+claimed only *after* the facilitator returns `isValid` — *changed 2026-08-18*,
+when the mere **presence** of an `X-PAYMENT` header still unlocked it, which let
+any caller who could type a header buy a 500× higher ceiling for nothing.
+
+And the invariant that has not changed: **nothing is ever fake-verified.**
+`x-payment-verified: true` appears only after a facilitator round trip that
+returned `isValid`. There is no code path that infers it from a header.
+
+#### `env FREE_TIER_DAILY=N`
+
+With the var set, the legacy matrix applies and **the paywall moves to call
+N + 1**. The first N calls per caller per UTC day are simply served, carrying
+`x-free-tier-remaining: <n>`; a payment presented inside the tier is neither
+checked nor charged and the response says so with `x-payment-verified: false`;
+and with `PAYTO` unset, call N + 1 gets the legacy 429 body — `{"error": "free
+tier is N conversions per day per caller", "free_tier_daily": N, …}` — with a
+`Retry-After` to the next UTC midnight, byte for byte as before.
+
+The ordering rule behind it is the same one it always was, expressed as control
+flow rather than as a promise: **the free allowance is claimed first**, before
+anything looks at `X-PAYMENT`, so a caller with allowance left is never verified
+and never billed, and the facilitator is not called at all.
+`test/x402-settlement.test.mjs` asserts that as **zero** calls to the
+facilitator rather than as a header.
 
 The page publishes the same thing in plain language under **Pricing, and paying
-with USDC** — the free tier and its IP-keyed counter, what the 402 carries, the
-two things an agent needs (an x402-capable HTTP client and a wallet key holding
-USDC on Base), a copy-able `x402-fetch` example, and an honest-status box. The
-MCP server's `toolshed_convert` explains both a 402 and a 429 rather than
-returning a bare error.
+with USDC** — that there is no trial and nothing to sign up to, what the 402
+carries, that you are charged only for served conversions, the two things an
+agent needs (an x402-capable HTTP client and a wallet key holding USDC on Base),
+a copy-able `x402-fetch` example, and an honest-status box. The MCP server's
+`toolshed_convert` explains both a 402 and a 429 rather than returning a bare
+error.
 
 The envelope (`x402Version: 1`) advertises `scheme: exact`, `network: base` and
 `asset` = USDC on Base (`0x8335…2913`). `maxAmountRequired` is in atomic units,
@@ -482,23 +607,113 @@ The envelope (`x402Version: 1`) advertises `scheme: exact`, `network: base` and
 atomic conversion happens in the Worker, so changing the price is a one-line
 content edit.
 
-Set it for a local test without editing the file:
+Set it for a local test without editing the file. Nothing has to be spent first
+— the very first call answers the envelope:
 
 ```bash
 npx wrangler dev --local --port 8787 --var PAYTO:0xTEST
+curl -isX POST http://localhost:8787/convert/md-html --data-binary '# hi'
 ```
 
-Exercising the 402 needs the free tier spent first — eleven calls, or a
-`DELETE FROM convert_quota` between runs:
+To exercise the *other* configuration locally, add the tier var — and clear the
+counter between runs, because it is per caller per UTC day:
 
 ```bash
+npx wrangler dev --local --port 8787 --var PAYTO:0xTEST --var FREE_TIER_DAILY:3
 npx wrangler d1 execute DB --local --command "DELETE FROM convert_quota;"
 ```
 
+### Re-enabling the free tier
+
+Three steps, and all three or the site lies about itself — the Worker and the
+static copy read different sources on purpose, so that a dashboard flip can take
+effect without a rebuild:
+
+1. **Set the Worker var** `FREE_TIER_DAILY = "N"` — uncomment it in
+   `wrangler.toml`'s `[vars]` block, or set it in the dashboard. This is what
+   actually enforces the tier, and it takes effect on the next request.
+2. **Set the build constant** `FREE_TIER_DAILY` in `build.mjs` to the same `N`,
+   then `npm run build`. This is what the page, `catalog.json`, `llms.txt`,
+   `llms-full.txt` and `openapi.json` advertise. Every piece of that copy
+   branches on the constant, so both states render honestly; the build prints
+   which one it just wrote.
+3. **Redeploy both** — `npx wrangler deploy` for the Worker *and* the Pages site
+   for the static surfaces. One without the other is the drift step 1 and 2
+   exist to avoid.
+
+`GET /check` reports the runtime value throughout, so it is the field to check
+after step 1 and the tie-breaker if the two halves ever disagree.
+
+> **The cost, which is not obvious.** A free tier serves any fresh IP a **200**,
+> and that fails the `returns_402` preflight Coinbase's Bazaar index runs. The
+> index **health-probes on an interval**, so this does not merely block a new
+> listing — it **delists an existing one**. Turning the tier back on trades
+> discovery for a trial allowance, which is precisely the trade that was made in
+> the other direction on 2026-08-19.
+
+## Discoverability (Bazaar)
+
+The 402-first shape is not an aesthetic preference. Coinbase's **Bazaar** is a
+discovery index of x402 resources, and it lists a resource by probing it: an
+unauthenticated request has to come back **402**, carrying a spec-valid envelope
+whose `outputSchema.input.discoverable` is `true`. Nothing else on this service
+is a marketing surface for machines; this is.
+
+Validate a deployed resource:
+
+```bash
+curl -X POST https://api.cdp.coinbase.com/platform/v2/x402/validate \
+  -d '{"resource":"https://toolshed.lemon-agent.dev/convert/md-html","method":"POST"}'
+```
+
+It checks three things: that the resource answers 402 to an unauthenticated
+request, that the envelope is spec-valid, and that
+`outputSchema.input.discoverable` is set. **It probes PUBLIC URLs**, so it
+cannot be pointed at `wrangler dev` and cannot run in the local suite. The split
+is deliberate: the envelope's *shape* — `outputSchema`, `discoverable` inside
+`input`, per-tool `mimeType`, descriptions under the facilitator's 500-character
+limit — is asserted locally in `test/tier-off.test.mjs` and `test/x402.test.mjs`,
+and the validator is a **post-deploy re-check** against the real origin.
+`npm run test:live:full` asserts the same envelope shape against production
+without spending anything.
+
+Two details that are silent when wrong:
+
+- **`discoverable` lives inside `outputSchema.input`.** Hoisting it to the top
+  level of the envelope produces something that is still spec-shaped and still
+  passes every other assertion — and is simply never indexed.
+- **These are v1 field names**, copied from a resource already carrying an x402
+  v1 listing, so there is no v2 migration to do.
+
+Indexing is **automatic after one settled paid call**. The settle body carries
+`resource`, which is how the Bazaar attaches a settlement to a listing — and
+because an x402 client is not obliged to echo `resource` back (`x402-fetch` does
+not), `settleAndRecord()` fills it in from the envelope's own value. It is spread
+in rather than assigned, so a client that *did* send one keeps its own, and it is
+deliberately absent from the **verify** call: verify is the signature check and
+must see byte-for-byte what arrived. `resource` is envelope metadata and is not
+covered by the EIP-712 signature, so adding it at settle time cannot invalidate
+anything.
+
+Two static files support the same job, both written by `npm run build` into
+`dist/` and served by Pages **at the origin**, where a real file beats the SPA
+fallback:
+
+| file | why |
+| --- | --- |
+| `/openapi.json` | OpenAPI 3.1 — `x402scan` and friends expect it at exactly `GET {origin}/openapi.json`. It describes `GET /check` and one `POST /convert/{id}` per live tool, with the 200, 400, 402, 413, 429 and 503, and the x402 envelope schema. A document that listed only the 200 would be worse than none: the 402 is the interesting response |
+| `/robots.txt` | allow all. It exists so a prober gets a real 200 rather than the SPA fallback, which is indistinguishable from a misconfigured site to anything that checks |
+
+Both are linked from the site nav and the footer. A test asserts that the 200
+content type `openapi.json` documents equals the `mimeType` the live envelope
+advertises, per tool — the two are generated by different files and can drift,
+and a machine that reads one and calls the other has no way to tell which is
+wrong.
+
 ## Settlement (live)
 
-Past the free tier, a payment is now **checked before the conversion is served
-and settled on chain immediately afterwards**, through the Coinbase CDP
+A payment presented against the 402 envelope is **checked before the conversion
+is served and settled on chain immediately afterwards**, through the Coinbase CDP
 facilitator.
 
 > **Status.** Live and proven with real money. On **2026-08-18** a real payment
@@ -513,7 +728,7 @@ facilitator.
 
 ```text
 caller ──POST /convert/x, X-PAYMENT──▶ Worker
-                                        │  free tier gone? and PAYTO set?
+                                        │  PAYTO set? (and no free tier to claim)
                                         ▼
                                       POST <facilitator>/verify     (2 s cap)
                                         │
@@ -551,7 +766,35 @@ recorded as `settle_ok = 0`.
 once in `paymentRequirements()` and used by both, because the client signs
 against what the envelope said and the facilitator recovers that signature from
 what we send. Any field that differs between the two turns a perfectly good
-payment into `invalid_exact_evm_payload_signature`.
+payment into `invalid_exact_evm_payload_signature`. The suite asserts that
+identity field-for-field rather than trusting the shared call site.
+
+The one field the **settle** payload carries that the verify payload does not is
+`resource`, filled in from the envelope when the client omitted it. See
+[Discoverability (Bazaar)](#discoverability-bazaar) for why it is there, and why
+verify is deliberately left untouched.
+
+### `outputSchema` — what makes a resource indexable
+
+The envelope carries a per-tool `outputSchema`, in v1 field names:
+
+```json
+"outputSchema": {
+  "input":  { "type": "http", "method": "POST", "discoverable": true,
+              "bodyType": "text",
+              "description": "the raw Markdown file as the request body, up to 256 KB" },
+  "output": { "type": "string",
+              "description": "the converted HTML file as the response body (text/html)" }
+}
+```
+
+The formats come from `inputFormat` / `outputFormat` on each `CONVERTERS` entry,
+so a new hosted tool describes itself. It says `bodyType: "text"` and describes
+the body in a sentence because that is what these tools actually take — a raw
+file, not a JSON object of named fields; inventing an input object would
+advertise a calling convention that fails on first use. Descriptions are asserted
+at **≤ 500 characters**, which is the facilitator's limit: an over-long
+description is not a cosmetic problem, it is an unpayable envelope.
 
 ### The dependency decision: no new production dependency
 
@@ -612,7 +855,7 @@ Note `"USD Coin"`, not `"USDC"`: on Base mainnet the token's `name()` differs
 from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
 `"USDC"` — if this ever runs on testnet, that value changes.)
 
-### Response headers, past the free tier
+### Response headers on the payment path
 
 | header | meaning |
 | --- | --- |
@@ -620,7 +863,7 @@ from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
 | `x-payment-verified: false` | nothing was checked — see `x-payment-error` |
 | `x-payment-error: facilitator-unreachable` | timeout, network failure, or a non-200 from the facilitator |
 | `x-payment-error: facilitator-unconfigured` | no CDP credentials on this Worker. Operator fault, not caller fault |
-| `x-pricing: pending` | served over the tier without a verified payment |
+| `x-pricing: pending` | served without a verified payment |
 
 The **ledger** keeps the precise reason (`facilitator-timeout`,
 `facilitator-http-503`, …) because that is what you debug from; the **header**
@@ -667,11 +910,22 @@ npm run buyer:pay -- --dry-run
 npm run buyer:pay -- --yes
 ```
 
-**What step 4 actually costs:** one $0.001 USDC payment, *plus* today's free
-tier for whatever IP you run it from — up to 3 throwaway conversions. The paid
-path is unreachable until the free tier is spent (that is the design), so the
-script burns it first and says so, call by call. It then signs, pays, and prints
-the status, `x-payment-verified`, and where to confirm the money moved.
+**What step 4 actually costs:** one $0.001 USDC payment, and there is no free
+tier to burn through to reach it — the first call answers 402 and the script
+pays immediately. It makes one unpaid probe first, purely to read the envelope
+it is about to sign against, and refuses to spend anything if that envelope is
+wrong (bad `extra`, missing `outputSchema.input.discoverable`, an over-long
+description); every problem is printed together rather than one per redeploy.
+Then it signs, pays, and prints the status, `x-payment-verified`, and where to
+confirm the money moved.
+
+It then makes **one more signed call with malformed input**, to check the
+"charged only for served conversions" claim against the real facilitator: a
+correct Worker answers 400 and settles nothing, so that probe costs $0.000. If it
+costs $0.001 it has found the bug it went looking for. `--skip-400-check` opts
+out; worst case for a whole run is $0.002. If the deployment it is pointed at
+answers 200 to the unpaid probe — a free tier is enabled — the script stops
+rather than burning through the tier to reach the paid path.
 
 The key in `.buyer.env` is a **plaintext private key on disk**. That is fine for
 a key holding a dollar and catastrophic for one holding anything else — fund it
@@ -686,16 +940,28 @@ with the minimum that proves the path, and treat the file as burnable.
    `tx_hash` (`0xe2c8bb8d…`).
 3. The $0.001 landed at the `PAYTO` address.
 
-The box now says payment is live and verified. **The rule holds in reverse, and
-that is the part worth keeping**: if settlement ever breaks — a run of
-`verify_ok = 0` in `settlements`, a facilitator outage that stops being
-transient, a revoked CDP key — the box goes back to naming what is broken,
-before anything else is fixed. "The code is written and the tests pass" is not
-the same claim as "money has moved", and the box exists to not blur the two in
-either direction.
+**Rewritten 2026-08-19** when the tier was retired. The box now says, on the
+free-tier-off branch, that the free tier is **switched off** — every conversion
+is a paid call, at $0.001 — and that payment is **live and verified**: a payment
+presented against the 402 envelope is checked with the Coinbase CDP facilitator
+before the conversion is served, a verified call comes back with
+`x-payment-verified: true`, and it settles on Base immediately afterwards. If the
+facilitator cannot be reached, the call is served anyway and says so with
+`x-payment-error` — at $0.001 the price is a signal, and an outage on our side
+should not turn a paying caller away.
 
-The copy lives in `<div class="status-box">` in `build.mjs`, with a short
-comment above it recording the flip.
+**The rule holds in reverse, and that is the part worth keeping**: if settlement
+ever breaks — a run of `verify_ok = 0` in `settlements`, a facilitator outage
+that stops being transient, a revoked CDP key — the box goes back to naming what
+is broken, before anything else is fixed. "The code is written and the tests
+pass" is not the same claim as "money has moved", and the box exists to not blur
+the two in either direction.
+
+The copy lives in `<div class="status-box">` in `build.mjs`, in **both**
+branches of `FREE_TIER_ON` — live code, not one branch and one comment, because
+the re-enable runbook depends on the generator being able to render either state
+truthfully. The comment above it keeps the 2026-08-18 flip record and appends the
+2026-08-19 retirement.
 
 ## Shutdown runbook
 
@@ -769,18 +1035,22 @@ npx wrangler d1 execute DB --remote --command "
   GROUP BY entry ORDER BY conversions DESC, clicks DESC LIMIT 40;"
 ```
 
-**Free-tier pressure** — the number that says whether 3/day is the right number.
-`hit_the_ceiling` counts callers that spent the whole tier, so a rising share is
-the signal to raise `FREE_TIER_DAILY` — or evidence that the paid tier is doing
-its job (the `3` in this query has to match it):
+**Per-caller conversion pressure.** `convert_quota` holds one row per caller per
+day counting calls that were actually **served**, so with the free tier off this
+is a table of paying callers. `hit_the_ceiling` counts callers that reached
+`PAID_DAILY` — a runaway bound, so a non-zero number is a caller worth looking
+at rather than a pricing signal (the `5000` in this query has to match
+`PAID_DAILY` in `worker/beacon.js`). On a deployment that has enabled a free
+tier, the same query against the tier width is what says whether it is the right
+width:
 
 ```bash
 npx wrangler d1 execute DB --remote --command "
   SELECT day,
-         COUNT(*)        AS callers,
-         SUM(used)       AS conversions,
-         SUM(used >= 3)  AS hit_the_ceiling,
-         MAX(used)       AS busiest_caller
+         COUNT(*)           AS callers,
+         SUM(used)          AS conversions,
+         SUM(used >= 5000)  AS hit_the_ceiling,
+         MAX(used)          AS busiest_caller
   FROM convert_quota
   GROUP BY day ORDER BY day DESC LIMIT 30;"
 ```
@@ -826,7 +1096,7 @@ npx wrangler d1 execute DB --remote --command "
 ```
 
 Only today's `convert_quota` row is ever read, so pruning it is free of
-consequences — it is kept the 90 days purely so the free-tier pressure query
+consequences — it is kept the 90 days purely so the per-caller pressure query
 above has a history to plot.
 
 **Blocklist expiry — enforced in the operator query, not by a cron.** Rows
@@ -855,14 +1125,16 @@ the same argument.
 |---|---|---|---|
 | 0 | Cloudflare edge | REACTIVE — free WAF custom rule blocking blocklist IPs (`ip.src in {…}`), populated from the `blocklist` table; the planned rate-limiting rule is unavailable on this account's plan (owner-verified 2026-08-18) | nothing blocks a first-seen IP at the edge; the in-Worker tiers below are the standing bound, and abuse is blocked at the edge only after it is identified |
 | 1 | Worker | 100 events / identifier / UTC day — **`/b` only**; convert rows are excluded from the count | honest runaway client stops being counted; UA rotation still mints fresh identifiers, which is a measurement cost, not a spend |
-| 1c | Worker | **3 conversions / caller / UTC day** (`FREE_TIER_DAILY`), or 5,000 once a payment has been **verified** by the facilitator (changed 2026-08-18 — presenting a header is no longer enough) | over-tier callers get 402 or 429; the key is the IP hash, so UA rotation does **not** mint a fresh allowance |
+| 1c | Worker | **5,000 SERVED conversions / caller / UTC day** (`PAID_DAILY`), claimed only once a payment has been **verified** by the facilitator (changed 2026-08-18 — presenting a header is no longer enough). Optionally, `env FREE_TIER_DAILY = N` puts a free tier of N/caller/day on the same counter and the same key; unset (the default) means no tier | unpaid callers get 402 (or 429 with no `PAYTO`) without touching this counter at all; a caller past the ceiling gets 429 + `Retry-After`. The key is the IP hash, so UA rotation does **not** mint a fresh allowance |
 | 2 | Worker | 200,000 events / UTC day, fail-closed before insert | metrics loss and no conversions for the rest of the day |
 | 3 | — | none; priced, not bounded — $2.49/day at 100 req/s, $25.82/day at 1,000 req/s | detective only: $25 alert + shutdown runbook |
 
-Rung 0 is configured in the dashboard (deploy step 6), not in this repo. It is
-the zone's only Free rate-limiting rule, so a second instrumented house surface
-on `lemon-agent.dev` contends for it. **Its expression must cover `/convert/*`
-as well as `/b`** — the expression is in the deploy runbook above.
+Rung 0 is configured in the dashboard, not in this repo — and it is the
+REACTIVE control the table says it is: a free WAF custom rule blocking IPs
+already in the `blocklist` table. The rate-limiting rule the dossier planned
+here is unavailable on this account's plan (owner-verified 2026-08-18, deploy
+runbook deviations above); nothing proactive runs at the edge, and the
+in-Worker rungs are the standing bound.
 
 Rungs 1 and 2 execute inside the Worker, so a request they reject is already
 billed. CPU is metered separately from requests, which is why
@@ -874,9 +1146,9 @@ flag from the previous pass, closed. Rung 1 counts `events` rows
 `WHERE type <> 'convert'`, and conversions are metered by `convert_quota`
 instead, so:
 
-- A caller that loads the page five times still has all 3 conversions. A caller
-  that spends all 3 conversions is still counted as a visitor. Neither budget
-  reaches into the other.
+- A caller that loads the page five times still has its whole conversion
+  ceiling. A caller that converts all day is still counted once as a visitor.
+  Neither budget reaches into the other.
 - Conversions still write an `events` row — that is measurement, not
   rate-limiting: what got called, and which tool. The input is never written.
 - The two identities differ on purpose. `events.id_hash` is
@@ -906,12 +1178,17 @@ user-agents are dropped before any write. That filter applies to `/b`; a
 conversion call is counted whatever its user-agent claims, because it is a real
 call rather than an audience measurement.
 
-Two stores, two subject-rights answers, both stated on the page: the counting
+Three stores, three subject-rights answers, all stated on the page: the counting
 store holds a truncated daily-salted hash and nothing attributable once the salt
-rotates; the IP blocklist is attributable and is purged on request. The
-free-tier counter belongs to the first store, and the page says so in *How we
-count* in one line: keyed on a daily-salted hash of the IP alone (no
-user-agent), unlinkable across days, same retention as the other counters.
+rotates; the **settlements ledger** holds one row per payment attempt, including
+the paying wallet address and the transaction hash, and is deliberately *not*
+salted away nightly, because a payment ledger you cannot reconcile is not a
+ledger; the IP blocklist is attributable and is purged on request. The
+`convert_quota` counter belongs to the first store, and the page says so in *How
+we count* in one line: a daily ceiling on served calls, keyed on a daily-salted
+hash of the IP alone (no user-agent), unlinkable across days, same retention as
+the other counters — and an unpaid call never reaches it, because the 402 is
+answered before anything is read or written.
 
 **Conversion inputs are never stored.** The `events` row records that a call
 happened, which tool it used, and the day-scoped hash — never the body. The page
@@ -926,17 +1203,24 @@ recomputable forever, which is the negation of discarded-at-rotation.
 
 ## Testing
 
-Two commands, and the split between them is about **cost**, not about depth:
+Two commands, and the split between them is about **what each one can see** —
+the converter, or the deployed gate in front of it:
 
 ```bash
 npm test           # the whole suite, LOCAL ONLY — touches nothing deployed
-npm run test:live  # the production smoke — spends AT MOST ONE free conversion
+npm run test:live  # the production smoke — serves nothing, spends nothing
 ```
 
-`npm test` is the real coverage: 192 tests across nine files, per-tool fixture
-batteries plus the protocol, quota, spoof-resistance, x402 and beacon contracts.
-It never speaks to production and it never needs a Cloudflare login. Framework
-is `node:test` — no test dependency was added, and none is wanted.
+`npm test` is the real coverage: **225 tests across eleven files**, per-tool
+fixture batteries plus the protocol, quota, spoof-resistance, tier-off, x402,
+settlement and beacon contracts. It never speaks to production and it never needs
+a Cloudflare login. Framework is `node:test` — no test dependency was added, and
+none is wanted.
+
+Neither costs anything. It used to be a budget question — the live run spent the
+caller's free allowance — and it is not any more: with no free tier, every unpaid
+probe against production stops at the 402, so the live commands serve nothing and
+spend nothing however often they are run.
 
 Writing it found two real defects, both fixed in `worker/beacon.js` and both now
 carrying a named regression test: a CSV column headed `__proto__` was **silently
@@ -954,12 +1238,38 @@ test/convert-yaml-json.test.mjs   block scalars, anchors, comments, tabs
 test/convert-csv-json.test.mjs    the RFC 4180 battery
 test/convert-html-markdown.test.mjs
 test/protocol.test.mjs            /check, method and routing guards, 413, /b
-test/quota.test.mjs               the free tier and its spoof resistance
+test/quota.test.mjs               the env-gated free tier and its spoof resistance
+test/tier-off.test.mjs            the PRODUCTION default — 402 first, and it writes nothing
 test/x402.test.mjs                the 402 envelope, and PAYTO set with no facilitator
 test/x402-settlement.test.mjs     verify/settle against a mock facilitator + a real client
 test/beacon.test.mjs              rows, bot drops, salt rotation
 test/live.smoke.mjs               the production smoke (`npm run test:live`)
 ```
+
+**What the tier retirement added.** `tier-off.test.mjs` is new, and the coverage
+it carries is the coverage that did not exist while a free tier absorbed the
+first call:
+
+- the first call is a 402, **per live tool**, with no `x-free-tier-remaining`
+  header anywhere;
+- the 402 writes **nothing** — `events`, `convert_quota` and `settlements` row
+  counts are read before and after five probes and must be identical;
+- the 413 fires before the 402, and the 404 / 405 guards fire before both — an
+  unknown id must not become "pay me first";
+- `/check` reports `free_tier_daily` **0**, present rather than absent (in
+  phase 1 the same field reads 3, which is the other half of the claim);
+- alias matching resolves `md`, `.md`, `text/markdown`, `yml`, `.yaml`,
+  `text/html`, `text/csv` and `application/json`, plus a guard that aliasing
+  never crosses the have/need field binding;
+- a **negative** and an **unparseable** `FREE_TIER_DAILY` both read as 0 —
+  a misconfigured var fails towards charging;
+- the no-`PAYTO` 429 carries no `Retry-After`;
+- `openapi.json`'s documented 200 content type equals the `mimeType` the live
+  envelope advertises, per tool.
+
+In `x402-settlement.test.mjs`: the 400-not-settled regression plus its positive
+control (a payment that *is* served does settle, so the test cannot pass by the
+settle path being broken), and settle-carries-`resource`.
 
 ### The fresh-state guarantee
 
@@ -967,8 +1277,9 @@ Every phase of a run boots its own `wrangler dev --local` against its own
 `--persist-to` directory under the OS temp dir, with `worker/schema.sql` applied
 to it **before** the server starts, and deletes that directory on teardown. Two
 runs cannot see each other's rows, and no run can see the demo database in
-`.wrangler/`. That is what lets the free-tier assertions be exact — "the 11th
-call is refused", not "some call is eventually refused".
+`.wrangler/`. That is what lets the counting assertions be exact — "the 4th call
+is refused" and "these five 402s wrote zero rows", not "some call is eventually
+refused" and "not many rows were written".
 
 Teardown kills the process **group**. `wrangler dev` spawns two `workerd`
 children, so killing the node process alone orphans them and leaks the port; the
@@ -977,21 +1288,53 @@ escalating to `SIGKILL`, plus a best-effort sweep on process exit.
 
 ### Why there are three phases
 
-Dev vars change the product's answer past the free tier — with `PAYTO` unset it
-is a 429, with `PAYTO` set it is a 402 envelope, and with a facilitator
-configured it is a verified payment — and a dev var is fixed for the life of a
-`wrangler dev` process. So `npm test` runs them in turn:
+Two dev vars decide what the product answers, and a dev var is fixed for the life
+of a `wrangler dev` process, so each configuration needs its own worker:
+
+- **`FREE_TIER_DAILY`** — unset (production) means every call is a paid call and
+  the *first* unauthenticated call is the 402; set to N means the legacy free
+  tier of N calls per caller per UTC day.
+- **`PAYTO`** — unset means a 429 where a 402 would otherwise go, because there
+  is nowhere to pay.
+
+So `npm test` boots three workers and runs them in turn:
 
 | phase | vars | files |
 | --- | --- | --- |
-| 1 | none | everything except the two x402 suites |
-| 2 | `PAYTO` | `x402.test.mjs` — the envelope, and a half-configured deploy |
-| 3 | `PAYTO` + `FACILITATOR_URL` + fake CDP keys | `x402-settlement.test.mjs` |
+| 1 — `free tier enabled` | `FREE_TIER_DAILY=3`, `PAYTO` unset | the five convert fixture suites, `protocol`, `quota`, `beacon` |
+| 2 — `production default` | `PAYTO` set, no tier | `tier-off.test.mjs`, `x402.test.mjs` |
+| 3 — `settlement` | `PAYTO` + `FACILITATOR_URL` + fake CDP keys | `x402-settlement.test.mjs` (standalone) |
 
-Phase 3 is marked `standalone` in `test/run.mjs`: it runs a mock facilitator on
-a port it only learns at startup, and `FACILITATOR_URL` has to name that port,
+**Phase 1 boots the tier on purpose, for two different reasons.** `quota.test.mjs`
+is there because the tier *is* what it asserts — countdown, UA-rotation
+resistance, per-caller-not-per-tool — and that mechanism is env-gated now rather
+than gone, so it is kept tested rather than allowed to rot into dead code. It
+keeps every assertion it ever had. The fixture suites are there for a duller
+reason: they need conversions actually **served**, and with no facilitator and no
+wallet in the loop a free tier is the only free way to be served. `beacon.mjs`
+runs last because it rotates the shared salt, which re-keys every
+`convert_quota` row — harmless afterwards, confusing before.
+
+**Phase 2 is what `toolshed.lemon-agent.dev` actually runs.** It is also the
+configuration Coinbase's Bazaar probes, which is why the first-call-is-402 claim
+lives here rather than being inferred from phase 1's absence.
+
+**Phase 3 is marked `standalone`** in `test/run.mjs`: it runs a mock facilitator
+on a port it only learns at startup, and `FACILITATOR_URL` has to name that port,
 so the worker cannot be booted before the mock exists. The suite boots its own —
-on its own fresh D1, like every other phase.
+on its own fresh D1, like every other phase — with the tier off. The `exhaust()`
+helpers that used to open every x402 and settlement test are gone: the first call
+is now the 402, so each test simply makes its call. That simplified the setup
+without weakening a single assertion.
+
+**A file joins the phase's worker only when the WHOLE var set matches.**
+`useWorker({ payTo, vars })` compares against `TOOLSHED_TEST_VARS`, which
+`run.mjs` exports as the phase's canonically-ordered var set. It used to compare
+`PAYTO` alone, which was enough while that was the only var that changed
+behaviour; once `FREE_TIER_DAILY` became the var deciding whether the first call
+is a 200 or a 402, a file joining a differently-configured worker would have
+failed in a way that looked like a product bug. A file whose config does not
+match boots its own.
 
 The CDP credentials it uses are **structurally real and worth nothing**: a
 freshly generated Ed25519 keypair, base64-encoded the way CDP encodes a Secret
@@ -1020,18 +1363,20 @@ fails this test (measured, not assumed).
 
 ### Running one suite
 
-Any file works on its own — it boots its own worker when the runner has not
-already exported one, so there is nothing to set up:
+Any file works on its own — each one names the configuration it needs in
+`before()`, and boots its own worker when the runner has not exported a matching
+one, so there is nothing to set up:
 
 ```bash
-node --test test/quota.test.mjs
+node --test test/quota.test.mjs        # boots FREE_TIER_DAILY=3 for itself
+node --test test/tier-off.test.mjs     # boots PAYTO, no tier, for itself
 node --test test/convert-csv-json.test.mjs
-npm test csv                       # or filter the runner by substring
+npm test csv                           # or filter the runner by substring
 ```
 
 ### `cf-connecting-ip`, and why the quota tests work at all
 
-The free-tier counter is keyed on `hash(daily salt + IP)`, read from
+The per-caller conversion counter is keyed on `hash(daily salt + IP)`, read from
 `request.headers.get('cf-connecting-ip')`. **`wrangler dev --local` passes that
 header straight through from the client** — verified empirically against
 wrangler 4.42.2: three POSTs to `/convert/md-html` carrying `cf-connecting-ip`
@@ -1041,9 +1386,10 @@ one row at `used = 3`.
 
 So every virtual caller in the suite is just a header value, and per-test
 isolation costs nothing: each suite owns a band of `198.18.<octet>.<n>`
-addresses (`SUITE_OCTET` in `test/harness.mjs`), fixture tests take a fresh
-address per call so quota is never in play, and the quota and x402 suites pin
-addresses deliberately so they can exhaust one.
+addresses (`SUITE_OCTET` in `test/harness.mjs`), most tests take a fresh address
+per call so no counter is ever in play, and `quota.test.mjs` pins addresses
+deliberately so it can spend one caller's allowance down to zero and assert the
+refusal lands on the exact call it should.
 
 In production the header comes from the edge and a client cannot forge it. There
 is no edge in front of `wrangler dev`, which is exactly what makes it usable as
@@ -1051,26 +1397,28 @@ a test control.
 
 ### The live smoke
 
-`npm run test:live` checks that what is deployed is the same product, on a
-strict budget: **at most one free-tier conversion**, and it never depends on how
-much allowance is left. It asserts the `/check` contract, fetches
-`catalog.json` / `llms.txt` / `llms-full.txt` and sanity-checks their shape
-(including that `catalog.json` and `/check` agree about what is hosted), then
-makes exactly one conversion — accepting **200**, **402** (paid gate live, tier
-spent) or **429** (tier spent with no receiving address, or the paid ceiling) as
-passes, labelled differently, so a repeat run on a spent day still tells the
-truth. The remaining checks are
-refusals (405, 404), which reach no counter.
+`npm run test:live` checks that what is deployed is the same product, and against
+production its budget is **zero**: the one conversion it posts stops at the 402,
+so no converter runs and nothing is charged. It never depends on quota state, so
+it can be repeated as often as you like and still tell the truth. It asserts the
+`/check` contract, fetches `catalog.json` / `llms.txt` / `llms-full.txt` and
+sanity-checks their shape (including that `catalog.json` and `/check` agree about
+what is hosted), then makes exactly one `POST /convert/md-html` — accepting
+**402** (the production answer), **200** (a deployment running with
+`FREE_TIER_DAILY` set; the converter output is then checked) or **429** as
+passes, labelled differently. It tells the two 429s apart by the header: no
+`Retry-After` means no receiving address is configured, a sane one means this
+caller hit the daily paid ceiling. The remaining checks are refusals (405, 404),
+which reach no counter.
 
 ```bash
 npm run test:live
 TOOLSHED_URL=http://localhost:8787 npm run test:live
 ```
 
-`npm run test:live:full` is the older `scripts/test-live.mjs`: the whole surface
-plus a cost estimate, but it **spends the caller's whole 3/day allowance**, and
-its remaining convert calls land on the paywall by design. One run a day per IP.
-Its `--quota` probe burns the day on purpose.
+`npm run test:live:full` is the wider `scripts/test-live.mjs`: the whole public
+surface plus a cost estimate. It serves no conversions and spends nothing either,
+but it makes about twenty requests, so it paces itself — see § Maintenance.
 
 ## Maintenance
 
@@ -1079,79 +1427,88 @@ a PR. `build.mjs` prints a `STALE` warning for any entry whose `verified` date i
 more than 35 days old and marks it *review due* on the page, so staleness is
 visible in the build rather than discovered by a reader.
 
-`scripts/test-live.mjs` posts a known payload to every hosted endpoint and
-asserts a distinctive substring came back, so a rotted converter shows up as a
-red row rather than as a broken product.
+`scripts/test-live.mjs` reads the **public gate** on the deployed service and
+asserts it in detail. It sends no `X-PAYMENT` header at any point, so every
+`/convert` probe stops at the paywall: **zero conversions served, zero USDC
+spent, and no meter moved past a couple of dozen requests.**
 
 ```bash
 npm run test:live:full                            # production
 node scripts/test-live.mjs http://localhost:8787  # against wrangler dev --local
-node scripts/test-live.mjs --quota                # the free-tier probe, opt-in
 ```
 
-It covers `GET /check` with and without parameters, all five happy-path
-conversions, a malformed-input `400`, a `413` at 300 KB, and a `POST /b` visit —
-then prints a PASS/FAIL table and exits non-zero on any failure. Zero
-dependencies; Node 18+ for global `fetch`.
+`--quota` and `--tools=` are gone. Neither has anything left to do: there is no
+free-tier ledger to walk, and no three scarce served slots to re-point.
 
-**A default run spends all 3 of the caller's free conversions, and is
-deliberately wider than the tier.** Seven calls reach `/convert`: five happy
-paths, a malformed-input case (which claims its free call before the body is
-read) and the 413 (rejected on the declared size, before any D1 work — it costs
-nothing). Only the first **3** can be served, so the run is written as a ledger:
+It covers `GET /check` with and without parameters, the alias rows (`md`, `.md`,
+`text/markdown`, `yaml`, `.yml` → `application/json`), an unknown format
+returning an empty answer rather than an error, `catalog.json` / `llms.txt` /
+`llms-full.txt` / `openapi.json` / `robots.txt`, **one 402-envelope assertion per
+live tool**, a `413` at 300 KB, and a `POST /b` visit — then prints a PASS/FAIL
+table and exits non-zero on any failure. Zero dependencies; Node 18+ for global
+`fetch`.
 
-- Calls 1–3 must be **200**, with the converter's own output and
-  `x-free-tier-remaining` counting down **2 → 1 → 0** exactly.
-- Every `/convert` call after them is over the tier, where the paywall is the
-  **correct** answer. The run asserts that transition at exactly the call the
-  tier runs out on — a **402** with a spec-shaped x402 envelope, or a **429**
-  with the documented free-tier body where `PAYTO` is unset. Those rows pass
-  because the *gate* is right, and each one says the converter behind it was
-  **not exercised** this run. They are not converter passes.
+The envelope assertion is the core of the run, because it is the exact JSON a
+paying agent reads before it signs anything: the fields a signature is computed
+over (`network`, `scheme`, `asset`, `extra`) and the fields that identify the
+tool (`resource`, `mimeType`) are pinned exactly; `outputSchema.input.discoverable`
+must be `true`; every `description` at any depth must be ≤ 500 characters; and no
+two tools may claim the same description, which is how "the envelopes are
+per-tool" is checked rather than assumed. Price and timeout are only
+sanity-checked, because they are owner-tunable and pinning them would turn a
+config change into a red row that says nothing.
 
-So only the first three converters in the list get live coverage on a given day.
-`--tools=<id,...>` re-points the three scarce slots at the converters you
-actually changed; the local suite (`npm test`) is what covers all five, plus the
-malformed-input case, unconditionally.
+**What a green row here does not say.** No converter runs on a 402 path, so a
+pass means *the gate is right* — it says nothing about the tool behind the gate.
+Converter coverage is `npm test` (local, free). Paid-path coverage is
+`scripts/pay-test.mjs` (owner-only, real USDC). None of the three substitutes for
+another.
 
-**A second run in the same UTC day from the same IP fails on its first
-conversion**, saying the tier was already spent rather than blaming a converter.
-
-`--quota` is the free-tier probe and is **not** part of the default run, because
-it deliberately burns the day: 5 beacons, 3 conversions, one over, then three
-more under rotated user-agents. It asserts, in order, that beacons do not touch
-the conversion budget, that `x-free-tier-remaining` counts 2 → 0, that call 4 is
-refused with the documented 429 body and a sane `Retry-After` (or a 402 envelope
-when `PAYTO` is set), and that rotating the user-agent from the same IP changes
-nothing. It needs a caller whose allowance is untouched today, and it paces
-itself at 2.5 s against a remote host so rung 0 does not block it first (no
-pause against localhost).
+It does not assume the tier is off, either. `GET /check` publishes the runtime
+value, and a deployment with `FREE_TIER_DAILY` set will serve a probe: those rows
+are **relabelled** rather than quietly asserting the wrong contract, and the run
+prints a loud NOTES block under the table saying a free tier is enabled and that
+the run is no longer free of served conversions. The same treatment applies to a
+deployment with no receiving address. It paces itself at 2.5 s per request
+against a remote host, so a run of twenty cannot look like a tight loop to
+anything at the edge; there is no pause against localhost.
 
 After the table it prints a **cost estimate** from named constants with the
 arithmetic shown — Workers requests and CPU, D1 rows written, the assumed 2 ms
-per conversion — the cost of the run just made (≈ $0, every meter inside its
-allowance), and a table of monthly cost at 1k / 10k / 100k / 1M calls a day.
-Requests are the allowance that cracks first, at roughly 333k calls/day
-(10M req/mo); at 1M calls/day the metered charge is about $16.60/month on top of
-the flat plan fee. Everything there is labelled *list prices as of 2026-08-18*
-and needs re-reading, not trusting, after any Cloudflare repricing.
+per conversion — the cost of the run just made (**$0.00 in USDC and $0.00 in
+Cloudflare metering**, with the served-conversion count printed rather than
+assumed), and a table of monthly cost at 1k / 10k / 100k / 1M calls a day, where
+one "call" is a served and therefore paid one. Requests are the allowance that
+cracks first, at roughly 333k calls/day (10M req/mo); at 1M calls/day the metered
+charge is about $16.60/month on top of the flat plan fee. Unpaid traffic — 402s,
+413s, `/check`, the static files — counts only against requests and CPU, because
+an unpaid 402 writes no D1 row at all. Everything there is labelled *list prices
+as of 2026-08-18* and needs re-reading, not trusting, after any Cloudflare
+repricing.
 
 One piece of automation is still **not built**: a CI link-check over every
 `url`.
 
 Adding a hosted tool is four steps: add the `hosted:` block in `entries.yaml`
-(with a `price`, since every hosted tool is priced past the free tier), add the
-matching entry to `CONVERTERS` in `worker/beacon.js`, run `npm run build` (which
-regenerates `worker/catalog.generated.js`), and deploy. The build fails if
-`hosted.path` and the entry id disagree; the Worker answers `501` if an entry is
-listed `live` with no implementation behind it. The free tier needs no per-tool
-work — it is one constant and it applies to `/convert/*` as a whole.
+(with a `price` — every hosted tool is priced), add the matching entry to
+`CONVERTERS` in `worker/beacon.js`, run `npm run build` (which regenerates
+`worker/catalog.generated.js`), and deploy. The build fails if `hosted.path` and
+the entry id disagree; the Worker answers `501` if an entry is listed `live` with
+no implementation behind it.
 
-Changing the free tier is one line: `FREE_TIER_DAILY` in `build.mjs`, then
-`npm run build` (which rewrites `worker/catalog.generated.js`) and deploy. Page
-copy, `catalog.json`, `llms.txt`, `llms-full.txt`, `GET /check` and the Worker's
-enforcement all move together. Two numbers are typed a second time and are worth
-grepping when it changes: `FREE_TIER_EXPECT` in `scripts/test-live.mjs`,
-`FREE_TIER_DAILY` in `mcp/server.mjs` (wording only — the service is
-authoritative), the hardcoded numbers in `skills/toolshed/SKILL.md`, and the
-`3` in the free-tier pressure query above.
+The `CONVERTERS` entry needs `inputFormat` and `outputFormat` alongside
+`description`, `mimeType` and `contentType`: those two are what the 402
+envelope's `outputSchema` descriptions are built from, so a new tool describes
+itself to a discovery index without a second edit. Keep `mimeType` in step with
+`RESPONSE_MIME` in `build.mjs` — a test asserts the two agree per tool, because
+`openapi.json` publishes one and the envelope publishes the other.
+
+Turning the free tier back on is [its own
+runbook](#re-enabling-the-free-tier) — three steps, because the Worker and the
+static copy read different sources. Numbers typed a second time and worth
+grepping when it changes: `FREE_TIER_ENABLED` in `test/harness.mjs` (the width
+phase 1 boots), the `5000` in the per-caller pressure query above, and
+`PAID_DAILY`, which is mirrored in `test/harness.mjs` because it is deliberately
+not exported by the catalog. `mcp/server.mjs` and `skills/toolshed/SKILL.md` no
+longer hardcode a tier at all — both read `hosted.free_tier_daily` and the
+`x-free-tier-remaining` header, and print only what the service reported.

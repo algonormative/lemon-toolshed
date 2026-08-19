@@ -5,6 +5,10 @@
 // assertion here reads the STORE rather than the response — the response is
 // designed to tell you nothing.
 //
+// It shares phase 1's worker (the env-gated free tier), which changes nothing
+// here: /b has never consulted the conversion tier. The var is passed only so
+// this file joins that worker instead of booting a fourth one.
+//
 // The salt-rotation test is the one that would otherwise need a day to run. It
 // does not wait: it ages the salt row in D1 by hand and then makes one request,
 // which is enough to prove the identity space really is discarded at rotation
@@ -12,7 +16,7 @@
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { useWorker, client, callers, sqlString } from './harness.mjs';
+import { useWorker, client, callers, sqlString, TIER_ON_VARS } from './harness.mjs';
 
 let worker;
 let api;
@@ -21,7 +25,7 @@ const ips = callers('beacon');
 const HEX16 = /^[0-9a-f]{16}$/;
 
 before(async () => {
-  worker = await useWorker();
+  worker = await useWorker({ vars: TIER_ON_VARS });
   api = client(worker);
 });
 after(async () => {

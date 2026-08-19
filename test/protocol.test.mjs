@@ -3,10 +3,24 @@
 //
 // This is the surface an agent codes against without reading the page, so the
 // assertions are about the shape of the answer rather than about any one tool.
+//
+// PHASE: the env-gated free tier, because several tests here need a conversion
+// actually served and that is the cheapest way to get one. What /check reports
+// as `free_tier_daily` is therefore the RUNTIME value this worker was booted
+// with, which is the claim being tested — that the number moves with the env
+// var rather than with the build constant. tier-off.test.mjs asserts the other
+// half: the same field reads 0 on a worker booted without it.
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { useWorker, client, callers, CATALOG, FREE_TIER_DAILY } from './harness.mjs';
+import {
+  useWorker,
+  client,
+  callers,
+  CATALOG,
+  FREE_TIER_ENABLED,
+  TIER_ON_VARS,
+} from './harness.mjs';
 
 let worker;
 let api;
@@ -15,7 +29,7 @@ const ips = callers('protocol');
 const HOSTED_IDS = CATALOG.filter((e) => e.hosted).map((e) => e.id).sort();
 
 before(async () => {
-  worker = await useWorker();
+  worker = await useWorker({ vars: TIER_ON_VARS });
   api = client(worker);
 });
 after(async () => {
@@ -45,8 +59,9 @@ describe('GET /check', () => {
       assert.equal(match.hosted.status, 'live', `${match.id} is listed but not live`);
       assert.equal(
         match.hosted.free_tier_daily,
-        FREE_TIER_DAILY,
-        `${match.id} advertises a free tier the Worker does not enforce`
+        FREE_TIER_ENABLED,
+        `${match.id} advertises a free tier the Worker does not enforce — /check must report the ` +
+          'RUNTIME env value, not the number compiled into the catalog'
       );
       assert.ok(match.hosted.price, `${match.id} has no price`);
       assert.equal(match.hosted.price.scheme, 'exact');
@@ -70,6 +85,50 @@ describe('GET /check', () => {
   test('matching is case-insensitive and trims surrounding whitespace', async () => {
     assert.deepEqual((await check('?from=MARKDOWN&to=HtMl')).body.matches.map((m) => m.id), ['md-html']);
     assert.deepEqual((await check('?from=%20markdown%20&to=%20html%20')).body.matches.map((m) => m.id), ['md-html']);
+  });
+
+  test('extensions and MIME types match, with or without a leading dot', async () => {
+    // THE BUG THIS FIXES, verified live 2026-08-19 against the production host:
+    // `?from=md`, `?from=.md` and `?from=text/markdown` all returned [] while
+    // only `?from=markdown` matched. An extension and a Content-Type are the two
+    // things a machine actually has on hand — it reads them off a filename and
+    // off a response header — so the one spelling that worked was the one least
+    // likely to be tried.
+    const ids = async (q) => (await check(q)).body.matches.map((m) => m.id);
+
+    for (const q of ['?from=md&to=html', '?from=.md&to=html', '?from=text/markdown&to=text/html']) {
+      assert.deepEqual(await ids(q), ['md-html'], `${q} did not resolve to md-html`);
+    }
+    for (const q of ['?from=yml&to=json', '?from=.yaml&to=json', '?from=yaml&to=application/json']) {
+      assert.deepEqual(await ids(q), ['yaml-json'], `${q} did not resolve to yaml-json`);
+    }
+    assert.deepEqual(await ids('?from=text/csv&to=application/json'), ['csv-json']);
+    assert.deepEqual(await ids('?to=text/html'), ['md-html']);
+
+    // An alias is an EXACT hit, not a second substring pass: `.md` must not
+    // start matching things that merely contain "md".
+    assert.deepEqual(await ids('?from=zzzznotathing'), []);
+    assert.deepEqual(await ids('?from=.zzzznotathing'), []);
+  });
+
+  test('aliasing never crosses the have/need binding', async () => {
+    // The whole point of field-bound matching, restated for the alias half: an
+    // alias hit on the wrong side must not resurrect the reversed pair.
+    const { body } = await check('?from=md&to=text/html');
+    assert.ok(!body.matches.some((m) => m.id === 'html-markdown'), 'the reversed pair matched via an alias');
+  });
+
+  test('every catalog entry carries alias sets containing its own label', async () => {
+    // Compiled in build.mjs, so a missing set means the build silently stopped
+    // emitting them and /check quietly went back to substring-only.
+    for (const entry of CATALOG) {
+      assert.ok(Array.isArray(entry.xa) && entry.xa.length, `${entry.id} has no from-side aliases`);
+      assert.ok(Array.isArray(entry.ya) && entry.ya.length, `${entry.id} has no to-side aliases`);
+      for (const alias of [...entry.xa, ...entry.ya]) {
+        assert.equal(alias, alias.toLowerCase(), `${entry.id} has an unnormalised alias: ${alias}`);
+        assert.ok(!alias.startsWith('.'), `${entry.id} has a dotted alias: ${alias}`);
+      }
+    }
   });
 
   test('a from with no hosted conversion answers with local references instead', async () => {
