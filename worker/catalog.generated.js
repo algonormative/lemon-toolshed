@@ -8,7 +8,7 @@ export const SITE_BASE = "https://toolshed.lemon-agent.dev";
 
 // The free tier, compiled in from build.mjs so the number the site advertises and
 // the number the Worker enforces are the same number. OWNER-TUNABLE in build.mjs.
-export const FREE_TIER_DAILY = 10;
+export const FREE_TIER_DAILY = 3;
 
 export const CATALOG = [
   {
@@ -55,7 +55,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 10
+      "free_tier_daily": 3
     },
     "local": {
       "tool": "pandoc",
@@ -74,7 +74,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 10
+      "free_tier_daily": 3
     },
     "local": {
       "tool": "pandoc",
@@ -181,7 +181,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 10
+      "free_tier_daily": 3
     },
     "local": {
       "tool": "yq",
@@ -200,7 +200,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 10
+      "free_tier_daily": 3
     },
     "local": {
       "tool": "yq",
@@ -219,7 +219,7 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 10
+      "free_tier_daily": 3
     },
     "local": {
       "tool": "csvkit",

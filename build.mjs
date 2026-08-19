@@ -57,7 +57,7 @@ const API_BASE = `${API_SCHEME}://${API_HOST}`;
 // try the thing, not to be a free service, and the caller key it is counted
 // against (a daily-salted hash of the IP alone) is the cheapest spoof-resistance
 // available — a fresh identity costs a fresh IP, not a fresh user-agent string.
-const FREE_TIER_DAILY = 10;
+const FREE_TIER_DAILY = 3;
 
 const SITE_NAME = 'Toolshed';
 const HOUSE = 'Lemon';
@@ -869,8 +869,8 @@ function cmdRow(command, label, extraClass = '') {
 
 // The worked example in the pricing section. Deliberately short: two imports, an
 // account, the wrapper, one call. Every hosted tool is priced past the free tier,
-// so the snippet is runnable rather than illustrative — modulo settlement, which
-// is not switched on yet.
+// and the 402 it answers is verified with the CDP facilitator and settled on
+// Base — so the snippet is runnable rather than illustrative.
 const X402_SNIPPET = [
   'import { wrapFetchWithPayment } from "x402-fetch";',
   'import { privateKeyToAccount } from "viem/accounts";',
@@ -1074,7 +1074,7 @@ ${sections.map(renderShelf).join('\n')}
     </div>
     <div class="agent-row">
       ${cmdRow(`curl -X POST "${API_BASE}/convert/md-html" --data-binary @README.md`, 'Copy the convert command')}
-      <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB. The first ${FREE_TIER_DAILY} calls a day are free and say how many are left in <code>x-free-tier-remaining</code>; past that the answer is a <code>402</code> asking for payment, or a <code>429</code> while payment is switched off.</p>
+      <p class="note">Post the raw file as the body; the converted file comes back as the body. Input is capped at 256 KB. The first ${FREE_TIER_DAILY} calls a day are free and say how many are left in <code>x-free-tier-remaining</code>; past that the answer is a <code>402</code> carrying an x402 envelope to pay against.</p>
     </div>
 
     <h4>2. The whole catalog as files</h4>
@@ -1129,34 +1129,13 @@ ${sections.map(renderShelf).join('\n')}
     </div>
 
     <!--
-      HONEST STATUS — DO NOT UPDATE THIS COPY UNTIL A REAL PAYMENT HAS SETTLED.
+      HONEST STATUS. Flipped 2026-08-18, after a real x402 payment verified and
+      settled on Base (tx 0xe2c8bb8d..., settlements row verify_ok = 1,
+      settle_ok = 1). The standing rule is the same in reverse: if settlement
+      ever breaks, this box goes back to naming what is broken.
 
       NOTE FOR EDITORS: this comment lives inside a JS template literal, so it
       must contain no backticks and no dollar-brace sequences.
-
-      The Worker now verifies and settles against the CDP facilitator (README
-      section "Settlement (live)"), and the whole path is proven against a mock
-      facilitator AND against a real x402-fetch client in
-      test/x402-settlement.test.mjs. What has NOT happened yet is one real
-      payment, with real USDC, on Base, landing in the real wallet. Until it
-      has, the sentence below stays as it is: "we wrote the code and the tests
-      pass" is not the same claim as "money has moved", and this box exists
-      precisely to not blur the two.
-
-      THE FLIP: run "node scripts/pay-test.mjs --yes" (owner only — it spends
-      real USDC), confirm a settlements row with settle_ok = 1 and a real
-      tx_hash, then replace the <p> below with EXACTLY this, rebuild, redeploy:
-
-      <p><span class="status-label">Honest status</span>The free tier is
-      <strong>live and enforced</strong>, and payment is <strong>live and
-      verified</strong>: a call past the free tier answers the <code>402</code>
-      envelope above, and a payment presented against it is checked with the
-      Coinbase CDP facilitator before the conversion is served — a verified call
-      comes back with <code>x-payment-verified: true</code> and settles on Base
-      immediately afterwards. If the facilitator cannot be reached, the call is
-      served anyway and says so with <code>x-payment-error</code>: at $0.001 the
-      price is a signal, and an outage on our side should not turn a paying
-      caller away.</p>
     -->
     <div class="status-box">
       <p><span class="status-label">Honest status</span>The free tier is
@@ -1233,8 +1212,9 @@ const catalog = {
     note:
       `Entries with a hosted block run on our server. Every one is free to try — ${FREE_TIER_DAILY} conversions ` +
       'per caller (per IP) per UTC day, reported in an x-free-tier-remaining header — and priced per call past ' +
-      'that: HTTP 402 with an x402 envelope naming a live USDC address on Base (or HTTP 429 if payment were switched off). ' +
-      'Entries without a hosted block are local-only references.',
+      'that: HTTP 402 with an x402 envelope naming a live USDC address on Base. A payment presented against that ' +
+      'envelope is verified with the Coinbase CDP facilitator before the conversion is served, and settles on Base ' +
+      'immediately afterwards. Entries without a hosted block are local-only references.',
   },
   entries: entries.map(catalogEntry),
 };
@@ -1253,12 +1233,16 @@ const API_HEADER = [
   `Tiers: every hosted tool is free to try — ${FREE_TIER_DAILY} conversions per caller per UTC day, no login —`,
   `  and priced per call past that. A caller is an IP address (rotating the user-agent does not reset it);`,
   `  every free-tier response carries x-free-tier-remaining: <n>, and the count resets at midnight UTC.`,
-  `Payment: past the free tier a call answers HTTP 402 with an x402 envelope (USDC on Base).`,
-  `  No accounts, no keys, per-call pricing. Pay with an x402-capable client (x402-fetch, the x402`,
-  `  SDK, Coinbase AgentKit) holding a wallet key with USDC on Base; it signs and retries with an`,
-  `  X-PAYMENT header. NOT SWITCHED ON YET: with no receiving address configured, a call past the free`,
-  `  tier answers HTTP 429 with a Retry-After instead of a 402, and nothing verifies settlement — a`,
-  `  response that sees an X-PAYMENT header says x-payment-verified: false rather than treating it as paid.`,
+  `Payment: past the free tier a call answers HTTP 402 with an x402 envelope — exact scheme, USDC`,
+  `  on Base — naming the price and the payTo address. No accounts, no keys, per-call pricing. Pay`,
+  `  with an x402-capable client (x402-fetch, the x402 SDK, Coinbase AgentKit) holding a wallet key`,
+  `  with USDC on Base; it signs and retries with an X-PAYMENT header. The payment is verified with`,
+  `  the Coinbase CDP facilitator before the conversion is served: a verified call comes back with`,
+  `  x-payment-verified: true and settles on Base immediately afterwards; a payment the facilitator`,
+  `  rejects gets the 402 again with an invalidReason and no conversion; and if the facilitator`,
+  `  cannot be reached the call is served anyway, saying so with x-payment-verified: false and`,
+  `  x-payment-error. Inside the free tier nothing is checked or charged. On a deployment with no`,
+  `  receiving address configured, over-tier calls answer HTTP 429 with a Retry-After, not a 402.`,
   `Skill: npx skills add chronick/lemon-toolshed`,
   `MCP: claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed`,
   `  Tools: toolshed_check, toolshed_convert, toolshed_catalog. Base URL via TOOLSHED_URL.`,

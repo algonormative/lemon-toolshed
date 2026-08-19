@@ -36,12 +36,16 @@ const USDC_DECIMALS = 6;
 // state the tier before any HTTP call has happened. The service enforces its own
 // number and publishes it per tool in /check as `hosted.free_tier_daily`, which is
 // authoritative; this constant never gates anything.
-const FREE_TIER_DAILY = 10;
+const FREE_TIER_DAILY = 3;
 
 // How few free calls have to be left before a successful conversion carries a
 // warning. Below this the note is worth the noise; above it, the caller gets
 // clean output, because the converted file is the product.
-const LOW_TIER_WARN = 3;
+//
+// Bounded by the tier itself: a flat 3 would warn on EVERY call of a 3/day tier,
+// which is the noise this threshold exists to avoid. At 3/day it warns on the
+// last two calls; at 10/day it is the flat 3 it has always been.
+const LOW_TIER_WARN = Math.min(3, FREE_TIER_DAILY - 1);
 
 const TOOLS = [
   {
@@ -69,8 +73,9 @@ const TOOLS = [
       '"md-html"); `input` is the file content, sent as the request body. The converted ' +
       `text comes back. Input is capped at 256 KB. The first ${FREE_TIER_DAILY} conversions ` +
       'a day are free, counted per caller (per IP, so rotating the user-agent does not ' +
-      'reset it); a 402 or a 429 means the day\'s free calls are spent — 402 when payment ' +
-      'is live and asks you to pay, 429 while it is not. Both come back explained, not raw.',
+      'reset it); a 402 or a 429 means the day\'s free calls are spent — 402 asks you to pay ' +
+      '(payment is live: USDC on Base via x402), 429 means this deployment has nowhere to ' +
+      'take payment. Both come back explained, not raw.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -147,7 +152,7 @@ async function convert(args) {
   if (Number.isFinite(left) && left < LOW_TIER_WARN) {
     return text(
       `${body}\n\n[toolshed: free tier — ${left} of ${FREE_TIER_DAILY} conversions left today for this caller. ` +
-        'At zero, calls answer 402 (pay per call in USDC via x402) or 429 while payment is switched off.]'
+        'At zero, calls answer 402 and payment is live: pay per call in USDC on Base via x402.]'
     );
   }
   if (res.headers.get('x-pricing') === 'pending') {

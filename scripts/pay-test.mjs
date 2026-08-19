@@ -6,7 +6,7 @@
 //  │  It makes one paid call to the live Toolshed: $0.001 in USDC on      │
 //  │  Base, signed with the key in .buyer.env and settled on chain by     │
 //  │  the CDP facilitator. It ALSO burns today's free tier for whatever   │
-//  │  IP address you run it from — up to 10 throwaway conversions —       │
+//  │  IP address you run it from — up to 3 throwaway conversions —        │
 //  │  because the paid path is only reachable past the free tier.         │
 //  │                                                                      │
 //  │  FOR THE OWNER TO RUN, DELIBERATELY, ONCE. Not part of `npm test`,   │
@@ -145,7 +145,7 @@ console.log('  1. Free tier — the paid path is unreachable until it is gone.\n
 
 let burned = 0;
 let sawPaywall = false;
-const MAX_BURN = 24; // FREE_TIER_DAILY is 10; this is a safety stop, not a target
+const MAX_BURN = 24; // FREE_TIER_DAILY is 3; this is a safety stop, not a target
 
 for (let i = 0; i < MAX_BURN; i++) {
   const res = await fetch(ENDPOINT, { method: 'POST', body: INPUT });

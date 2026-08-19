@@ -1,26 +1,44 @@
 #!/usr/bin/env node
 // Live smoke test for the Toolshed API, plus a cost estimate.
 //
-//   node scripts/test-live.mjs                        # production
-//   node scripts/test-live.mjs http://localhost:8787  # wrangler dev --local
+//   node scripts/test-live.mjs                          # production
+//   node scripts/test-live.mjs http://localhost:8787    # wrangler dev --local
 //   TOOLSHED_URL=... node scripts/test-live.mjs
-//   node scripts/test-live.mjs --quota                # the free-tier probe, opt-in
+//   node scripts/test-live.mjs --tools=csv-json,md-html # spend the free slots here
+//   node scripts/test-live.mjs --quota                  # the free-tier probe, opt-in
 //
 // Zero dependencies — Node 18+ for global fetch, and nothing else. This is the
 // smoke test README.md § Maintenance says is missing: it posts a known payload
 // to every hosted endpoint and checks a distinctive substring came back, so a
 // rotted converter shows up as a red row rather than as a broken product.
 //
-// It exercises the real service, so it writes real rows — and it now spends real
-// free-tier allowance: the default run makes 6 accepted conversions against this
-// caller's FREE_TIER_DAILY (10). TWO DEFAULT RUNS IN ONE UTC DAY FROM ONE IP WILL
-// HIT THE FREE TIER, and the second one reports 429s rather than converter faults.
+// IT SPENDS THE WHOLE DAY'S FREE TIER, AND THE DEFAULT RUN IS DELIBERATELY WIDER
+// THAN IT. The free tier is 3 conversions per caller per UTC day and there are 5
+// converters, so a run cannot check them all for nothing. What it does instead:
+//
+//   calls 1..FREE_TIER_EXPECT   served and fully checked — the converter ran, and
+//                               x-free-tier-remaining counted down exactly
+//   every /convert call after   OVER THE TIER, where the paywall is the correct
+//                               answer. The run asserts that transition at exactly
+//                               the call the tier runs out on: a 402 carrying a
+//                               spec-shaped x402 envelope (what the hosted service
+//                               answers), or a 429 where no receiving address is
+//                               configured. Those rows are green because the GATE
+//                               is right, and they say the converter behind them
+//                               was not exercised — they are not converter passes.
+//
+// So one default run costs FREE_TIER_EXPECT conversions: the whole allowance for
+// the IP it runs from. A SECOND RUN IN THE SAME UTC DAY FROM THE SAME IP fails on
+// its first conversion, saying the tier was already spent rather than blaming a
+// converter. Only the first FREE_TIER_EXPECT converters in the list get live
+// coverage on a given day — use --tools=<id,...> to aim the free slots elsewhere.
 //
 // --quota is the free-tier probe and is NOT part of the default run, because it
 // deliberately burns the whole day's allowance plus one. See quotaProbe().
 
 const ARGS = process.argv.slice(2);
 const QUOTA = ARGS.includes('--quota');
+const TOOLS_ARG = (ARGS.find((a) => a.startsWith('--tools=')) || '').slice('--tools='.length);
 const BASE = (
   ARGS.find((a) => !a.startsWith('--')) ||
   process.env.TOOLSHED_URL ||
@@ -100,7 +118,32 @@ const BIG_INPUT_BYTES = 300 * 1024;
 // Must match FREE_TIER_DAILY in build.mjs. Asserted against the live service by
 // the quota probe, and published in catalog.json — so a drift shows up as a red
 // row rather than as a surprise.
-const FREE_TIER_EXPECT = 10;
+const FREE_TIER_EXPECT = 3;
+
+// Which converters get the free slots. Default is every one, in order, which
+// means the first FREE_TIER_EXPECT of them are checked and the rest land on the
+// paywall. --tools=<id,...> re-points the scarce slots at whatever you changed.
+const SELECTED_CONVERSIONS = (() => {
+  if (!TOOLS_ARG) return CONVERSIONS;
+  const wanted = TOOLS_ARG.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const unknown = wanted.filter((id) => !CONVERSIONS.some((c) => c.id === id));
+  if (unknown.length) {
+    console.error(
+      `--tools names ${unknown.join(', ')}, which this file has no fixture for. ` +
+        `Known: ${CONVERSIONS.map((c) => c.id).join(', ')}`
+    );
+    process.exit(2);
+  }
+  return wanted.map((id) => CONVERSIONS.find((c) => c.id === id));
+})();
+
+// The ledger the whole run is metered against: how many conversions this caller
+// has actually had SERVED so far. A refused over-tier call claims nothing, so it
+// does not move this — which is what makes the next prediction exact.
+let spent = 0;
+const insideTier = () => spent < FREE_TIER_EXPECT;
 
 // ---------------------------------------------------------------- table
 
@@ -126,7 +169,7 @@ function printTable() {
 //
 //   1. beacons are on a separate budget — 5 /b events first, and the free tier
 //      is still whole afterwards;
-//   2. x-free-tier-remaining counts down 9 -> 0 across the free calls;
+//   2. x-free-tier-remaining counts down FREE_TIER_EXPECT - 1 -> 0 across them;
 //   3. call FREE_TIER_EXPECT + 1 is refused — 429 with the free-tier body and a
 //      sane Retry-After, or 402 with an x402 envelope once PAYTO is set;
 //   4. rotating the user-agent from the same IP does NOT mint a fresh allowance.
@@ -226,7 +269,17 @@ if (QUOTA) {
 
 // ---------------------------------------------------------------- tests
 
-console.log(`Toolshed live test — ${BASE}\n`);
+// Every queued call that reaches the converter claims an allowance: the selected
+// happy paths plus the malformed-input case. The 413 is refused on the declared
+// size before any of that, so it is free.
+const QUEUED_METERED = SELECTED_CONVERSIONS.length + 1;
+
+console.log(`Toolshed live test — ${BASE}`);
+console.log(
+  `Budget: ${FREE_TIER_EXPECT} free conversions — this IP's whole allowance for the UTC day. ` +
+    `${QUEUED_METERED} calls queued that spend it; the first ${Math.min(FREE_TIER_EXPECT, QUEUED_METERED)} ` +
+    (QUEUED_METERED > FREE_TIER_EXPECT ? 'are checked, the rest land on the paywall.\n' : 'are checked.\n')
+);
 
 await test('GET /check with no parameters lists every hosted tool', async () => {
   const res = await get('/check');
@@ -253,41 +306,70 @@ await test('GET /check?from=markdown&to=html returns exactly md-html', async () 
   return 'md-html';
 });
 
-for (const c of CONVERSIONS) {
+// Set when a call this run expected to be free came back refused, which means
+// the allowance was already gone before the run started. It is diagnosed ONCE,
+// as a red row; after that the remaining rows say the same thing the calmer way
+// rather than repeating the same failure six times over one root cause.
+let tierSpentEarly = false;
+
+// A conversion the tier could not pay for. The refusal is the RIGHT answer, and
+// it is asserted as one — but it is not evidence that the converter behind it
+// still works, so the row says so out loud.
+const notExercised = async (res, what) => {
+  const detail = assertRefusal(res, await res.text());
+  const why = tierSpentEarly ? 'tier was already spent before this run' : 'over tier';
+  return `${why} — ${detail} — ${what} NOT exercised this run`;
+};
+
+// A call that was predicted free and was refused means one thing only: this IP
+// had already converted today. It is a red row, because the run proved nothing.
+function assertTierWasWhole(res, callNumber) {
+  if (res.status !== 402 && res.status !== 429) return;
+  tierSpentEarly = true;
+  throw new Error(
+    `refused with ${res.status} on free call ${callNumber}/${FREE_TIER_EXPECT} — this IP had already ` +
+      `spent today's ${FREE_TIER_EXPECT}/day free tier before this run. Nothing after this row ` +
+      'exercises a converter. Re-run after midnight UTC (beacons did NOT do it; they are on a ' +
+      'separate budget).'
+  );
+}
+
+for (const c of SELECTED_CONVERSIONS) {
   await test(`POST /convert/${c.id} converts and returns its own output`, async () => {
+    const free = insideTier() && !tierSpentEarly;
     const res = await post(`/convert/${c.id}`, c.input);
 
-    // A 402 is CORRECT behaviour once PAYTO is set and the free tier is spent —
-    // the envelope is the product, not a fault. Report it, do not fail on it.
-    if (res.status === 402) {
-      const env = await res.json();
-      const offer = (env.accepts && env.accepts[0]) || {};
-      return `402 x402 envelope (paid gate live) — ${offer.maxAmountRequired} atomic to ${offer.payTo}`;
-    }
+    if (!free) return notExercised(res, c.id);
 
-    // A 429 is not a converter fault either, but it IS a red row: it means this
-    // caller's free tier is already spent, so the run proved nothing about the
-    // converter. Say which, so nobody debugs the wrong thing.
-    if (res.status === 429) {
-      throw new Error(
-        `429 — this IP's ${FREE_TIER_EXPECT}/day free tier is spent (Retry-After ` +
-          `${res.headers.get('retry-after')}s). Re-run after midnight UTC.`
-      );
-    }
-
+    assertTierWasWhole(res, spent + 1);
     assert(res.status === 200, `expected 200, got ${res.status}`);
     const out = await res.text();
     assert(out.includes(c.expect), `output did not contain ${JSON.stringify(c.expect)}`);
+
+    // Served, so the allowance moved — and the header has to agree, exactly.
+    spent += 1;
     const left = res.headers.get('x-free-tier-remaining');
-    const pending = res.headers.get('x-pricing') === 'pending';
-    const note = left !== null ? ` [free tier: ${left} left]` : pending ? ' [x-pricing: pending]' : '';
-    return `${out.replace(/\s+/g, ' ').trim().slice(0, 48)}${note}`;
+    assert(
+      Number(left) === FREE_TIER_EXPECT - spent,
+      `x-free-tier-remaining is ${left}, expected ${FREE_TIER_EXPECT - spent}`
+    );
+    return `${out.replace(/\s+/g, ' ').trim().slice(0, 48)} [free tier: ${left} left]`;
   });
 }
 
+// A malformed body is rejected AFTER the free-tier call is claimed, so this case
+// costs an allowance like any other — which at 3/day means it usually lands past
+// the tier and cannot run. The local suite (`npm test`) is where it is covered
+// unconditionally; here it is opportunistic and honest about it.
 await test('POST /convert/json-yaml rejects malformed input with 400', async () => {
+  const free = insideTier() && !tierSpentEarly;
   const res = await post('/convert/json-yaml', '{not json');
+
+  if (!free) return notExercised(res, 'the malformed-input 400');
+
+  assertTierWasWhole(res, spent + 1);
   assert(res.status === 400, `expected 400, got ${res.status}`);
+  spent += 1; // a rejected conversion still spends its free-tier call
   const body = await res.json();
   assert(typeof body.error === 'string' && body.error.length > 0, 'no error message in the 400 body');
   return body.error.slice(0, 60);
@@ -362,21 +444,27 @@ console.log(`  ${ASSUME.daysPerMonth}-day month; one "call" below = one /convert
 
 // --- this run -----------------------------------------------------------
 
-const runConverts = CONVERSIONS.length + 2; // the five happy paths + the 400 + the 413
+const runConverts = SELECTED_CONVERSIONS.length + 2; // the happy paths + the 400 + the 413
 const runOther = results.length - runConverts;
 const runRequests = results.length;
-const runCpuMs = runConverts * ASSUME.cpuMsPerConvert + runOther * ASSUME.cpuMsPerOther;
-// Six calls reach the store: the five happy paths plus the malformed one, which
-// claims its free-tier call before the body is read. The 413 is rejected on the
-// declared size, before any D1 work; the beacon writes its own two rows.
-const runRowsWritten = (CONVERSIONS.length + 1) * ASSUME.d1RowsWrittenPerConvert + 2;
+// Only the SERVED conversions cost a converter's worth of CPU and rows — `spent`
+// of them. A refusal past the free tier reads the salt and the global counter and
+// tries the quota claim, but runs no converter, writes no events row and moves no
+// counter; the 413 is rejected on the declared size before any D1 work at all;
+// the beacon writes its own two rows.
+const runRefused = runRequests - spent;
+const runCpuMs = spent * ASSUME.cpuMsPerConvert + runRefused * ASSUME.cpuMsPerOther;
+const runRowsWritten = spent * ASSUME.d1RowsWrittenPerConvert + 2;
 
 console.log('This test run');
 console.log(
   `  ${runRequests} requests (${runConverts} convert, ${runOther} other) = ${runRequests} / ${PRICES.requestsIncluded.toLocaleString()} of the monthly request allowance`
 );
 console.log(
-  `  ${runCpuMs} ms CPU (${runConverts}x${ASSUME.cpuMsPerConvert} + ${runOther}x${ASSUME.cpuMsPerOther}) = ${runCpuMs} / ${PRICES.cpuMsIncluded.toLocaleString()} ms`
+  `  ${spent} of ${FREE_TIER_EXPECT} free-tier conversions spent — the rest of the convert calls were over the tier`
+);
+console.log(
+  `  ${runCpuMs} ms CPU (${spent}x${ASSUME.cpuMsPerConvert} served + ${runRefused}x${ASSUME.cpuMsPerOther} refused or unmetered) = ${runCpuMs} / ${PRICES.cpuMsIncluded.toLocaleString()} ms`
 );
 console.log(
   `  ~${runRowsWritten} D1 rows written = ${runRowsWritten} / ${PRICES.d1RowsWrittenIncluded.toLocaleString()}`

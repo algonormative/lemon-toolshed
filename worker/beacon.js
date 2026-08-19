@@ -307,8 +307,8 @@ async function handleConvert(request, env, path, ctx) {
     //
     // It also fixes what the ceiling keys on. It used to key on the PRESENCE of
     // an X-PAYMENT header, so any caller that sent one got PAID_DAILY (5,000)
-    // instead of 10 — a pre-facilitator placeholder that let an unverified
-    // claim buy a 500x higher ceiling for free. Now the higher ceiling is
+    // instead of the free tier — a pre-facilitator placeholder that let an
+    // unverified claim buy a vastly higher ceiling for free. Now it is
     // claimed only after the facilitator says isValid, further down.
     const free = await claimConvertQuota(db, day, ipHash, FREE_TIER_DAILY);
 

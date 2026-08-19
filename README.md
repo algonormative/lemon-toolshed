@@ -3,14 +3,16 @@
 **A collection of tools for agents — no install required.** Privacy-first: no
 login, no credit card, no account.
 
-**Every tool is free to try: 10 conversions a day, no login. Past that it's a
+**Every tool is free to try: 3 conversions a day, no login. Past that it's a
 paid call — $0.001 in USDC via x402, with much higher limits.**
 
 An agent posts a file to an HTTP endpoint and gets the converted file back.
 Inside the free tier it just answers, and says how many calls are left in an
 `x-free-tier-remaining` header. Past it, the answer is HTTP 402 with an x402
-envelope (USDC on Base) naming a live receiving address — or HTTP 429 if
-payment were ever switched off (`PAYTO` unset).
+envelope (USDC on Base) naming a live receiving address, and a payment
+presented against that envelope is verified with the Coinbase CDP facilitator
+before the conversion is served — or HTTP 429 on a deployment with no receiving
+address configured (`PAYTO` unset).
 
 Not everything is hosted. Where we do not run the conversion ourselves, the
 entry is a **reference**: it names the tool worth reaching for, the caveats that
@@ -41,14 +43,16 @@ Three honest caveats:
 - **The curation is owner taste.** The 33 entries in `entries.yaml` are drafts
   for review, not a finished list, and every verdict is engineering judgment
   rather than measurement.
-- **The free tier is enforced; payment is verified in code but has never been
-  paid.** The 10/day free tier is real and runs against D1. Past it, a
-  spec-valid 402 is issued (`PAYTO` is set — live since 2026-08-18), and a
-  payment presented against it is now verified and settled with the Coinbase
-  CDP facilitator. Two honest caveats: **no real payment has settled yet** —
-  the path is proven against a mock facilitator and a real `x402-fetch` client,
-  not against real USDC — and an unreachable facilitator serves the call
-  *unverified* rather than refusing it. See
+- **The free tier is enforced and payment is live; exactly one real payment has
+  settled, and it was ours.** The 3/day free tier is real and runs against D1.
+  Past it, a spec-valid 402 is issued (`PAYTO` is set — live since 2026-08-18),
+  and a payment presented against it is verified and settled with the Coinbase
+  CDP facilitator. Proven end to end on 2026-08-18 by a real payment in real
+  USDC on Base (tx `0xe2c8bb8d…`, `verify_ok = 1`, `settle_ok = 1`) — made by
+  `scripts/pay-test.mjs`, which is to say by us, not by a stranger. Two honest
+  caveats: **no third party has paid yet**, so nothing is known about how a
+  wallet we did not build behaves against this envelope, and an unreachable
+  facilitator serves the call *unverified* rather than refusing it. See
   [Settlement (live)](#settlement-live) and
   [Pricing and payment (x402)](#pricing-and-payment-x402) — all of it is
   stated in the response headers rather than hidden.
@@ -73,7 +77,7 @@ worker/schema.sql           D1 schema — events / daily_aggregates / blocklist 
 mcp/server.mjs              the MCP server — thin stdio wrapper over the HTTP API
 skills/toolshed/SKILL.md    the agent skill — check availability, convert, x402
 test/                       the e2e suite — `npm test`, local only; see § Testing
-scripts/test-live.mjs       the older live probe + cost estimate; spends 6 free calls a run
+scripts/test-live.mjs       the older live probe + cost estimate; spends the whole 3/day tier
 scripts/create-test-buyer.mjs  OWNER ONLY — makes a throwaway buyer key (.buyer.env)
 scripts/pay-test.mjs        OWNER ONLY — SPENDS REAL USDC; one paid call end to end
 wrangler.toml               Worker config; routes are live, database_id filled in at deploy
@@ -104,7 +108,7 @@ No `hosted:` block means a local-only reference entry. A bare top-level
 the split need no edit. The build fails if `hosted.path` and the id disagree.
 
 **The free tier is not a per-entry field.** It is one build constant,
-`FREE_TIER_DAILY` in `build.mjs` (owner-tunable, currently **10**). The build
+`FREE_TIER_DAILY` in `build.mjs` (owner-tunable, currently **3**). The build
 stamps it onto every hosted entry as `hosted.free_tier_daily` — so it reaches
 `catalog.json`, `llms.txt`, `llms-full.txt` and `GET /check` — *and* exports it
 into `worker/catalog.generated.js`, which is where the Worker reads it to
@@ -202,7 +206,7 @@ DEPLOY, in order:
  6. Edge abuse control — OWNER-VERIFIED 2026-08-18: the dashboard gates
     rate-limiting rules behind a higher plan for this account, so the edge
     rate rule is DROPPED from this runbook. The deployed in-Worker tiers
-    (10/day free per IP-hash, 100/day beacon identifier, 200k/day global
+    (3/day free per IP-hash, 100/day beacon identifier, 200k/day global
     fail-closed) are the abuse bound, the $25 Usage-Based Billing
     notification (step 8 — free on every plan) is the bill bound, and the
     reactive edge control is a free WAF CUSTOM rule when the blocklist
@@ -340,12 +344,17 @@ public API, and it holds no state, no key and no wallet. Three tools:
 `BASE` is `TOOLSHED_URL`, defaulting to `https://toolshed.lemon-agent.dev`.
 Neither refusal is swallowed. On a `402`, `toolshed_convert` returns a readable
 explanation quoting the price, the asset and the `payTo` address, says what an
-x402 client would do with it, and states that settlement is not switched on yet.
-On a `429` it says the day's free calls are spent, quotes the free tier, the
+x402 client would do with it, and states that payments are verified with the CDP
+facilitator and settled — including what a `402` carrying an `invalidReason`
+means, which is that a payment was rejected and resending it will fail the same
+way. On a `429` it says the day's free calls are spent, quotes the free tier, the
 paid tier and the reset time in hours, and says plainly that a different
 user-agent will not help because the counter is keyed on the IP. A successful
-call comes back clean unless fewer than three free conversions are left, in
-which case it carries a one-line warning.
+call comes back clean unless the free tier is nearly out — `LOW_TIER_WARN`,
+which is `min(3, FREE_TIER_DAILY - 1)`, so the last two calls of a 3/day tier —
+in which case it carries a one-line warning. A verified paid call, and a call
+served without verification because the facilitator was unreachable, each carry
+their own one-liner too.
 
 Dependencies: `@modelcontextprotocol/sdk` (exact-pinned) and Node 18+ for global
 `fetch`. The `bin` entry plus the shebang are what make
@@ -364,7 +373,7 @@ printf '%s\n' \
 ## Pricing and payment (x402)
 
 **All five hosted tools are priced, and all five are free to try.** The first
-`FREE_TIER_DAILY` — currently **10** — conversions per caller per UTC day cost
+`FREE_TIER_DAILY` — currently **3** — conversions per caller per UTC day cost
 nothing and need no login; past that a call costs **$0.001 in USDC on Base**,
 per call, negotiated with x402.
 
@@ -416,16 +425,16 @@ npx wrangler secret put CDP_API_KEY_SECRET
 
 | calls today | `PAYTO` | `X-PAYMENT` | facilitator says | response |
 | --- | --- | --- | --- | --- |
-| ≤ 10 | unset | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` |
-| ≤ 10 | unset | yes | *not asked* | **200**, plus `x-payment-verified: false` — the free tier is not a payment path |
-| ≤ 10 | set | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` — a receiving address does not cancel the free tier |
-| ≤ 10 | set | yes | *not asked* | **200**, `x-free-tier-remaining: <n>` + `x-payment-verified: false`. **Never billed inside the free tier** |
-| > 10 | unset | either | *not asked* | **429**, `{"error": "free tier is 10 conversions per day per caller", …}` + `Retry-After` |
-| > 10 | set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool |
-| > 10 | set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable to send |
-| > 10 | set | yes | `isValid` | **200**, `x-payment-verified: true`, and settlement runs after the response |
-| > 10 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served |
-| > 10 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served free, recorded |
+| ≤ 3 | unset | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` |
+| ≤ 3 | unset | yes | *not asked* | **200**, plus `x-payment-verified: false` — the free tier is not a payment path |
+| ≤ 3 | set | no | *not asked* | **200**, the conversion, `x-free-tier-remaining: <n>` — a receiving address does not cancel the free tier |
+| ≤ 3 | set | yes | *not asked* | **200**, `x-free-tier-remaining: <n>` + `x-payment-verified: false`. **Never billed inside the free tier** |
+| > 3 | unset | either | *not asked* | **429**, `{"error": "free tier is 3 conversions per day per caller", …}` + `Retry-After` |
+| > 3 | set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool |
+| > 3 | set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable to send |
+| > 3 | set | yes | `isValid` | **200**, `x-payment-verified: true`, and settlement runs after the response |
+| > 3 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served |
+| > 3 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served free, recorded |
 | > 5,000 | set | yes | — | **429** + `Retry-After` — the runaway bound, not a price gate |
 
 Three rows deserve saying out loud:
@@ -492,10 +501,13 @@ Past the free tier, a payment is now **checked before the conversion is served
 and settled on chain immediately afterwards**, through the Coinbase CDP
 facilitator.
 
-> **Status.** The code path is live and tested end to end, but **no real payment
-> has settled yet.** Everything below is verified against a mock facilitator and
-> against a real `x402-fetch` client signing a real EIP-3009 authorization — not
-> against real USDC on Base. The flip criteria are at the end of this section.
+> **Status.** Live and proven with real money. On **2026-08-18** a real payment
+> in real USDC on Base verified and settled through the CDP facilitator — tx
+> `0xe2c8bb8d…`, `settlements` row `verify_ok = 1`, `settle_ok = 1`. It was made
+> by `scripts/pay-test.mjs`, so the one settlement on record is **our own test
+> call**; no third party has paid yet. Everything below is additionally covered
+> against a mock facilitator and against a real `x402-fetch` client signing a
+> real EIP-3009 authorization.
 
 ### The shape of it
 
@@ -656,7 +668,7 @@ npm run buyer:pay -- --yes
 ```
 
 **What step 4 actually costs:** one $0.001 USDC payment, *plus* today's free
-tier for whatever IP you run it from — up to 10 throwaway conversions. The paid
+tier for whatever IP you run it from — up to 3 throwaway conversions. The paid
 path is unreachable until the free tier is spent (that is the design), so the
 script burns it first and says so, call by call. It then signs, pays, and prints
 the status, `x-payment-verified`, and where to confirm the money moved.
@@ -665,24 +677,25 @@ The key in `.buyer.env` is a **plaintext private key on disk**. That is fine for
 a key holding a dollar and catastrophic for one holding anything else — fund it
 with the minimum that proves the path, and treat the file as burnable.
 
-### Flipping the honest-status box
+### The honest-status box
 
-The site still says settlement verification is not live, and **that copy stays
-until a real payment settles**. "The code is written and the tests pass" is not
-the same claim as "money has moved", and the status box exists to not blur the
-two.
+**Flipped 2026-08-18**, after all three criteria were met by a real payment:
 
-The criteria, all three:
+1. `npm run buyer:pay -- --yes` returned **200** with `x-payment-verified: true`.
+2. A `settlements` row carried `verify_ok = 1`, `settle_ok = 1` and a real
+   `tx_hash` (`0xe2c8bb8d…`).
+3. The $0.001 landed at the `PAYTO` address.
 
-1. `npm run buyer:pay -- --yes` returns **200** with `x-payment-verified: true`.
-2. A `settlements` row exists with `verify_ok = 1`, `settle_ok = 1`, and a real
-   `tx_hash`.
-3. The $0.001 is visible at the `PAYTO` address (and on the CDP x402 chart).
+The box now says payment is live and verified. **The rule holds in reverse, and
+that is the part worth keeping**: if settlement ever breaks — a run of
+`verify_ok = 0` in `settlements`, a facilitator outage that stops being
+transient, a revoked CDP key — the box goes back to naming what is broken,
+before anything else is fixed. "The code is written and the tests pass" is not
+the same claim as "money has moved", and the box exists to not blur the two in
+either direction.
 
-Then replace the `<p>` inside `<div class="status-box">` in `build.mjs` with the
-sentence in the HTML comment directly above it — it is written out in full,
-ready to paste — rebuild, and redeploy. Do not paraphrase it; the comment is the
-approved copy.
+The copy lives in `<div class="status-box">` in `build.mjs`, with a short
+comment above it recording the flip.
 
 ## Shutdown runbook
 
@@ -756,17 +769,17 @@ npx wrangler d1 execute DB --remote --command "
   GROUP BY entry ORDER BY conversions DESC, clicks DESC LIMIT 40;"
 ```
 
-**Free-tier pressure** — the number that says whether 10/day is the right number.
+**Free-tier pressure** — the number that says whether 3/day is the right number.
 `hit_the_ceiling` counts callers that spent the whole tier, so a rising share is
-the signal to raise `FREE_TIER_DAILY`, switch payment on, or both (the `10` in
-this query has to match it):
+the signal to raise `FREE_TIER_DAILY` — or evidence that the paid tier is doing
+its job (the `3` in this query has to match it):
 
 ```bash
 npx wrangler d1 execute DB --remote --command "
   SELECT day,
          COUNT(*)        AS callers,
          SUM(used)       AS conversions,
-         SUM(used >= 10) AS hit_the_ceiling,
+         SUM(used >= 3)  AS hit_the_ceiling,
          MAX(used)       AS busiest_caller
   FROM convert_quota
   GROUP BY day ORDER BY day DESC LIMIT 30;"
@@ -842,7 +855,7 @@ the same argument.
 |---|---|---|---|
 | 0 | Cloudflare edge | REACTIVE — free WAF custom rule blocking blocklist IPs (`ip.src in {…}`), populated from the `blocklist` table; the planned rate-limiting rule is unavailable on this account's plan (owner-verified 2026-08-18) | nothing blocks a first-seen IP at the edge; the in-Worker tiers below are the standing bound, and abuse is blocked at the edge only after it is identified |
 | 1 | Worker | 100 events / identifier / UTC day — **`/b` only**; convert rows are excluded from the count | honest runaway client stops being counted; UA rotation still mints fresh identifiers, which is a measurement cost, not a spend |
-| 1c | Worker | **10 conversions / caller / UTC day** (`FREE_TIER_DAILY`), or 5,000 once a payment has been **verified** by the facilitator (changed 2026-08-18 — presenting a header is no longer enough) | over-tier callers get 402 or 429; the key is the IP hash, so UA rotation does **not** mint a fresh allowance |
+| 1c | Worker | **3 conversions / caller / UTC day** (`FREE_TIER_DAILY`), or 5,000 once a payment has been **verified** by the facilitator (changed 2026-08-18 — presenting a header is no longer enough) | over-tier callers get 402 or 429; the key is the IP hash, so UA rotation does **not** mint a fresh allowance |
 | 2 | Worker | 200,000 events / UTC day, fail-closed before insert | metrics loss and no conversions for the rest of the day |
 | 3 | — | none; priced, not bounded — $2.49/day at 100 req/s, $25.82/day at 1,000 req/s | detective only: $25 alert + shutdown runbook |
 
@@ -861,8 +874,8 @@ flag from the previous pass, closed. Rung 1 counts `events` rows
 `WHERE type <> 'convert'`, and conversions are metered by `convert_quota`
 instead, so:
 
-- A caller that loads the page five times still has all 10 conversions. A caller
-  that spends all 10 conversions is still counted as a visitor. Neither budget
+- A caller that loads the page five times still has all 3 conversions. A caller
+  that spends all 3 conversions is still counted as a visitor. Neither budget
   reaches into the other.
 - Conversions still write an `events` row — that is measurement, not
   rate-limiting: what got called, and which tool. The input is never written.
@@ -1044,8 +1057,9 @@ much allowance is left. It asserts the `/check` contract, fetches
 `catalog.json` / `llms.txt` / `llms-full.txt` and sanity-checks their shape
 (including that `catalog.json` and `/check` agree about what is hosted), then
 makes exactly one conversion — accepting **200**, **402** (paid gate live, tier
-spent) or **429** (tier spent, payment off) as passes, labelled differently, so
-a repeat run on a spent day still tells the truth. The remaining checks are
+spent) or **429** (tier spent with no receiving address, or the paid ceiling) as
+passes, labelled differently, so a repeat run on a spent day still tells the
+truth. The remaining checks are
 refusals (405, 404), which reach no counter.
 
 ```bash
@@ -1054,9 +1068,9 @@ TOOLSHED_URL=http://localhost:8787 npm run test:live
 ```
 
 `npm run test:live:full` is the older `scripts/test-live.mjs`: the whole surface
-plus a cost estimate, but it **spends six free conversions a run**, so two runs
-in a UTC day from one IP hit the tier. Use it deliberately, not in a loop. Its
-`--quota` probe burns the day on purpose and is unchanged.
+plus a cost estimate, but it **spends the caller's whole 3/day allowance**, and
+its remaining convert calls land on the paywall by design. One run a day per IP.
+Its `--quota` probe burns the day on purpose.
 
 ## Maintenance
 
@@ -1080,20 +1094,33 @@ conversions, a malformed-input `400`, a `413` at 300 KB, and a `POST /b` visit �
 then prints a PASS/FAIL table and exits non-zero on any failure. Zero
 dependencies; Node 18+ for global `fetch`.
 
-**A default run now spends 6 of the caller's 10 free conversions** — the five
-happy paths plus the malformed one, which claims its call before the body is
-read. (The 413 is rejected on the declared size, before any D1 work.) **Two runs
-in one UTC day from one IP will hit the free tier**, and the second one reports
-429s. That is the design working, not a fault, and the test says so in the row
-rather than leaving someone to debug a healthy converter.
+**A default run spends all 3 of the caller's free conversions, and is
+deliberately wider than the tier.** Seven calls reach `/convert`: five happy
+paths, a malformed-input case (which claims its free call before the body is
+read) and the 413 (rejected on the declared size, before any D1 work — it costs
+nothing). Only the first **3** can be served, so the run is written as a ledger:
 
-A `402` is reported as a pass, not a failure: once `PAYTO` is set and the free
-tier is spent, the envelope *is* the correct response.
+- Calls 1–3 must be **200**, with the converter's own output and
+  `x-free-tier-remaining` counting down **2 → 1 → 0** exactly.
+- Every `/convert` call after them is over the tier, where the paywall is the
+  **correct** answer. The run asserts that transition at exactly the call the
+  tier runs out on — a **402** with a spec-shaped x402 envelope, or a **429**
+  with the documented free-tier body where `PAYTO` is unset. Those rows pass
+  because the *gate* is right, and each one says the converter behind it was
+  **not exercised** this run. They are not converter passes.
+
+So only the first three converters in the list get live coverage on a given day.
+`--tools=<id,...>` re-points the three scarce slots at the converters you
+actually changed; the local suite (`npm test`) is what covers all five, plus the
+malformed-input case, unconditionally.
+
+**A second run in the same UTC day from the same IP fails on its first
+conversion**, saying the tier was already spent rather than blaming a converter.
 
 `--quota` is the free-tier probe and is **not** part of the default run, because
-it deliberately burns the day: 5 beacons, 10 conversions, one over, then three
+it deliberately burns the day: 5 beacons, 3 conversions, one over, then three
 more under rotated user-agents. It asserts, in order, that beacons do not touch
-the conversion budget, that `x-free-tier-remaining` counts 9 → 0, that call 11 is
+the conversion budget, that `x-free-tier-remaining` counts 2 → 0, that call 4 is
 refused with the documented 429 body and a sane `Retry-After` (or a 402 envelope
 when `PAYTO` is set), and that rotating the user-agent from the same IP changes
 nothing. It needs a caller whose allowance is untouched today, and it paces
@@ -1124,5 +1151,7 @@ Changing the free tier is one line: `FREE_TIER_DAILY` in `build.mjs`, then
 `npm run build` (which rewrites `worker/catalog.generated.js`) and deploy. Page
 copy, `catalog.json`, `llms.txt`, `llms-full.txt`, `GET /check` and the Worker's
 enforcement all move together. Two numbers are typed a second time and are worth
-grepping when it changes: `FREE_TIER_EXPECT` in `scripts/test-live.mjs` and the
-`10` in the free-tier pressure query above.
+grepping when it changes: `FREE_TIER_EXPECT` in `scripts/test-live.mjs`,
+`FREE_TIER_DAILY` in `mcp/server.mjs` (wording only — the service is
+authoritative), the hardcoded numbers in `skills/toolshed/SKILL.md`, and the
+`3` in the free-tier pressure query above.

@@ -1,6 +1,6 @@
 ---
 name: toolshed
-description: Convert files/data between formats using Lemon Toolshed's hosted conversion endpoints — 10 free conversions a day, then $0.001 a call in USDC via x402; check pair availability first.
+description: Convert files/data between formats using Lemon Toolshed's hosted conversion endpoints — 3 free conversions a day, then $0.001 a call in USDC via x402; check pair availability first.
 ---
 
 # Toolshed
@@ -8,10 +8,10 @@ description: Convert files/data between formats using Lemon Toolshed's hosted co
 Conversion tools you call over HTTP with nothing installed. No login, no
 account, no key.
 
-**Every tool is free to try: 10 conversions a day.** Past that a call is priced
+**Every tool is free to try: 3 conversions a day.** Past that a call is priced
 at $0.001 in USDC on Base, paid per call with x402 — see
 [Paying (x402)](#3-paying-x402). The count is per caller per UTC day, and a
-caller is an IP address: rotating the user-agent does not get you a second 10.
+caller is an IP address: rotating the user-agent does not get you a second 3.
 
 Base URL: `https://toolshed.lemon-agent.dev`
 
@@ -61,28 +61,29 @@ curl -X POST "https://toolshed.lemon-agent.dev/convert/md-html" \
 - Malformed input answers `400` with `{"error": "..."}`. Read the message; it
   names the problem. A rejected call still spends a free-tier conversion.
 - Every free-tier answer carries `x-free-tier-remaining: <n>` — how many of the
-  day's 10 are left. At `0`, the next call is refused.
+  day's 3 are left. At `0`, the next call is refused.
 
 Live endpoints — all five priced the same, all five free to try:
 
 | id | converts | price |
 | --- | --- | --- |
-| `md-html` | Markdown to HTML | 10/day free, then $0.001/call |
-| `json-yaml` | JSON to YAML | 10/day free, then $0.001/call |
-| `yaml-json` | YAML to JSON | 10/day free, then $0.001/call |
-| `csv-json` | CSV to JSON (array of objects from the header row) | 10/day free, then $0.001/call |
-| `html-markdown` | HTML to Markdown | 10/day free, then $0.001/call |
+| `md-html` | Markdown to HTML | 3/day free, then $0.001/call |
+| `json-yaml` | JSON to YAML | 3/day free, then $0.001/call |
+| `yaml-json` | YAML to JSON | 3/day free, then $0.001/call |
+| `csv-json` | CSV to JSON (array of objects from the header row) | 3/day free, then $0.001/call |
+| `html-markdown` | HTML to Markdown | 3/day free, then $0.001/call |
 
 Treat this table as a cache; `/check` is authoritative.
 
 ## 3. Paying (x402)
 
-A `402` **or** a `429` means the same thing: this caller's 10 free conversions
+A `402` **or** a `429` means the same thing: this caller's 3 free conversions
 for the UTC day are gone.
 
-- **`429`** — payment is not switched on yet, so there is nowhere to pay. The
-  body is `{"error": "free tier is 10 conversions per day per caller",
-  "free_tier_daily": 10, "paid_tier": "...", "retry": "tomorrow UTC"}` and a
+- **`429`** — this deployment has no receiving address configured, so there is
+  nowhere to pay. (Not what `toolshed.lemon-agent.dev` answers — it answers the
+  `402` below.) The body is `{"error": "free tier is 3 conversions per day per
+  caller", "free_tier_daily": 3, "paid_tier": "...", "retry": "tomorrow UTC"}` and a
   `Retry-After` header gives the seconds to midnight UTC. Do not retry in a
   loop, and do not retry with a different user-agent — the counter is keyed on
   the IP. Wait, or use the local tool from `/check`.
@@ -136,8 +137,9 @@ is the same data structured.
 
 ## Limits
 
-- **10 conversions per caller per UTC day, free.** Over that, `402` (pay) or
-  `429` (payment not switched on yet). The caller key is the IP address.
+- **3 conversions per caller per UTC day, free.** Over that, `402` (pay — this
+  is what the hosted service answers) or `429` (a deployment with no receiving
+  address). The caller key is the IP address.
 - The edge blocks bursts at 5 requests / 10 seconds per IP — pace calls rather
   than firing them in a tight loop.
 - `413` over 256 KB, `400` on malformed input, `503` when the service is down —

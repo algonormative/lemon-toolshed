@@ -15,7 +15,8 @@
 //
 //   200  the converter ran
 //   402  the paid gate is live and this caller's free tier is spent — correct
-//   429  the free tier is spent and payment is off — also correct
+//   429  the free tier is spent on a deployment with no receiving address, or the
+//        paid ceiling is reached — also correct
 //
 // Only a 5xx, a wrong content-type, or output that does not look like the
 // conversion is a failure. That is what "never depends on quota state" means
@@ -28,8 +29,9 @@
 // Zero dependencies. Node 18+ for global fetch.
 //
 // (`npm run test:live:full` runs scripts/test-live.mjs, the older and much
-// hungrier probe: it spends SIX free-tier conversions per run plus a cost
-// estimate. Use it deliberately, not in a loop.)
+// hungrier probe: it spends the caller's WHOLE daily allowance — all three free
+// conversions — plus a cost estimate, and its remaining convert calls land on
+// the paywall by design. Use it deliberately, once a day, not in a loop.)
 
 const ARG = process.argv.slice(2).find((a) => !a.startsWith('--'));
 const BASE = (ARG || process.env.TOOLSHED_URL || 'https://toolshed.lemon-agent.dev').replace(/\/+$/, '');

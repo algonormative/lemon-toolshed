@@ -154,18 +154,22 @@ describe('spoof resistance', () => {
       'csv-json': 'a\n1\n',
       'html-markdown': '<p>hi</p>',
     };
+    // Spend the allowance CYCLING through the tools rather than looping a fixed
+    // number of rounds, so the test asks its question — does switching tools
+    // reset the counter? — at whatever FREE_TIER_DAILY happens to be. A fixed
+    // two rounds of five only ever worked while the tier was exactly 10 wide.
+    assert.ok(FREE_TIER_DAILY >= 2, 'this test needs at least two free calls to prove anything');
     let spent = 0;
-    for (let round = 0; round < 2; round++) {
-      for (const id of tools) {
-        const res = await api.convert(id, inputs[id], { ip });
-        spent += 1;
-        assert.equal(res.status, 200, `${id} answered ${res.status}`);
-        assert.equal(
-          res.headers.get('x-free-tier-remaining'),
-          String(FREE_TIER_DAILY - spent),
-          `switching tools reset the counter at ${id}`
-        );
-      }
+    while (spent < FREE_TIER_DAILY) {
+      const id = tools[spent % tools.length];
+      const res = await api.convert(id, inputs[id], { ip });
+      spent += 1;
+      assert.equal(res.status, 200, `${id} answered ${res.status} on call ${spent}`);
+      assert.equal(
+        res.headers.get('x-free-tier-remaining'),
+        String(FREE_TIER_DAILY - spent),
+        `switching tools reset the counter at ${id}`
+      );
     }
     assert.equal((await api.convert('md-html', '# hi\n', { ip })).status, 429);
   });
@@ -196,7 +200,9 @@ describe('the beacon budget and the conversion budget are separate', () => {
     // bites at the documented number.
     const ip = ips.pinned(5);
     const ua = 'rung1-suite/1';
-    const conversions = 5;
+    // As many conversions as the tier allows — the claim needs at least one, and
+    // spending exactly the allowance keeps this from depending on the tier width.
+    const conversions = FREE_TIER_DAILY;
     const attempts = RUNG1_PER_ID_PER_DAY + 3;
 
     for (let i = 0; i < conversions; i++) {
