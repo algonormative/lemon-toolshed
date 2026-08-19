@@ -103,6 +103,7 @@ const SUITE_OCTET = {
   'yaml-json': 19,
   settlement: 20,
   'tier-off': 21,
+  alerts: 22,
 };
 
 /**

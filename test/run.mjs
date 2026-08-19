@@ -69,6 +69,16 @@ const PHASES = [
     standalone: true,
     files: ['test/x402-settlement.test.mjs'],
   },
+  {
+    // STANDALONE for the same reason as settlement, twice over: this suite runs
+    // a mock facilitator AND a mock Telegram, both on ports it only learns at
+    // startup, so FACILITATOR_URL and TELEGRAM_API_BASE cannot be known out
+    // here. It also reads the worker's own stdout to find the .eml files
+    // miniflare's send_email simulator writes, which needs the worker it booted.
+    name: 'alerts (mock facilitator + mock Telegram + send_email)',
+    standalone: true,
+    files: ['test/alerts.test.mjs'],
+  },
 ];
 
 const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));

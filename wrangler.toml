@@ -109,6 +109,59 @@ routes = [
 # `settlements` is a NEW TABLE. Run the migration in README § Migration — the
 # settlements table before deploying a Worker that verifies payments.
 
+# ------------------------------------------------------------------ alerts
+#
+# Owner-facing payment alerts: a Telegram ping and an email when money moves.
+# They fire from inside ctx.waitUntil, AFTER the caller has its response, and
+# each channel is independently try/caught — so a dead Telegram, a bad token or
+# an unconfigured Email Routing zone costs a notification and NOTHING ELSE. A
+# channel with no config is skipped before any network call, which means UNSET
+# IS A WORKING STATE: the defaults below change no behaviour on their own.
+# See README § Payment alerts.
+#
+# THREE SECRETS, none of which may ever appear in this committed file:
+#
+#   npx wrangler secret put TELEGRAM_BOT_TOKEN   # from @BotFather
+#   npx wrangler secret put TELEGRAM_CHAT_ID     # README says how to find it
+#   npx wrangler secret put ALERT_EMAIL_TO       # the owner's personal address
+#
+# ALERT_EMAIL_TO is a SECRET rather than a var for a reason that is about this
+# repo rather than about cryptography: the toolshed is public, and a personal
+# inbox address committed to it is a spam magnet forever. It must ALSO be a
+# VERIFIED Email Routing destination on this zone — Cloudflare refuses to
+# deliver to an address that has not clicked its confirmation link.
+#
+# TELEGRAM_API_BASE is an OPTIONAL var, defaulting to https://api.telegram.org.
+# Only the test suite sets it, to reach a local mock — the same override pattern
+# as FACILITATOR_URL above. It is deliberately not set here.
+
+[vars]
+# The house's own wallets, so the owner's $0.001 test buys read as "🧪 test
+# settlement" rather than as a sale. Any payer NOT listed here gets the loud
+# "🍋💰 THIRD PARTY PAID" message — the event this whole channel exists for,
+# which must never look like a drill.
+#
+# NON-SECRET on purpose: these are public chain addresses, already visible on
+# Base to anyone running the ledger queries in README § Reading the ledger.
+# Comma-separated; compared lowercased, so the case written here does not
+# matter.
+#
+# This is the throwaway buyer from `npm run buyer:create` (README § The buyer
+# test kit) — the key behind the live settlements this rail has already proven.
+HOUSE_PAYERS = "0x632ff2f904cc6ab6d741a42014c4c483f328e92f"
+
+# The email channel's binding. UNRESTRICTED — deliberately no
+# `destination_address` field, because that would put the owner's personal inbox
+# in a public repo. The recipient comes from the ALERT_EMAIL_TO secret instead,
+# and Cloudflare still enforces the constraint that actually matters: it only
+# delivers to a VERIFIED Email Routing destination on this zone.
+#
+# The Worker reads this binding defensively (`env.ALERT_EMAIL?.send`), so a
+# deployment on an account without Email Routing has no email channel rather
+# than a broken one.
+[[send_email]]
+name = "ALERT_EMAIL"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "lemon_toolshed"

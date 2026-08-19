@@ -53,6 +53,11 @@ import { marked } from 'marked';
 import yaml from 'js-yaml';
 import TurndownService from 'turndown';
 import domino from '@mixmark-io/domino';
+// Cloudflare's built-in email module, backing the `send_email` binding. It is a
+// workerd built-in rather than an npm package, so it adds nothing to the bundle
+// and it is present whether or not the binding is configured — the ALERT_EMAIL
+// binding's ABSENCE is what turns the email channel off, not this import.
+import { EmailMessage } from 'cloudflare:email';
 // The catalog is compiled in at build time. FREE_TIER_DAILY is deliberately NOT
 // imported: the build constant is what the STATIC surfaces advertise, and the
 // only runtime authority is env.FREE_TIER_DAILY — see freeTierDaily() below.
@@ -395,9 +400,13 @@ async function handleConvert(request, env, path, ctx) {
   const dayStart = Math.floor(Date.parse(`${day}T00:00:00Z`) / 1000);
 
   // What the response will say about payment, decided below and rendered by
-  // servedHeaders(). `settle` is the deferred half of a verified payment.
+  // servedHeaders(). `settle` is the deferred half of a verified payment, and
+  // `alert` the owner-facing ping for a call served WITHOUT one — the verified
+  // ping is fired by settleAndRecord(), which is the only place that knows
+  // whether the settlement landed.
   let outcome = { kind: 'free', remaining: 0, presented };
   let settle = null;
+  let alert = null;
 
   try {
     const salt = await currentSalt(db, day);
@@ -510,6 +519,20 @@ async function handleConvert(request, env, path, ctx) {
           txHash: null,
           error: verdict.unavailable,
         });
+        // REVENUE LEAKING, and the owner wants to hear about it while it is
+        // happening. This branch serves a conversion that nobody paid for —
+        // availability-first is deliberate, but a RUN of these is the paid rail
+        // silently not working, and the ledger query that would reveal it is one
+        // nobody runs at 3am. It is queued rather than sent here, alongside the
+        // settle block below, so a conversion that then 400s does not alarm
+        // about a call that was never served.
+        alert = {
+          kind: 'unverified',
+          tool: id,
+          payer: verdict.payer,
+          amount: requirements.maxAmountRequired,
+          error: publicReason(verdict.unavailable),
+        };
       }
     }
 
@@ -567,8 +590,18 @@ async function handleConvert(request, env, path, ctx) {
   // ctx.waitUntil and its outcome lands in `settlements` rather than in this
   // response. A settlement that fails here is the accepted exposure: one
   // conversion served for $0.001 that never arrived, recorded as settle_ok = 0.
-  if (settle) {
-    const work = settleAndRecord(env, db, settle);
+  //
+  // The owner's ALERT rides in the same deferred slot, for the same reason and
+  // one more: a notification must never be able to slow, fail or change a
+  // response the buyer already paid for. The two are mutually exclusive in
+  // practice — `settle` is the verified path and `alert` the unverified one —
+  // and the verified ping is fired from inside settleAndRecord(), which is the
+  // only place that knows whether the settlement actually landed.
+  const deferred = [];
+  if (settle) deferred.push(settleAndRecord(env, db, settle));
+  if (alert) deferred.push(sendPaymentAlert(env, alert));
+  if (deferred.length) {
+    const work = Promise.all(deferred);
     if (ctx?.waitUntil) ctx.waitUntil(work);
     else await work; // no ctx (direct invocation): correctness over latency
   }
@@ -1151,6 +1184,25 @@ async function settleAndRecord(env, db, { requirements, facRequirements, version
     // The response shipped a long time ago. A lost ledger row is bad, but
     // throwing into waitUntil helps nobody.
   }
+
+  // The owner's ping, LAST — after the ledger write, never instead of it. The
+  // `settlements` table is the source of truth for money; this is a courtesy
+  // that tells a human to go look. Ordering it this way means a channel outage
+  // can never cost a row, and it never throws (see sendPaymentAlert).
+  //
+  // `verifyOk` is 1 by construction here — reaching this function at all means
+  // the facilitator returned isValid — so this fires on real money moving, or
+  // on real money that was supposed to move and did not. Both are worth waking
+  // up for; `settleOk` is what tells them apart.
+  await sendPaymentAlert(env, {
+    kind: 'settled',
+    tool,
+    payer,
+    amount: requirements.maxAmountRequired,
+    settleOk,
+    txHash,
+    error,
+  });
 }
 
 /**
@@ -1302,6 +1354,335 @@ async function recordSettlement(db, { now, tool, payer, amount, verifyOk, settle
     )
     .bind(now, tool, payer ?? null, amount, verifyOk, settleOk, txHash ?? null, error ?? null)
     .run();
+}
+
+// ------------------------------------------------------------------ alerts
+//
+// Owner-facing payment alerts on two channels: Telegram (instant, primary) and
+// email through Cloudflare Email Routing (secondary). They exist because the
+// `settlements` table is a perfect record that nobody reads at 3am, and the one
+// event this service is built to produce — a stranger paying for something —
+// is worth a phone buzzing.
+//
+// FOUR RULES, and together they are the whole design.
+//
+//   AN ALERT NEVER TOUCHES THE PAYING CALLER. Everything here runs inside
+//   ctx.waitUntil, after the response has shipped, and each channel is caught
+//   independently. A dead Telegram, a revoked token, an unverified email
+//   destination or a missing binding costs a notification and nothing else.
+//
+//   NO RETRIES. AN ALERT IS NOT A LEDGER. `settlements` is the source of truth
+//   and the queries in README § Reading the ledger are what reconcile money; a
+//   retry loop here would buy duplicate pings on a flaky network and still lose
+//   the alert in a real outage. Fire once, drop it, move on.
+//
+//   A CHANNEL WITH NO CONFIG IS SKIPPED BEFORE ANY NETWORK CALL. Unset is a
+//   working state: this Worker ran without alerts for its entire life until
+//   now, and a deployment that never sets the secrets must behave exactly as it
+//   did — no fetch, no binding access, no cost.
+//
+//   ONLY VERIFIED MONEY IS WORTH A PING. Malformed headers and
+//   facilitator-rejected payments are probe noise — the shed is on a public
+//   index and gets scanned continuously — and paging on them would train the
+//   owner to ignore the channel, which is the only way this feature can truly
+//   fail. The two things that DO fire are a payment the facilitator accepted
+//   (settled or not), and a call served with nothing checked at all.
+
+// The email channel's identity. `alerts@lemon-agent.dev` need not be a real
+// mailbox — Email Routing sends FROM the zone — but it must be ON the zone.
+const ALERT_FROM = 'alerts@lemon-agent.dev';
+const ALERT_FROM_NAME = 'Toolshed';
+
+const DEFAULT_TELEGRAM_API_BASE = 'https://api.telegram.org';
+
+// Generous, because nobody is waiting: the response shipped before this ran.
+// It exists only so a hung socket cannot pin a waitUntil open indefinitely.
+const ALERT_TIMEOUT_MS = 10_000;
+
+/**
+ * Atomic USDC (6 decimals) rendered as money: "1000" → "$0.001".
+ *
+ * Anything that is not a run of digits is passed through labelled rather than
+ * coerced — a NaN in a revenue alert is worse than an ugly one.
+ */
+function formatUsdc(atomic) {
+  const raw = String(atomic ?? '');
+  if (!/^\d+$/.test(raw)) return `${raw || 'unknown'} (atomic)`;
+  const padded = raw.padStart(USDC_DECIMALS + 1, '0');
+  const whole = padded.slice(0, -USDC_DECIMALS);
+  const frac = padded.slice(-USDC_DECIMALS).replace(/0+$/, '');
+  return `$${whole}${frac ? `.${frac}` : ''}`;
+}
+
+/**
+ * Is this payer one of the house's own wallets?
+ *
+ * HOUSE_PAYERS is a non-secret var of public chain addresses (wrangler.toml),
+ * and it exists so the owner's own $0.001 probes read as a drill. The
+ * distinction is the entire point of the channel: if a test buy and a stranger's
+ * purchase produced the same message, the loud one would stop meaning anything.
+ * Unset means every payer is a third party, which fails towards TOO LOUD — the
+ * right direction for a revenue alert.
+ */
+function isHousePayer(env, payer) {
+  if (!payer) return false;
+  const target = String(payer).trim().toLowerCase();
+  return String(env?.HOUSE_PAYERS || '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean)
+    .includes(target);
+}
+
+/**
+ * The alert's first line — the Telegram message's opener and the email subject,
+ * deliberately the same string so a phone notification and an inbox preview say
+ * the identical thing.
+ *
+ * Three shapes, visually distinct at a glance because that is all a lock screen
+ * gives you:
+ *
+ *   🍋💰 THIRD PARTY PAID …   a stranger paid. The event.
+ *   🧪 test settlement …      the house paying itself. A drill.
+ *   ⚠️ SERVED WITHOUT VERIFICATION …   revenue leaked. Different problem.
+ */
+function alertHeadline(env, alert) {
+  const amount = formatUsdc(alert.amount);
+  const house = isHousePayer(env, alert.payer);
+  const payer = alert.payer || 'unknown';
+
+  if (alert.kind === 'unverified') {
+    // The house marker still goes on, because the owner's own probe hitting a
+    // down facilitator is a configuration story, not a revenue story. The ⚠️
+    // stays either way — the leak is real in both cases.
+    return (
+      `⚠️ SERVED WITHOUT VERIFICATION${house ? ' (test payer)' : ''} — ` +
+      `${amount} ${alert.tool} — payer ${payer} — x-payment-error: ${alert.error}`
+    );
+  }
+
+  const settled = alert.settleOk === 1 ? 'settled' : `SETTLE FAILED (${alert.error || 'unknown'})`;
+  const lead = house ? '🧪 test settlement' : '🍋💰 THIRD PARTY PAID';
+  return `${lead} — ${amount} ${alert.tool} — payer ${payer} — tx ${alert.txHash || 'none'} — ${settled}`;
+}
+
+/** The headline plus the detail a human needs before deciding to care. */
+function alertMessage(env, alert) {
+  const subject = alertHeadline(env, alert);
+  const lines = [subject, '', `tool     ${alert.tool}`];
+  lines.push(`amount   ${formatUsdc(alert.amount)}  (${alert.amount} atomic USDC on Base)`);
+  lines.push(`payer    ${alert.payer || 'unknown'}`);
+
+  if (alert.kind === 'unverified') {
+    lines.push(`checked  NO — ${alert.error}`);
+    lines.push('');
+    lines.push('This conversion was SERVED and the payment was never checked, so');
+    lines.push('nobody paid for it. Serving anyway is deliberate (availability-first');
+    lines.push('at $0.001 a call), but a run of these is the paid rail quietly down.');
+  } else {
+    lines.push('checked  yes — the facilitator returned isValid');
+    lines.push(
+      alert.settleOk === 1
+        ? `settled  yes — ${alert.txHash}`
+        : `settled  NO — ${alert.error || 'unknown'} (verified, so the caller was served)`
+    );
+    if (alert.settleOk === 1 && alert.txHash) {
+      lines.push(`explorer https://basescan.org/tx/${alert.txHash}`);
+    }
+  }
+
+  lines.push('');
+  lines.push('The settlements table is the source of truth; this is a courtesy ping.');
+  return { subject, text: lines.join('\n') };
+}
+
+/**
+ * Fire every configured channel. NEVER THROWS, NEVER RETRIES.
+ *
+ * `allSettled` rather than `all` is the load-bearing choice: the channels must
+ * not be able to cancel each other, so a Telegram outage still leaves the email
+ * to arrive. Both halves are additionally caught inside themselves, which makes
+ * this belt-and-braces — deliberately, because the caller of this function is a
+ * ctx.waitUntil where a rejection is both invisible and pointless.
+ */
+async function sendPaymentAlert(env, alert) {
+  try {
+    const { subject, text } = alertMessage(env, alert);
+    await Promise.allSettled([sendTelegramAlert(env, text), sendEmailAlert(env, subject, text)]);
+  } catch {
+    /* an alert is best-effort by construction — see the rules above */
+  }
+}
+
+/**
+ * Telegram — the primary channel, because it is the one that buzzes.
+ *
+ * TELEGRAM_API_BASE is overridable so the suite can point it at a local mock,
+ * exactly as FACILITATOR_URL is; production never sets it.
+ */
+async function sendTelegramAlert(env, text) {
+  // Config presence FIRST, before anything that costs. Both halves are needed:
+  // a token with no chat id has nowhere to send.
+  if (!env?.TELEGRAM_BOT_TOKEN || !env?.TELEGRAM_CHAT_ID) return;
+
+  const base = (env.TELEGRAM_API_BASE || DEFAULT_TELEGRAM_API_BASE).replace(/\/+$/, '');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ALERT_TIMEOUT_MS);
+  try {
+    // The RESPONSE IS NOT INSPECTED, and that is a decision rather than an
+    // oversight: there is nothing to do with a 400 here. No retry (rule two),
+    // and the money is already recorded. Reading the body would only add a way
+    // to throw inside a waitUntil.
+    await fetch(`${base}/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text }),
+      signal: controller.signal,
+    });
+  } catch {
+    /* best-effort: an unreachable Telegram costs a ping, nothing more */
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Email — the secondary channel, through the `send_email` binding.
+ *
+ * BOTH halves are checked before anything is built. The binding is absent
+ * unless wrangler.toml declares `[[send_email]]` AND the account has Email
+ * Routing enabled, so `env.ALERT_EMAIL?.send` is a genuine runtime question and
+ * not a formality; ALERT_EMAIL_TO is a secret, and must name a VERIFIED Email
+ * Routing destination or Cloudflare rejects the send.
+ *
+ * Until the zone's DNS and routing are live this silently no-ops, which is the
+ * intended state during setup rather than a failure to fix.
+ */
+async function sendEmailAlert(env, subject, text) {
+  if (typeof env?.ALERT_EMAIL?.send !== 'function' || !env?.ALERT_EMAIL_TO) return;
+  try {
+    const raw = rawEmail({ to: env.ALERT_EMAIL_TO, subject, text });
+    await env.ALERT_EMAIL.send(new EmailMessage(ALERT_FROM, env.ALERT_EMAIL_TO, raw));
+  } catch {
+    /* best-effort: an unverified destination or a dead zone costs a ping */
+  }
+}
+
+// --- RFC 5322 ---------------------------------------------------------------
+//
+// Hand-rolled, and the trade is worth stating. A MIME library would be a
+// production dependency in a Worker bundle to produce six headers and a
+// plain-text body — the same argument that keeps @coinbase/x402 out of the
+// facilitator path above. What it costs is that the details have to be right,
+// because Cloudflare PARSES what it is handed and rejects what it cannot read:
+// CRLF line endings (RFC 5322 § 2.1), a real Message-ID, a Date in the numeric-
+// zone form, and a `From:` header whose address matches the envelope sender.
+
+const RFC2822_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const RFC2822_MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+];
+
+// 75 characters is the RFC 2047 § 2 ceiling for one encoded-word. Minus
+// "=?UTF-8?B?" (10) and "?=" (2) that leaves 63 for the base64 itself, which
+// carries 47 bytes — rounded down to 45, a multiple of 3, so no chunk needs
+// interior padding.
+const MAX_ENCODED_WORD_BYTES = 45;
+
+/**
+ * A header value, RFC 2047 encoded when it is not plain ASCII.
+ *
+ * The headline carries emoji — 🍋💰, 🧪, ⚠️ — and a raw non-ASCII byte in a
+ * header is not legal RFC 5322 and gets mangled or refused by real mail
+ * servers. So a non-ASCII value becomes base64 encoded-words, each under the
+ * 75-character limit, split on CODEPOINT boundaries (iterating the string
+ * yields whole codepoints) so a multi-byte character is never cut in half —
+ * which would decode to a replacement character in the subject line.
+ *
+ * Embedded newlines are flattened first: a header value that can contain CRLF
+ * is a header-injection hole, and the subject is built from a tool id and a
+ * facilitator's error string.
+ */
+function encodeHeaderValue(value) {
+  const text = String(value).replace(/[\r\n]+/g, ' ');
+  if (/^[\x20-\x7E]*$/.test(text)) return text;
+
+  const encoder = new TextEncoder();
+  const words = [];
+  let chunk = '';
+  let size = 0;
+  for (const ch of text) {
+    const width = encoder.encode(ch).length;
+    if (size + width > MAX_ENCODED_WORD_BYTES && chunk) {
+      words.push(chunk);
+      chunk = '';
+      size = 0;
+    }
+    chunk += ch;
+    size += width;
+  }
+  if (chunk) words.push(chunk);
+
+  // Continuation lines are joined by CRLF + a single space: that is the RFC
+  // 5322 folding rule, and RFC 2047 says the whitespace between two adjacent
+  // encoded-words is dropped on decode, so the subject reassembles exactly.
+  return words.map((w) => `=?UTF-8?B?${base64Encode(encoder.encode(w))}?=`).join('\r\n ');
+}
+
+/** `"Toolshed" <alerts@lemon-agent.dev>`, or `<addr>` with no display name. */
+function formatMailbox(name, address) {
+  if (!name) return `<${address}>`;
+  const encoded = encodeHeaderValue(name);
+  // An encoded-word is already an atomic token and must NOT be quoted; a plain
+  // display name is quoted so punctuation in it cannot be read as address
+  // syntax.
+  const display = encoded.startsWith('=?') ? encoded : `"${name.replace(/(["\\])/g, '\\$1')}"`;
+  return `${display} <${address}>`;
+}
+
+/**
+ * RFC 2822 § 3.3 date, in UTC.
+ *
+ * Built from the UTC getters rather than from `toUTCString()`, which ends in
+ * "GMT" where the grammar wants a numeric zone. "GMT" is legal only as obsolete
+ * syntax, and obsolete syntax is exactly what a strict parser declines.
+ */
+function rfc2822Date(date) {
+  const p = (n) => String(n).padStart(2, '0');
+  return (
+    `${RFC2822_DAYS[date.getUTCDay()]}, ${p(date.getUTCDate())} ` +
+    `${RFC2822_MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()} ` +
+    `${p(date.getUTCHours())}:${p(date.getUTCMinutes())}:${p(date.getUTCSeconds())} +0000`
+  );
+}
+
+/**
+ * A Message-ID that is actually unique: milliseconds plus 8 random bytes, in
+ * the sending domain. Cloudflare REQUIRES the header — a message without one is
+ * rejected outright — and a duplicate id invites mail clients to thread or
+ * dedupe two unrelated alerts into one.
+ */
+function newMessageId() {
+  const domain = ALERT_FROM.split('@')[1];
+  return `<${Date.now().toString(36)}.${randomHex(8)}@${domain}>`;
+}
+
+/** The whole message: headers, a blank line, and a plain-text body. */
+function rawEmail({ to, subject, text, date = new Date() }) {
+  const headers = [
+    `From: ${formatMailbox(ALERT_FROM_NAME, ALERT_FROM)}`,
+    `To: ${formatMailbox(null, to)}`,
+    `Subject: ${encodeHeaderValue(subject)}`,
+    `Date: ${rfc2822Date(date)}`,
+    `Message-ID: ${newMessageId()}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=utf-8',
+  ];
+  // CRLF throughout, including inside the body — a bare LF in an SMTP payload
+  // is the classic silently-corrupted-message bug.
+  const body = String(text).replace(/\r?\n/g, '\r\n');
+  return `${headers.join('\r\n')}\r\n\r\n${body}\r\n`;
 }
 
 // --- base64 helpers ---------------------------------------------------------

@@ -532,6 +532,11 @@ reached.
 | `FACILITATOR_URL` | yes | the x402 facilitator base URL. Defaults to `https://api.cdp.coinbase.com/platform/v2/x402`; overridden only by the test suite, which points it at a local mock. |
 | `CDP_API_KEY_ID` | yes | CDP API key id. A **Worker secret**, not a var. |
 | `CDP_API_KEY_SECRET` | yes | CDP API key secret (base64 Ed25519). A **Worker secret**. Without both keys nothing can be verified, and paid calls are served with `x-payment-error: facilitator-unconfigured`. |
+| `TELEGRAM_BOT_TOKEN` | yes | owner alerts. A **Worker secret**. Unset = no Telegram channel. See [Payment alerts](#payment-alerts). |
+| `TELEGRAM_CHAT_ID` | yes | owner alerts. A **Worker secret**. Unset = no Telegram channel. |
+| `TELEGRAM_API_BASE` | yes | optional override of the Telegram API root, default `https://api.telegram.org`. Only the test suite sets it, to reach a local mock. |
+| `ALERT_EMAIL_TO` | yes | owner alerts by email. A **Worker secret**, and it must be a **verified Email Routing destination** on the zone. Unset = no email channel. |
+| `HOUSE_PAYERS` | yes | comma-separated wallet addresses whose payments read as a 🧪 test rather than a 🍋💰 sale. Compared lowercased. Non-secret: these are public chain addresses, and it lives in `wrangler.toml`. |
 
 **`FREE_TIER_DAILY` is only half the switch.** It is what the *Worker* enforces;
 the *static* copy — the page, `catalog.json`, `llms.txt`, `llms-full.txt`,
@@ -1072,6 +1077,115 @@ the re-enable runbook depends on the generator being able to render either state
 truthfully. The comment above it keeps the 2026-08-18 flip record and appends the
 2026-08-19 retirement.
 
+## Payment alerts
+
+The `settlements` table is a perfect record that nobody reads at 3am. These are
+the push half: a **Telegram** message and an **email** when money moves.
+
+### What fires, and what deliberately does not
+
+| event | alert |
+| --- | --- |
+| verified payment, settled | 🍋💰 `THIRD PARTY PAID — $0.001 md-html — payer 0x… — tx 0x… — settled` |
+| verified payment, from a wallet in `HOUSE_PAYERS` | 🧪 `test settlement — …` — same facts, quiet framing |
+| verified payment, settlement **failed** | the same message ending `SETTLE FAILED (<reason>)`. Verified means the caller was served, so this is money owed that did not arrive |
+| **served without verification** | ⚠️ `SERVED WITHOUT VERIFICATION — … — x-payment-error: <reason>`. Visually distinct because it is a different problem: the conversion went out and **nobody paid** |
+| unpaid 402 | **nothing** |
+| malformed `X-PAYMENT` / `PAYMENT-SIGNATURE` | **nothing** |
+| facilitator-rejected payment | **nothing** |
+| free-tier serve (when a tier is enabled) | **nothing** |
+
+The four silences are the design, not an omission. This service is on a public
+discovery index and is scanned continuously; an alert that fires on someone
+*failing* to pay would page all day and train the owner to swipe it away, which
+is the only way this feature can genuinely fail. **Only verified money, and the
+one case where money should have been taken and was not.**
+
+The house/third-party split matters for the same reason: if the owner's own
+$0.001 test buys and a stranger's purchase produced the same message, the loud
+one would stop meaning anything.
+
+### It cannot affect the caller
+
+Every alert runs inside the existing `ctx.waitUntil` settlement flow — **after**
+the response has shipped — and each channel is independently `try`/`catch`ed. A
+dead Telegram, a revoked token, an unverified email destination or a missing
+binding costs a notification and nothing else. The suite asserts exactly this:
+a Telegram endpoint answering 500, and an unreachable one, both leave the
+conversion **200** and the `settlements` row intact.
+
+**There are no retries**, on purpose. An alert is not a ledger — `settlements`
+is the source of truth and [Reading the ledger](#reading-the-ledger) is what
+reconciles money. A retry loop would buy duplicate pings on a flaky network and
+still lose the alert in a real outage.
+
+A channel with **no config is skipped before any network call**, so unset is a
+working state: a deployment that never sets these secrets behaves exactly as
+this Worker did before alerts existed.
+
+### Configuration
+
+| name | kind | effect |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | **secret** | the bot to send as. Unset = no Telegram channel |
+| `TELEGRAM_CHAT_ID` | **secret** | where to send. Unset = no Telegram channel |
+| `ALERT_EMAIL_TO` | **secret** | recipient. Must be a **verified Email Routing destination** on the zone. Unset = no email channel |
+| `ALERT_EMAIL` | `[[send_email]]` binding | declared unrestricted in `wrangler.toml`. Absent (no Email Routing on the account) = no email channel |
+| `HOUSE_PAYERS` | var | comma-separated wallet addresses that read as 🧪 instead of 🍋💰. Compared lowercased. Non-secret — public chain addresses |
+| `TELEGRAM_API_BASE` | var | optional override, default `https://api.telegram.org`. Only the test suite sets it, to reach a local mock — the same pattern as `FACILITATOR_URL` |
+
+The two Telegram secrets:
+
+```bash
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_CHAT_ID
+```
+
+**Finding the chat id.** Message the bot once from the account that should
+receive alerts — a bot cannot open a conversation — then read the id back:
+
+```bash
+curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[].message.chat.id'
+```
+
+A personal chat id is a positive integer; a group is negative (`-100…`). If
+`result` is empty, the bot has not been messaged yet, or the message predates
+the bot being started.
+
+### Email, and the DNS caveat
+
+```bash
+npx wrangler secret put ALERT_EMAIL_TO
+```
+
+Mail goes out **from** `Toolshed <alerts@lemon-agent.dev>` through Cloudflare's
+`send_email` binding. Two constraints, both enforced by Cloudflare rather than
+by this Worker:
+
+- the **from** address must be on a zone in the account, and
+- the **to** address must be a **verified Email Routing destination** — the
+  owner has to click the confirmation link Cloudflare emails, once.
+
+The binding is declared **unrestricted** (no `destination_address` in
+`wrangler.toml`) so that the owner's personal inbox never appears in this public
+repo; the recipient comes from the secret instead. Cloudflare still enforces the
+verified-destination rule, so unrestricted is not unlimited.
+
+**Until Email Routing and its DNS records are live, the email channel silently
+no-ops** — the binding call throws, it is caught, and the Telegram ping is
+unaffected. That is the intended state during setup, not a fault to chase.
+
+The raw message is a hand-rolled minimal RFC 5322: `From`, `To`, `Subject`,
+`Date`, `Message-ID`, `MIME-Version`, `Content-Type`, CRLF throughout, and the
+subject carried as RFC 2047 base64 encoded-words because the headline contains
+emoji and a raw non-ASCII byte in a header is not legal. No MIME library — the
+same no-new-production-dependency argument that keeps `@coinbase/x402` out of
+the [facilitator path](#the-dependency-decision-no-new-production-dependency).
+`wrangler dev --local` implements `send_email` and **parses** what it is handed,
+rejecting a message with no `Message-ID` or a `From` that disagrees with the
+envelope sender — so `test/alerts.test.mjs` reads the generated `.eml` back and
+asserts on the real bytes.
+
 ## Shutdown runbook
 
 There is **no preventive spend cap** on Workers. The controls are detective: a
@@ -1347,6 +1461,7 @@ test/convert-yaml-json.test.mjs   block scalars, anchors, comments, tabs
 test/convert-csv-json.test.mjs    the RFC 4180 battery
 test/convert-html-markdown.test.mjs
 test/protocol.test.mjs            /check, method and routing guards, 413, /b
+test/alerts.test.mjs              owner payment alerts: Telegram, email, and the silences
 test/quota.test.mjs               the env-gated free tier and its spoof resistance
 test/tier-off.test.mjs            the PRODUCTION default — 402 first, and it writes nothing
 test/x402.test.mjs                the 402 envelope, and PAYTO set with no facilitator
@@ -1395,7 +1510,7 @@ children, so killing the node process alone orphans them and leaks the port; the
 harness spawns it `detached` and tears it down with `process.kill(-pid, …)`,
 escalating to `SIGKILL`, plus a best-effort sweep on process exit.
 
-### Why there are three phases
+### Why there are four phases
 
 Two dev vars decide what the product answers, and a dev var is fixed for the life
 of a `wrangler dev` process, so each configuration needs its own worker:
@@ -1406,13 +1521,14 @@ of a `wrangler dev` process, so each configuration needs its own worker:
 - **`PAYTO`** — unset means a 429 where a 402 would otherwise go, because there
   is nowhere to pay.
 
-So `npm test` boots three workers and runs them in turn:
+So `npm test` boots four workers and runs them in turn:
 
 | phase | vars | files |
 | --- | --- | --- |
 | 1 — `free tier enabled` | `FREE_TIER_DAILY=3`, `PAYTO` unset | the five convert fixture suites, `protocol`, `quota`, `beacon` |
 | 2 — `production default` | `PAYTO` set, no tier | `tier-off.test.mjs`, `x402.test.mjs` |
 | 3 — `settlement` | `PAYTO` + `FACILITATOR_URL` + fake CDP keys | `x402-settlement.test.mjs` (standalone) |
+| 4 — `alerts` | phase 3's vars + `TELEGRAM_*` + `HOUSE_PAYERS` + `ALERT_EMAIL_TO` | `alerts.test.mjs` (standalone) |
 
 **Phase 1 boots the tier on purpose, for two different reasons.** `quota.test.mjs`
 is there because the tier *is* what it asserts — countdown, UA-rotation
@@ -1435,6 +1551,15 @@ on its own fresh D1, like every other phase — with the tier off. The `exhaust(
 helpers that used to open every x402 and settlement test are gone: the first call
 is now the 402, so each test simply makes its call. That simplified the setup
 without weakening a single assertion.
+
+**Phase 4 is `standalone` for the same reason twice over**: it runs a mock
+facilitator *and* a mock Telegram, both on ports it only learns at startup, so
+neither `FACILITATOR_URL` nor `TELEGRAM_API_BASE` can be known before the suite
+starts. It also reads its worker's stdout to find the `.eml` files miniflare's
+`send_email` simulator writes, which needs the worker it booted itself. Most of
+the file is **negative** assertions — see [Payment alerts](#payment-alerts): the
+hard claim is not that a sale pings, it is that a 402, a malformed header, a
+rejected payment and a free-tier serve all stay silent.
 
 **A file joins the phase's worker only when the WHOLE var set matches.**
 `useWorker({ payTo, vars })` compares against `TOOLSHED_TEST_VARS`, which
