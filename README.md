@@ -53,13 +53,14 @@ Three honest caveats:
 - **The curation is owner taste.** The 33 entries in `entries.yaml` are drafts
   for review, not a finished list, and every verdict is engineering judgment
   rather than measurement.
-- **Payment is live; exactly one real payment has settled, and it was ours.**
+- **Payment is live; exactly two real payments have settled, both ours.**
   Every call is a paid call, and a spec-valid 402 is issued on the first
   unauthenticated request (`PAYTO` is set — live since 2026-08-18). A payment
   presented against it is verified and settled with the Coinbase
-  CDP facilitator. Proven end to end on 2026-08-18 by a real payment in real
-  USDC on Base (tx `0xe2c8bb8d…`, `verify_ok = 1`, `settle_ok = 1`) — made by
-  `scripts/pay-test.mjs`, which is to say by us, not by a stranger. Two honest
+  CDP facilitator. Proven end to end twice: 2026-08-18 over x402 **v1**
+  (tx `0xe2c8bb8d…`) and 2026-08-19 over x402 **v2** with the real
+  `@x402/fetch` client (tx `0x4832d1ee…`) — both `verify_ok = 1`,
+  `settle_ok = 1`, both made by us, not by a stranger. Two honest
   caveats: **no third party has paid yet**, so nothing is known about how a
   wallet we did not build behaves against this envelope, and an unreachable
   facilitator serves the call *unverified* rather than refusing it. See
@@ -784,13 +785,17 @@ A payment presented against the 402 envelope is **checked before the conversion
 is served and settled on chain immediately afterwards**, through the Coinbase CDP
 facilitator.
 
-> **Status.** Live and proven with real money. On **2026-08-18** a real payment
-> in real USDC on Base verified and settled through the CDP facilitator — tx
-> `0xe2c8bb8d…`, `settlements` row `verify_ok = 1`, `settle_ok = 1`. It was made
-> by `scripts/pay-test.mjs`, so the one settlement on record is **our own test
-> call**; no third party has paid yet. Everything below is additionally covered
-> against a mock facilitator and against a real `x402-fetch` client signing a
-> real EIP-3009 authorization.
+> **Status.** Live and proven with real money, in both protocol versions. On
+> **2026-08-18** a real payment in real USDC on Base verified and settled
+> through the CDP facilitator over x402 **v1** (tx `0xe2c8bb8d…`), and on
+> **2026-08-19** a second one over x402 **v2** via the real `@x402/fetch`
+> client (tx `0x4832d1ee…`) — the v2 settlement also answers the one question
+> the local suite could not: the CDP facilitator accepts `x402Version: 2`
+> verify/settle bodies in production. Both rows `verify_ok = 1`,
+> `settle_ok = 1`; both settlements on record are **our own test calls**; no
+> third party has paid yet. Everything below is additionally covered against a
+> strict per-version mock facilitator and against real v1 (`x402-fetch`) and
+> v2 (`@x402/fetch`) clients signing real EIP-3009 authorizations.
 
 ### The shape of it
 
