@@ -1159,7 +1159,16 @@ ${sections.map(renderShelf).join('\n')}
       caller away.</p>
     -->
     <div class="status-box">
-      <p><span class="status-label">Honest status</span>The free tier is <strong>live and enforced</strong>, and the payment surface is <strong>advertised for real</strong>: a receiving address is configured, so a call past the free tier answers the <code>402</code> envelope above with a live USDC address on Base. What is <em>not</em> live yet is settlement verification — nothing checks that a payment actually landed, so an <code>X-PAYMENT</code> header is never treated as paid; a response that sees one says <code>x-payment-verified: false</code> and the call is served unverified. Settlement verification is the next build; until it lands, the 402 is an honest price signal, not a wall.</p>
+      <p><span class="status-label">Honest status</span>The free tier is
+      <strong>live and enforced</strong>, and payment is <strong>live and
+      verified</strong>: a call past the free tier answers the <code>402</code>
+      envelope above, and a payment presented against it is checked with the
+      Coinbase CDP facilitator before the conversion is served — a verified call
+      comes back with <code>x-payment-verified: true</code> and settles on Base
+      immediately afterwards. If the facilitator cannot be reached, the call is
+      served anyway and says so with <code>x-payment-error</code>: at $0.001 the
+      price is a signal, and an outage on our side should not turn a paying
+      caller away.</p>
     </div>
   </section>
 
