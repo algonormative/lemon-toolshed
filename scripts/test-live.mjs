@@ -20,7 +20,12 @@
 //                     openapi.json, robots.txt), and one 402-envelope probe per
 //                     hosted tool — the exact JSON a paying agent reads before it
 //                     signs anything, down to the outputSchema.input.discoverable
-//                     flag that Coinbase's Bazaar discovery index keys on.
+//                     flag that Coinbase's Bazaar discovery index keys on. BOTH
+//                     protocol versions: the v1 envelope in the body and the v2
+//                     one in the PAYMENT-REQUIRED header, plus the assertion
+//                     that the two name the same offer. The header half is only
+//                     checkable here — the local suite proves the Worker sends
+//                     it, and production is what proves it arrives.
 //   NOT checked here  that any converter still converts. No 402 path runs one. A
 //                     green row here says THE GATE IS RIGHT; it says nothing
 //                     about the tool behind the gate.
@@ -345,6 +350,84 @@ function assertEnvelope(offer, tool) {
 }
 
 /**
+ * The x402 v2 envelope, which lives in a HEADER rather than in the body.
+ *
+ * This is the half a v2 buyer actually reads — it checks `PAYMENT-REQUIRED`
+ * first and falls back to the body only when the body says `x402Version: 1`,
+ * which ours does say, but only a v1 client is listening for it. So a missing
+ * header is a seller that published no terms at all to every v2 buyer and to
+ * Coinbase's Bazaar validator, which since 2026-08-19 refuses a v1-only
+ * endpoint outright.
+ *
+ * Asserted LIVE rather than only locally because a response header is exactly
+ * the thing an intermediary can drop: the suite proves the Worker sends it, and
+ * only production proves it arrives.
+ */
+function assertEnvelopeV2(res, offer, tool) {
+  const header = res.headers.get('payment-required');
+  assert(header, 'the 402 carries no PAYMENT-REQUIRED header — a v2 buyer sees no envelope');
+  assert(
+    /^[A-Za-z0-9+/]*={0,2}$/.test(header),
+    'PAYMENT-REQUIRED is not standard base64 — a client rejects it before decoding'
+  );
+
+  let env;
+  try {
+    env = JSON.parse(Buffer.from(header, 'base64').toString('utf8'));
+  } catch (err) {
+    throw new Error(`PAYMENT-REQUIRED does not decode to JSON: ${err.message}`);
+  }
+
+  assert(env.x402Version === 2, `the v2 envelope says x402Version ${JSON.stringify(env.x402Version)}`);
+  assert(Array.isArray(env.accepts) && env.accepts.length === 1, 'the v2 envelope has no single accepts entry');
+  const v2 = env.accepts[0];
+
+  // CAIP-2. "base" is the v1 spelling and makes a v2 envelope invalid — a
+  // failure with no error message anywhere.
+  assert(v2.network === 'eip155:8453', `v2 network is ${JSON.stringify(v2.network)}, expected "eip155:8453"`);
+  assert(v2.maxAmountRequired === undefined, 'the v2 accepts entry still carries the v1 maxAmountRequired');
+  assert(v2.resource === undefined, 'the v2 accepts entry still carries the v1 resource');
+
+  // THE AGREEMENT — one offer, two spellings. Each envelope is independently
+  // valid, so a disagreement is felt only by the buyer that read the other one.
+  assert(v2.amount === offer.maxAmountRequired, `v2 amount ${v2.amount} != v1 ${offer.maxAmountRequired}`);
+  assert(v2.payTo === offer.payTo, 'the two envelopes name different payees');
+  assert(v2.asset === offer.asset, 'the two envelopes name different assets');
+  assert(v2.scheme === offer.scheme, 'the two envelopes name different schemes');
+  assert(canonical(v2.extra) === canonical(offer.extra), 'the two envelopes sign over different EIP-712 domains');
+  assert(env.resource?.url === offer.resource, 'the two envelopes name different resources');
+  assert(env.resource?.mimeType === offer.mimeType, 'the two envelopes name different mimeTypes');
+  assert(
+    typeof env.resource?.url === 'string' && env.resource.url.endsWith(`/convert/${tool.id}`),
+    `the v2 resource is ${env.resource?.url}, expected it to end /convert/${tool.id}`
+  );
+
+  // v1's outputSchema lives here now. No bazaar block, no listing.
+  const bazaar = env.extensions?.bazaar;
+  assert(bazaar?.info?.input, 'no extensions.bazaar.info.input — this tool cannot be indexed');
+  assert(bazaar.schema, 'no extensions.bazaar.schema — a facilitator cannot validate the info against anything');
+  assert(bazaar.info.input.method === 'POST', `bazaar input.method is ${JSON.stringify(bazaar.info.input.method)}`);
+  assert(
+    bazaar.info.input.bodyType === 'text',
+    `bazaar input.bodyType is ${JSON.stringify(bazaar.info.input.bodyType)}, expected "text"`
+  );
+  assert(
+    typeof bazaar.info.input.body === 'string' && bazaar.info.input.body.trim().length > 0,
+    'bazaar input.body publishes no example request'
+  );
+
+  for (const text of everyDescription(env)) {
+    assert(
+      text.length <= MAX_DESCRIPTION_CHARS,
+      `a v2 description is ${text.length} characters, over the facilitator's ` +
+        `${MAX_DESCRIPTION_CHARS}-character limit — the listing is rejected`
+    );
+  }
+
+  return `v2 — ${v2.amount} atomic USDC on ${v2.network}, bazaar block present, ${header.length}-byte header`;
+}
+
+/**
  * What a caller that presented no payment is allowed to get back, and what each
  * answer means. Exactly one of these is the production contract (402); the other
  * two are real deployment states that must be reported rather than mislabelled.
@@ -360,7 +443,10 @@ async function probeGate(res, tool) {
       body.accepts.length === 1,
       `accepts has ${body.accepts.length} entries, expected exactly 1`
     );
-    return assertEnvelope(body.accepts[0], tool);
+    const v1 = assertEnvelope(body.accepts[0], tool);
+    // Dual-stack: the same 402 has to satisfy a v2 buyer too, and that half
+    // travels in a header this function is the only live reader of.
+    return `${v1}; ${assertEnvelopeV2(res, body.accepts[0], tool)}`;
   }
 
   if (res.status === 429) {

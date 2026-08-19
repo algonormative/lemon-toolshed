@@ -89,7 +89,15 @@ Treat this table as a cache; `/check` is authoritative.
 
 A `402` is the ordinary answer to a call that carried no payment. It is the
 price, quoted in a form a client can pay — not an allowance you have used up.
-The body is an x402 v1 envelope:
+
+**Both x402 versions come out of that one 402, so use whichever your client
+speaks.** The v1 envelope is the response body. The v2 envelope is base64 JSON
+in the `PAYMENT-REQUIRED` response header — where a v2 client looks first, and
+where it should keep looking, because the body is the v1 half and a v2 client
+cannot use it. Pay with `X-PAYMENT` (v1) or `PAYMENT-SIGNATURE` (v2). One or the
+other, not both.
+
+The v1 body:
 
 ```json
 {"x402Version": 1, "error": "X-PAYMENT header is required",
@@ -106,16 +114,38 @@ The body is an x402 v1 envelope:
                 "output": {"type": "string", "description": "..."}}}]}
 ```
 
+The v2 header, decoded, is the same offer in v2 spelling:
+
+```json
+{"x402Version": 2, "error": "Payment required",
+ "resource": {"url": "https://toolshed.lemon-agent.dev/convert/md-html",
+              "method": "POST", "description": "Markdown to HTML conversion",
+              "mimeType": "text/html", "serviceName": "Toolshed"},
+ "accepts": [{"scheme": "exact", "network": "eip155:8453", "amount": "1000",
+              "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+              "payTo": "0x...", "maxTimeoutSeconds": 60,
+              "extra": {"name": "USD Coin", "version": "2"}}],
+ "extensions": {"bazaar": {"info": {"input": {"type": "http", "method": "POST",
+                                              "bodyType": "text", "body": "..."}},
+                           "schema": {"...": "..."}}}}
+```
+
 Then:
 
-- `asset` is USDC on Base. `maxAmountRequired` is atomic units — 6 decimals, so
-  `"1000"` is $0.001.
-- `outputSchema` says what you are buying: `input` describes the request the
-  endpoint takes, `output` what comes back — a string, the converted file.
-- Paying needs two things: an x402-capable HTTP client (`x402-fetch`, the x402
-  SDK, or Coinbase AgentKit) and a wallet key holding USDC on Base. The client
-  reads the envelope, signs, and retries with an `X-PAYMENT` header. No login,
-  no card, no account — the payment is the auth.
+- `asset` is USDC on Base. `maxAmountRequired` (v1) and `amount` (v2) are the
+  same number in atomic units — 6 decimals, so `"1000"` is $0.001.
+- `network` is `base` in v1 and the CAIP-2 `eip155:8453` in v2. Same chain.
+- What you are buying is `outputSchema` in v1 and `extensions.bazaar.info` in
+  v2: `input` describes the request the endpoint takes — and in v2 its `body`
+  is a real example you can send as-is — and `output` what comes back.
+- **No `PAYMENT-RESPONSE` header comes back on a paid call**, and that is not a
+  failure. Settlement runs after the response, so there is no receipt to hand
+  over at that moment; `x-payment-verified: true` is the claim to read instead.
+- Paying needs two things: an x402-capable HTTP client (`x402-fetch` or
+  `@x402/fetch`, the x402 SDK, or Coinbase AgentKit) and a wallet key holding
+  USDC on Base. The client reads the envelope, signs, and retries with an
+  `X-PAYMENT` header (v1) or a `PAYMENT-SIGNATURE` header (v2). No login, no
+  card, no account — the payment is the auth.
 - Never ask the user to paste a private key or a seed phrase. If you have no
   x402 client wired up, say so and offer the local tool from `/check` instead.
 - **Payments are verified and settled.** A payment presented against the

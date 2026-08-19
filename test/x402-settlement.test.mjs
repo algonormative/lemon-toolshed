@@ -21,6 +21,16 @@
 //
 // 3. SETTLEMENT IS ASYNCHRONOUS. It runs in ctx.waitUntil AFTER the response, so
 //    the ledger assertions poll (`awaitSettlement`) instead of reading once.
+//
+// 4. THE MOCK IS STRICT ABOUT VERSION SHAPE (added 2026-08-19 with dual-stack).
+//    v1 and v2 send the same three-field body to the same endpoint and differ
+//    entirely in the shapes inside it, so a Worker that shipped a v1 envelope
+//    alongside a v2 payload — or the reverse — would look completely healthy
+//    here against a mock that only echoes canned answers, and would verify as
+//    invalid against the real facilitator, which recovers the signature from
+//    what it is handed. So every hit is shape-checked against its own declared
+//    version and a mismatch answers 400, which surfaces as an unverified serve
+//    and fails whatever test made the call. Drift is meant to be loud.
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -50,7 +60,74 @@ let worker;
 let api;
 let mock;
 
+// USDC on Base — the asset both envelopes name, in the one spelling it has.
+const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+
 // ------------------------------------------------------------------ the mock
+
+/**
+ * Is this facilitator call self-consistent? Returns a sentence, or null.
+ *
+ * The two versions are checked against each other rather than each on its own:
+ * it is not enough that a v1 body has `maxAmountRequired`, it must ALSO not
+ * have `amount`, because the failure this guards against is a half-migrated
+ * envelope carrying both and being accepted by a lenient reader. Every field
+ * named below is one the real facilitator reads.
+ */
+function shapeProblem(body) {
+  if (!body || typeof body !== 'object') return 'the body is not a JSON object';
+  const { x402Version: version, paymentPayload: payload, paymentRequirements: req } = body;
+
+  if (version !== 1 && version !== 2) return `x402Version ${JSON.stringify(version)} is neither 1 nor 2`;
+  if (!payload || typeof payload !== 'object') return 'no paymentPayload';
+  if (!req || typeof req !== 'object') return 'no paymentRequirements';
+  if (payload.x402Version !== version) {
+    return `paymentPayload.x402Version ${payload.x402Version} disagrees with the body's ${version}`;
+  }
+
+  const missing = (obj, fields, what) => {
+    for (const f of fields) if (obj[f] === undefined) return `${what} is missing ${f}`;
+    return null;
+  };
+  const foreign = (obj, fields, what, other) => {
+    for (const f of fields) if (obj[f] !== undefined) return `${what} carries the v${other} field ${f}`;
+    return null;
+  };
+
+  if (version === 1) {
+    return (
+      missing(req, ['scheme', 'network', 'maxAmountRequired', 'resource', 'description', 'payTo', 'asset'], 'v1 paymentRequirements') ||
+      foreign(req, ['amount'], 'v1 paymentRequirements', 2) ||
+      (typeof req.resource !== 'string' ? 'v1 paymentRequirements.resource must be the URL string' : null) ||
+      (req.network.includes(':') ? `v1 network must be a plain name, got the CAIP-2 ${req.network}` : null) ||
+      missing(payload, ['scheme', 'network', 'payload'], 'v1 paymentPayload') ||
+      foreign(payload, ['accepted'], 'v1 paymentPayload', 2)
+    );
+  }
+
+  return (
+    missing(req, ['scheme', 'network', 'amount', 'asset', 'payTo', 'maxTimeoutSeconds'], 'v2 paymentRequirements') ||
+    foreign(req, ['maxAmountRequired', 'resource', 'description', 'mimeType', 'outputSchema'], 'v2 paymentRequirements', 1) ||
+    (!/^[a-z0-9-]+:[a-zA-Z0-9-]+$/.test(req.network) ? `v2 network must be CAIP-2, got ${req.network}` : null) ||
+    missing(payload, ['accepted', 'payload'], 'v2 paymentPayload') ||
+    foreign(payload, ['scheme', 'network'], 'v2 paymentPayload', 1) ||
+    // The signature was made over `accepted`, so a requirements object that
+    // does not match it is a payment the facilitator cannot recover. Compared
+    // key-order-independently, the way x402's own server does it — a client
+    // that re-serialises our entry has not changed the offer.
+    (canonical(payload.accepted) !== canonical(req)
+      ? 'v2 paymentRequirements is not the accepts entry the payload signed against'
+      : null)
+  );
+}
+
+/** JSON with object keys sorted, so a comparison is about values not order. */
+const canonical = (value) =>
+  JSON.stringify(value, (_key, v) =>
+    v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)))
+      : v
+  );
 
 /** A programmable stand-in for https://api.cdp.coinbase.com/platform/v2/x402. */
 async function startMockFacilitator() {
@@ -63,6 +140,10 @@ async function startMockFacilitator() {
       body: { success: true, transaction: TX_HASH, network: 'base', payer: VERIFIED_PAYER },
     },
     delayMs: { verify: 0, settle: 0 },
+    // Enforcement, on by default. One test turns it off to prove the check
+    // itself has teeth — a strictness that nothing ever trips is indistinguishable
+    // from no strictness at all.
+    strict: true,
   };
 
   const server = http.createServer((req, res) => {
@@ -76,12 +157,18 @@ async function startMockFacilitator() {
       } catch {
         /* recorded as null — a malformed body is itself a finding */
       }
+      // The version-shape verdict is recorded on the hit whether or not it is
+      // enforced, so a test can assert on it directly as well as through the
+      // 400 below.
+      const problem = shapeProblem(body);
       state.hits.push({
         endpoint,
         method: req.method,
         url: req.url,
         authorization: req.headers.authorization || null,
         contentType: req.headers['content-type'] || null,
+        version: body?.x402Version ?? null,
+        problem,
         body,
       });
 
@@ -92,6 +179,14 @@ async function startMockFacilitator() {
       if (!canned) {
         res.writeHead(404, { 'content-type': 'application/json' });
         return res.end('{"error":"no such endpoint"}');
+      }
+
+      // A malformed call answers 400 rather than the canned success, which is
+      // what the real facilitator would do and what makes drift fail loudly
+      // instead of passing green against a mock that never looks.
+      if (problem && state.strict) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'x402_shape', detail: problem }));
       }
       res.writeHead(canned.status, { 'content-type': 'application/json' });
       res.end(typeof canned.body === 'string' ? canned.body : JSON.stringify(canned.body));
@@ -108,6 +203,12 @@ async function startMockFacilitator() {
       return state.hits;
     },
     hitsOn: (endpoint) => state.hits.filter((h) => h.endpoint === endpoint),
+    /** Every shape complaint this mock has recorded, as one readable string. */
+    problems: () =>
+      state.hits
+        .filter((h) => h.problem)
+        .map((h) => `${h.endpoint} (v${h.version}): ${h.problem}`)
+        .join('; '),
     reset: () => {
       state.hits.length = 0;
       state.verify = { status: 200, body: { isValid: true, payer: VERIFIED_PAYER } };
@@ -116,6 +217,7 @@ async function startMockFacilitator() {
         body: { success: true, transaction: TX_HASH, network: 'base', payer: VERIFIED_PAYER },
       };
       state.delayMs = { verify: 0, settle: 0 };
+      state.strict = true;
     },
     stop: () => new Promise((resolve) => server.close(resolve)),
   };
@@ -148,6 +250,51 @@ function paymentHeader({ from = CLAIMED_PAYER, value = '1000' } = {}) {
           nonce: `0x${'cd'.repeat(32)}`,
         },
       },
+    })
+  ).toString('base64');
+}
+
+/** The v2 envelope this Worker publishes for a tool, read off its own 402. */
+async function v2EnvelopeFor(apiClient, tool, ip) {
+  const probe = await apiClient.convert(tool, 'probe', { ip, ua: 'settlement-suite/1' });
+  assert.equal(probe.status, 402, `${tool} did not answer the 402 front door: ${probe.status} ${probe.text}`);
+  const header = probe.headers.get('payment-required');
+  assert.ok(header, `${tool} published no v2 envelope`);
+  return JSON.parse(Buffer.from(header, 'base64').toString('utf8'));
+}
+
+/**
+ * A well-formed x402 v2 payment, base64-encoded as PAYMENT-SIGNATURE.
+ *
+ * Built FROM the Worker's own 402 rather than typed out here, which is what a
+ * real client does and is the only version that stays true: `accepted` has to
+ * be the accepts entry we advertised, byte for byte, or the signature was made
+ * over something else. The signature itself is nonsense — the mock decides
+ * valid from invalid — but the shape around it is the client's.
+ */
+async function paymentHeaderV2(apiClient, tool, { ip, from = CLAIMED_PAYER } = {}) {
+  const env = await v2EnvelopeFor(apiClient, tool, ip);
+  const accepted = env.accepts[0];
+  const now = Math.floor(Date.now() / 1000);
+  return Buffer.from(
+    JSON.stringify({
+      x402Version: 2,
+      resource: env.resource,
+      accepted,
+      payload: {
+        signature: `0x${'ab'.repeat(65)}`,
+        authorization: {
+          from,
+          to: accepted.payTo,
+          value: accepted.amount,
+          validAfter: String(now - 600),
+          validBefore: String(now + accepted.maxTimeoutSeconds),
+          nonce: `0x${'cd'.repeat(32)}`,
+        },
+      },
+      // A v2 client echoes the server's extensions back, and the bazaar spec
+      // says cataloguing never happens if it does not.
+      extensions: env.extensions,
     })
   ).toString('base64');
 }
@@ -728,6 +875,263 @@ describe('a real x402 client can pay the envelope we publish', () => {
       assert.match(sent.body.paymentPayload.payload.signature, /^0x[0-9a-f]{130}$/i);
       // …and it was signed against OUR domain, unchanged in transit.
       assert.deepEqual(sent.body.paymentRequirements.extra, { name: 'USD Coin', version: '2' });
+    } finally {
+      await scratch.stop();
+      await clientMock.stop();
+    }
+  });
+});
+
+// ------------------------------------------------------------------ x402 v2
+//
+// Same facilitator, same two endpoints, same three-field body — and entirely
+// different shapes inside it. The mock's strictness (note 4 at the top) is what
+// turns that into a testable claim rather than a hope: these tests would pass
+// against a Worker that sent v1 requirements with a v2 payload, if nobody
+// looked.
+
+describe('a v2 payment is verified and settled in v2 shape', () => {
+  test('PAYMENT-SIGNATURE is accepted, and both facilitator calls declare v2', async () => {
+    mock.reset();
+    const ip = ips.pinned(17);
+    const header = await paymentHeaderV2(api, 'md-html', { ip });
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'payment-signature': header },
+    });
+
+    assert.equal(res.status, 200, `a v2 payment was not accepted: ${res.status} ${res.text}`);
+    assert.ok(res.text.includes('<h1>hi</h1>'), 'the conversion did not run');
+    assert.equal(res.headers.get('x-payment-verified'), 'true');
+
+    await awaitSettlement((r) => r.verify_ok === 1 && r.settle_ok === 1, 'the v2 settlement');
+
+    const verify = mock.hitsOn('verify');
+    const settle = mock.hitsOn('settle');
+    assert.equal(verify.length, 1, `expected exactly one verify, saw ${verify.length}`);
+    assert.equal(settle.length, 1, `expected exactly one settle, saw ${settle.length}`);
+    assert.equal(mock.problems(), '', 'the facilitator was sent a mixed-version body');
+
+    for (const hit of [verify[0], settle[0]]) {
+      assert.equal(hit.body.x402Version, 2, `${hit.endpoint} declared the wrong version`);
+      assert.equal(hit.body.paymentPayload.x402Version, 2);
+
+      // The v2 requirements: renamed, re-networked, and stripped of everything
+      // v2 moved onto the resource object.
+      assert.deepEqual(hit.body.paymentRequirements, {
+        scheme: 'exact',
+        network: 'eip155:8453',
+        amount: '1000',
+        asset: USDC_BASE,
+        payTo: PAYTO_TEST,
+        maxTimeoutSeconds: 60,
+        extra: { name: 'USD Coin', version: '2' },
+      });
+    }
+
+    // …and the settle body still names the resource a Bazaar listing attaches
+    // to — as the v2 OBJECT, not the v1 URL string.
+    const resource = settle[0].body.paymentPayload.resource;
+    assert.equal(resource.url, `${SITE_BASE}/convert/md-html`);
+    assert.equal(resource.serviceName, 'Toolshed');
+  });
+
+  test('a v2 settle body gets our resource even when the client omits it', async () => {
+    // The v2 twin of the v1 test above. @x402/core's client does echo
+    // `resource`, but a hand-rolled one need not, and a settlement with nothing
+    // to attach to is a settlement the index cannot see.
+    mock.reset();
+    const ip = ips.pinned(18);
+    const full = JSON.parse(Buffer.from(await paymentHeaderV2(api, 'csv-json', { ip }), 'base64').toString('utf8'));
+    const { resource, ...stripped } = full;
+    assert.ok(resource, 'the fixture never carried a resource — this would prove nothing');
+
+    const res = await api.convert('csv-json', 'a\n1\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'payment-signature': Buffer.from(JSON.stringify(stripped)).toString('base64') },
+    });
+    assert.equal(res.status, 200, res.text);
+    await awaitSettlement((r) => r.tool === 'csv-json' && r.settle_ok === 1, 'the csv-json v2 settlement');
+
+    assert.equal(mock.problems(), '');
+    assert.deepEqual(
+      mock.hitsOn('settle')[0].body.paymentPayload.resource,
+      resource,
+      'the settle body names no resource — the Bazaar has nothing to attach the settlement to'
+    );
+    // VERIFY stays byte-for-byte what arrived: it is the signature check.
+    assert.equal(mock.hitsOn('verify')[0].body.paymentPayload.resource, undefined);
+  });
+
+  test('the version comes from the payload, not from the header it arrived in', async () => {
+    // Both directions, because both are real: a v2 payload can turn up under
+    // the old header name, and a v1 client is never going to learn the new one.
+    // Routing on the header would send the facilitator the wrong shape in
+    // exactly the case where a payment is otherwise good.
+    mock.reset();
+    const ip = ips.pinned(19);
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': await paymentHeaderV2(api, 'md-html', { ip }) },
+    });
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.headers.get('x-payment-verified'), 'true');
+    assert.equal(mock.hitsOn('verify')[0].body.x402Version, 2, 'a v2 payload under X-PAYMENT was sent as v1');
+    assert.equal(mock.problems(), '');
+
+    // …and the converse: a v1 payload is still v1, whatever else changed.
+    mock.reset();
+    const v1 = await api.convert('md-html', '# hi\n', {
+      ip: ips.pinned(20),
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    assert.equal(v1.status, 200, v1.text);
+    assert.equal(mock.hitsOn('verify')[0].body.x402Version, 1);
+    assert.equal(mock.problems(), '');
+  });
+
+  test('the mixed-version check has teeth', async () => {
+    // A strictness nothing ever trips is indistinguishable from none, so the
+    // guard is tripped on purpose: a v2 payload presented with the v1
+    // requirements it did NOT sign against must be caught, not waved through.
+    mock.reset();
+    mock.state.strict = false; // record the complaint, do not answer 400
+    const ip = ips.pinned(21);
+    const v2 = JSON.parse(Buffer.from(await paymentHeaderV2(api, 'md-html', { ip }), 'base64').toString('utf8'));
+
+    assert.ok(
+      shapeProblem({ x402Version: 2, paymentPayload: v2, paymentRequirements: { ...v2.accepted, amount: '9999' } }),
+      'requirements that name a different price passed the shape check'
+    );
+    assert.ok(
+      shapeProblem({
+        x402Version: 2,
+        paymentPayload: v2,
+        paymentRequirements: { ...v2.accepted, maxAmountRequired: '1000' },
+      }),
+      'a v1 field smuggled into v2 requirements passed the shape check'
+    );
+    assert.ok(
+      shapeProblem({ x402Version: 1, paymentPayload: v2, paymentRequirements: v2.accepted }),
+      'a v2 payload declared as v1 passed the shape check'
+    );
+    // …and the shape the Worker actually sends passes it.
+    assert.equal(
+      shapeProblem({ x402Version: 2, paymentPayload: v2, paymentRequirements: v2.accepted }),
+      null,
+      'the check rejects the very shape this Worker sends'
+    );
+  });
+
+  test('every tool advertises an example body that actually converts', async () => {
+    // extensions.bazaar.info.input.body is published as a WORKED EXAMPLE of the
+    // call — the one thing in the envelope an agent is most likely to copy
+    // verbatim. So it is copied verbatim here, paid for, and required to come
+    // back 200. An example that 400s is worse than no example.
+    mock.reset();
+    for (const tool of ['md-html', 'json-yaml', 'yaml-json', 'csv-json', 'html-markdown']) {
+      const ip = ips.next();
+      const env = await v2EnvelopeFor(api, tool, ip);
+      const sample = env.extensions.bazaar.info.input.body;
+
+      const res = await api.convert(tool, sample, {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'payment-signature': await paymentHeaderV2(api, tool, { ip }) },
+      });
+      assert.equal(res.status, 200, `${tool} cannot convert its own published example: ${res.status} ${res.text}`);
+      assert.ok(res.text.trim().length > 0, `${tool} converted its example to nothing`);
+    }
+    assert.equal(mock.problems(), '');
+  });
+});
+
+describe('a real x402 v2 client can pay the envelope we publish', () => {
+  // THE V2 POSITIVE CONTROL, and it is the same argument as the v1 one below
+  // it: every test above builds its own payload, so it proves the Worker
+  // handles what THIS FILE writes. Only a real client proves the envelope is
+  // payable — and the v2 envelope is the one with no track record at all, since
+  // the payment that has actually settled on this rail was v1.
+  //
+  // This drives @x402/fetch 2.23.0 with @x402/evm's ExactEvmScheme, the same
+  // pair that paid a live third-party v2 seller on 2026-08-19. It reads our
+  // PAYMENT-REQUIRED header, picks our accepts entry, signs a real EIP-3009
+  // authorization over the EIP-712 domain in `extra`, and sends it back as
+  // PAYMENT-SIGNATURE. No funds move — the key is generated here and the mock
+  // does not look at a chain — but the parsing and the signing are real, and
+  // those are the halves a mock cannot fake.
+  test('@x402/fetch reads PAYMENT-REQUIRED, signs, and the payment verifies', async (t) => {
+    let deps;
+    try {
+      deps = {
+        accounts: await import('viem/accounts'),
+        fetchWrapper: await import('@x402/fetch'),
+        evm: await import('@x402/evm'),
+      };
+    } catch {
+      // devDependencies only; never fail the suite over a missing client.
+      return t.skip('@x402/fetch / @x402/evm not installed (npm install)');
+    }
+
+    const clientMock = await startMockFacilitator();
+    // A REAL EVM address: the client checks it, and PAYTO_TEST is not 20 bytes.
+    const payTo = '0x1234567890123456789012345678901234567890';
+    const scratch = await bootWorker({
+      vars: { PAYTO: payTo, FACILITATOR_URL: clientMock.url, ...fakeCdpCredentials() },
+    });
+
+    try {
+      const account = deps.accounts.privateKeyToAccount(deps.accounts.generatePrivateKey());
+      const payingFetch = deps.fetchWrapper.wrapFetchWithPaymentFromConfig(fetch, {
+        // CAIP-2 only. This client has no v1 scheme registered at all, so if it
+        // fell back to the 402's v1 BODY it would throw "No client registered
+        // for x402 version: 1" — which makes the run itself the proof that the
+        // header is what it read.
+        schemes: [{ network: 'eip155:8453', client: new deps.evm.ExactEvmScheme(account) }],
+      });
+
+      const res = await payingFetch(`${scratch.baseUrl}/convert/md-html`, {
+        method: 'POST',
+        body: '# x402 v2\n',
+        headers: { 'cf-connecting-ip': ips.pinned(22) },
+      });
+      const text = await res.text();
+
+      assert.equal(res.status, 200, `a real x402 v2 client could not pay: ${res.status} ${text}`);
+      assert.equal(res.headers.get('x-payment-verified'), 'true');
+      assert.ok(text.includes('<h1>x402 v2</h1>'), 'the conversion did not run');
+      assert.equal(clientMock.problems(), '', 'the facilitator was sent a mixed-version body');
+
+      const sent = clientMock.hitsOn('verify')[0];
+      assert.ok(sent, 'the client paid but the facilitator was never asked');
+      assert.equal(sent.body.x402Version, 2);
+      assert.equal(sent.body.paymentPayload.x402Version, 2);
+      // v2 payloads carry `accepted`, not a top-level scheme/network.
+      assert.equal(sent.body.paymentPayload.scheme, undefined);
+      assert.equal(sent.body.paymentPayload.accepted.network, 'eip155:8453');
+      assert.equal(sent.body.paymentPayload.accepted.amount, '1000');
+      assert.equal(sent.body.paymentPayload.payload.authorization.from, account.address);
+      assert.equal(sent.body.paymentPayload.payload.authorization.to, payTo);
+      assert.equal(sent.body.paymentPayload.payload.authorization.value, '1000');
+      // A real 65-byte secp256k1 signature: 0x + 130 hex chars.
+      assert.match(sent.body.paymentPayload.payload.signature, /^0x[0-9a-f]{130}$/i);
+      // …signed over OUR EIP-712 domain, unchanged in transit.
+      assert.deepEqual(sent.body.paymentRequirements.extra, { name: 'USD Coin', version: '2' });
+      // …and it echoed our bazaar block back, without which nothing is catalogued.
+      assert.ok(sent.body.paymentPayload.extensions?.bazaar?.info, 'the client dropped the bazaar extension');
+
+      // NO PAYMENT-RESPONSE, and the client is fine with it. Settlement is
+      // queued behind the response here, so there is no receipt to give at the
+      // moment we answer, and inventing one would be the first fake thing this
+      // service says. @x402/fetch reads the receipt inside a try/catch — this
+      // run is the evidence that its absence costs a real client nothing.
+      assert.equal(res.headers.get('payment-response'), null, 'a settlement receipt was emitted before settling');
     } finally {
       await scratch.stop();
       await clientMock.stop();

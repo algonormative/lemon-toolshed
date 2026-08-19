@@ -58,6 +58,13 @@ routes = [
 # Payment configuration. All three are UNSET by default, and unset is a working
 # state — see README.md § Payment (x402).
 #
+# NOTHING HERE CHANGED FOR x402 v2 (2026-08-19), which is the question an
+# operator asks first. The Worker serves v1 and v2 from the same 402 — v1 in the
+# body, v2 base64 in a PAYMENT-REQUIRED response header — and both verify and
+# settle against the same CDP facilitator, at the same two endpoints, with the
+# same credentials. No new var, no new secret, no new endpoint, and no new
+# production dependency in the bundle. See README § "x402 v2 — dual-stack".
+#
 # [vars]
 # PAYTO = "0x..."            # receiving address for USDC on Base
 # FACILITATOR_URL = "..."    # OPTIONAL override; defaults to the CDP facilitator

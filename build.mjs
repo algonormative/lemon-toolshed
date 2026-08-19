@@ -1397,13 +1397,15 @@ const catalog = {
         'per caller (per IP) per UTC day, reported in an x-free-tier-remaining header — and priced per call past ' +
         'that: HTTP 402 with an x402 envelope naming a live USDC address on Base. A payment presented against that ' +
         'envelope is verified with the Coinbase CDP facilitator before the conversion is served, and settles on Base ' +
-        'immediately afterwards. Entries without a hosted block are local-only references.'
+        'immediately afterwards. x402 v1 and v2 are both served from that one 402 — v1 in the body, v2 base64 in a ' +
+        'PAYMENT-REQUIRED response header. Entries without a hosted block are local-only references.'
       : 'Entries with a hosted block run on our server, and every one is a paid call — there is no free tier. An ' +
         'unauthenticated POST answers HTTP 402 immediately, carrying an x402 envelope that names a live USDC ' +
         'address on Base and the per-call price. A payment presented against that envelope is verified with the ' +
         'Coinbase CDP facilitator before the conversion is served, and settles on Base immediately afterwards. You ' +
         'are charged only for conversions that are actually served: a 400 on input we cannot convert settles ' +
-        'nothing. Entries without a hosted block are local-only references.',
+        'nothing. x402 v1 and v2 are both served from that one 402 — v1 in the body, v2 base64 in a ' +
+        'PAYMENT-REQUIRED response header. Entries without a hosted block are local-only references.',
   },
   entries: entries.map(catalogEntry),
 };
@@ -1437,6 +1439,8 @@ const PAYMENT_LINES = FREE_TIER_ON
       `  cannot be reached the call is served anyway, saying so with x-payment-verified: false and`,
       `  x-payment-error. Inside the free tier nothing is checked or charged. On a deployment with no`,
       `  receiving address configured, over-tier calls answer HTTP 429 with a Retry-After, not a 402.`,
+      `  x402 v1 + v2 dual-stack: the same 402 carries the v1 envelope in the body and the v2 envelope`,
+      `  base64 in a PAYMENT-REQUIRED response header; pay with X-PAYMENT (v1) or PAYMENT-SIGNATURE (v2).`,
     ]
   : [
       `Payment: an unpaid call answers HTTP 402 with an x402 envelope — exact scheme, USDC on Base —`,
@@ -1451,6 +1455,8 @@ const PAYMENT_LINES = FREE_TIER_ON
       `  for a conversion that was actually served, so a 400 on input we cannot convert is never charged,`,
       `  and a body over the 256 KB cap is refused with 413 before an envelope is built. On a deployment`,
       `  with no receiving address configured, calls answer HTTP 429 instead of 402.`,
+      `  x402 v1 + v2 dual-stack: the same 402 carries the v1 envelope in the body and the v2 envelope`,
+      `  base64 in a PAYMENT-REQUIRED response header; pay with X-PAYMENT (v1) or PAYMENT-SIGNATURE (v2).`,
     ];
 
 const API_HEADER = [
@@ -1614,10 +1620,22 @@ const ERROR_SCHEMA = {
 
 const paymentRequiredResponse = {
   description:
-    'Payment required. The body is an x402 v1 envelope naming the terms; pay it with an ' +
-    'x402-capable client and retry the same request with an X-PAYMENT header. A body that also ' +
+    'Payment required, in both x402 protocol versions at once. The body is the x402 v1 envelope; ' +
+    'pay it with a v1 client and retry the same request with an X-PAYMENT header. The same 402 ' +
+    'also carries the x402 v2 envelope, base64, in the PAYMENT-REQUIRED response header — that is ' +
+    'where a v2 client looks, and it pays with a PAYMENT-SIGNATURE header. A body that also ' +
     'carries `invalidReason` means a payment WAS presented and the facilitator rejected it — ' +
     'retrying the same payload will fail identically.',
+  headers: {
+    'PAYMENT-REQUIRED': {
+      description:
+        'The x402 v2 PaymentRequired envelope, base64-encoded JSON: { x402Version: 2, resource, ' +
+        'accepts, extensions.bazaar }. The same price, payTo and asset as the v1 body, in v2 ' +
+        'spelling — `amount` instead of `maxAmountRequired`, the CAIP-2 network `eip155:8453` ' +
+        'instead of `base`, and the outputSchema moved into extensions.bazaar.',
+      schema: { type: 'string' },
+    },
+  },
   content: {
     'application/json': {
       schema: {
@@ -1656,7 +1674,17 @@ const convertPaths = Object.fromEntries(
             name: 'X-PAYMENT',
             in: 'header',
             required: false,
-            description: 'A base64-encoded x402 payment payload, signed against the 402 envelope.',
+            description:
+              'A base64-encoded x402 v1 payment payload, signed against the envelope in the 402 body.',
+            schema: { type: 'string' },
+          },
+          {
+            name: 'PAYMENT-SIGNATURE',
+            in: 'header',
+            required: false,
+            description:
+              'The x402 v2 equivalent: a base64-encoded v2 payment payload, signed against the ' +
+              'envelope in the 402 PAYMENT-REQUIRED header. Send one header or the other, not both.',
             schema: { type: 'string' },
           },
         ],

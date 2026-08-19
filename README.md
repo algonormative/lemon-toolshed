@@ -7,10 +7,11 @@ login, no credit card, no account.
 tier — the 402 is the front door, and the payment is the auth.**
 
 An agent posts a file to an HTTP endpoint and gets the converted file back. A
-call carrying no `X-PAYMENT` header answers HTTP 402 on the *first* request,
-and the body of that 402 is an x402 envelope (USDC on Base) naming a live
-receiving address — or HTTP 429 on a deployment with no receiving address
-configured (`PAYTO` unset). A payment presented against that envelope is
+call carrying no payment answers HTTP 402 on the *first* request, and that 402
+carries an x402 envelope (USDC on Base) naming a live receiving address — in
+**both protocol versions at once** since 2026-08-19: v1 in the body, v2 base64
+in a `PAYMENT-REQUIRED` response header. Or HTTP 429 on a deployment with no
+receiving address configured (`PAYTO` unset). A payment presented against that envelope is
 verified with the Coinbase CDP facilitator before the conversion is served, and
 settled on Base immediately afterwards. **You are only charged for conversions
 that are actually served**: a `400` on input we cannot convert settles nothing,
@@ -432,6 +433,65 @@ keeps every assertion the tier ever had, so the path stays tested rather than
 rotting into dead env-gated code. [Re-enabling the free
 tier](#re-enabling-the-free-tier) is the runbook, and it names the cost.
 
+### x402 v2 — dual-stack, from 2026-08-19
+
+**Both protocol versions are served from the same 402, and neither client sees
+the other's.** The v1 envelope is the response BODY, exactly as it was. The v2
+envelope is base64 JSON in a `PAYMENT-REQUIRED` **response header**, which is
+where a v2 client looks first and a v1 client never looks at all.
+
+| | x402 v1 | x402 v2 |
+| --- | --- | --- |
+| **envelope** | the 402's JSON body | `PAYMENT-REQUIRED` response header, base64 |
+| **payment** | `X-PAYMENT` request header | `PAYMENT-SIGNATURE` request header |
+| **price field** | `maxAmountRequired` | `amount` |
+| **network** | `base` | `eip155:8453` (CAIP-2 — the colon is required) |
+| **resource** | a URL string inside `accepts[0]` | a top-level object: `url`, `method`, `description`, `mimeType`, `tags`, `serviceName` |
+| **discovery** | `accepts[0].outputSchema` | `extensions.bazaar` — `{ info, schema }` |
+| **facilitator** | same two endpoints, same `{ x402Version, paymentPayload, paymentRequirements }` body | ditto, with `x402Version: 2` and the v2 shapes inside |
+
+**The gate this clears.** Coinbase's Bazaar validator passes `returns_402` as of
+2026-08-19 and then refuses the listing with *"Endpoint uses x402 v1 — upgrade
+to x402 v2 to be discoverable."* The 402 was never the problem; the version was.
+
+**Which version an inbound payment is, is read out of the payload's
+`x402Version` field, not out of the header it arrived in.** That is what the
+facilitator's own client keys on, and it survives a client that puts a v2
+payload under the old header name. The version then decides the shape of both
+the verify and the settle body — a v2 payload checked against a v1 envelope
+verifies as invalid however good the payment was, so the mock facilitator in the
+suite shape-checks every call against its declared version and answers `400` on
+a mismatch.
+
+**One construction point, still.** `paymentRequirements()` builds the v1 object;
+`requirementsV2()`, `resourceInfoV2()` and `bazaarExtension()` are *projections*
+of it. The two envelopes cannot disagree about price, `payTo`, asset or resource
+because there is nothing for them to disagree with, and the suite asserts the
+agreement field by field anyway.
+
+**No configuration changed.** No new env var, no new endpoint, no new
+dependency in the Worker bundle. `@x402/fetch` and `@x402/evm` (2.23.0) are
+devDependencies, used only as the suite's v2 positive control.
+
+**What is deliberately absent: `PAYMENT-RESPONSE`.** In v2 that header is a
+settlement *receipt*, and this Worker has none to give at the moment it answers
+— settlement is queued behind the response so a buyer is never charged for a
+conversion that was not served. Emitting `success: true` before anything settled
+would be the first fake thing this service says. `@x402/fetch` reads the receipt
+inside a `try`/`catch` and carries on without one; the v2 positive control in
+`test/x402-settlement.test.mjs` is the evidence that its absence costs a real
+client nothing. What a caller gets instead is `x-payment-verified: true` — the
+claim we can actually support.
+
+**Two fields that are not in `@x402/core`'s schema.** `resource.method` is
+carried because the live v2 sellers already in the index carry it (observed on
+x402scan's own paid API, 2026-08-19) and a POST-only resource that does not say
+so is a listing an agent calls wrong; zod strips what it does not know, so it is
+inert for a v2 client and legible to a crawler, and the same fact is stated
+again schema-legally as `extensions.bazaar.info.input.method`. `serviceName` and
+`tags` *are* in `@x402/core` 2.23.0's `ResourceInfoSchema` (32-character
+printable ASCII, at most 5 tags) though not in the older published spec text.
+
 ### The caller key
 
 The counter itself did not go anywhere. `convert_quota` is what `PAID_DAILY` —
@@ -683,7 +743,15 @@ Two details that are silent when wrong:
   level of the envelope produces something that is still spec-shaped and still
   passes every other assertion — and is simply never indexed.
 - **These are v1 field names**, copied from a resource already carrying an x402
-  v1 listing, so there is no v2 migration to do.
+  v1 listing.
+
+**The v2 gate, 2026-08-19.** `returns_402` started passing and the validator
+then refused anyway: *"Endpoint uses x402 v1 — upgrade to x402 v2 to be
+discoverable."* So the same 402 now also carries the v2 envelope in a
+`PAYMENT-REQUIRED` response header, with `outputSchema` re-expressed as
+`extensions.bazaar`. The v1 body is untouched — see
+[x402 v2 — dual-stack](#x402-v2--dual-stack-from-2026-08-19) for the whole
+mapping and for what a facilitator does with the bazaar block.
 
 Indexing is **automatic after one settled paid call**. The settle body carries
 `resource`, which is how the Bazaar attaches a settlement to a listing — and
@@ -761,13 +829,21 @@ recorded as `settle_ok = 0`.
 | **verify →** | `{ isValid, invalidReason, invalidMessage, payer }` |
 | **settle →** | `{ success, errorReason, transaction, network, payer }` |
 
-`paymentPayload` is the caller's `X-PAYMENT` header, base64-decoded.
-`paymentRequirements` is **the same object the 402 envelope advertised** — built
-once in `paymentRequirements()` and used by both, because the client signs
-against what the envelope said and the facilitator recovers that signature from
-what we send. Any field that differs between the two turns a perfectly good
-payment into `invalid_exact_evm_payload_signature`. The suite asserts that
-identity field-for-field rather than trusting the shared call site.
+`paymentPayload` is the caller's payment header, base64-decoded — `X-PAYMENT`
+for v1, `PAYMENT-SIGNATURE` for v2. `paymentRequirements` is **the same object
+the 402 envelope advertised**, in the version the payload declared: the v1
+object built by `paymentRequirements()`, or its v2 projection from
+`requirementsV2()`. Both because the client signs against what the envelope said
+and the facilitator recovers that signature from what we send. Any field that
+differs between the two — including the version — turns a perfectly good payment
+into `invalid_exact_evm_payload_signature`. The suite asserts that identity
+field-for-field rather than trusting the shared call site.
+
+There is **no separate v2 endpoint**. Confirmed twice: `@x402/core` 2.23.0's
+`HTTPFacilitatorClient` sends the identical three-field body for v1 and v2
+alike, and CDP's own reference pages for `/platform/v2/x402/{verify,settle}`
+document `x402Version` as `1 | 2` with no second route. The `v2` in that path is
+CDP's platform API version and has nothing to do with the protocol version.
 
 The one field the **settle** payload carries that the verify payload does not is
 `resource`, filled in from the envelope when the client omitted it. See
@@ -795,6 +871,28 @@ file, not a JSON object of named fields; inventing an input object would
 advertise a calling convention that fails on first use. Descriptions are asserted
 at **≤ 500 characters**, which is the facilitator's limit: an over-long
 description is not a cosmetic problem, it is an unpayable envelope.
+
+In v2 the same facts live in `extensions.bazaar`, projected from this object:
+
+```json
+"extensions": { "bazaar": {
+  "info": { "input":  { "type": "http", "method": "POST", "bodyType": "text",
+                        "body": "# Title\n\nSome **bold** text.\n" },
+            "output": { "type": "text", "format": "text/html" } },
+  "schema": { "$schema": "https://json-schema.org/draft/2020-12/schema", "...": "..." }
+} }
+```
+
+Three differences that are not cosmetic. `discoverable` is **gone** — that was
+v1's opt-in flag, and in v2 the presence of the extension *is* the opt-in.
+`info.input.body` is a **worked example**, a real request body rather than a
+description of one, because POST is a body method in the bazaar input union; it
+comes from a `sample` on each `CONVERTERS` entry, and the suite pays for every
+one of them and requires a `200`, because an example that `400`s is worse than
+no example. And `schema` is **required**: the bazaar spec says a facilitator
+MUST validate `info` against it before cataloguing, so a schema that does not
+admit its own info is a silent delisting — the suite compiles it with `ajv` and
+checks both that the info passes and that a wrong info fails.
 
 ### The dependency decision: no new production dependency
 
@@ -864,6 +962,12 @@ from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
 | `x-payment-error: facilitator-unreachable` | timeout, network failure, or a non-200 from the facilitator |
 | `x-payment-error: facilitator-unconfigured` | no CDP credentials on this Worker. Operator fault, not caller fault |
 | `x-pricing: pending` | served without a verified payment |
+
+On the **402** rather than on a served call, two more: `PAYMENT-REQUIRED`
+carrying the base64 v2 envelope, and `cache-control: no-store`, because an
+envelope is per-request and a cached 402 hands the next caller someone else's
+terms. There is deliberately no `PAYMENT-RESPONSE` — see
+[x402 v2 — dual-stack](#x402-v2--dual-stack-from-2026-08-19).
 
 The **ledger** keeps the precise reason (`facilitator-timeout`,
 `facilitator-http-503`, …) because that is what you debug from; the **header**
@@ -1211,9 +1315,9 @@ npm test           # the whole suite, LOCAL ONLY — touches nothing deployed
 npm run test:live  # the production smoke — serves nothing, spends nothing
 ```
 
-`npm test` is the real coverage: **225 tests across eleven files**, per-tool
-fixture batteries plus the protocol, quota, spoof-resistance, tier-off, x402,
-settlement and beacon contracts. It never speaks to production and it never needs
+`npm test` is the real coverage: **238 tests across eleven files**, per-tool
+fixture batteries plus the protocol, quota, spoof-resistance, tier-off, x402
+v1 and v2, settlement and beacon contracts. It never speaks to production and it never needs
 a Cloudflare login. Framework is `node:test` — no test dependency was added, and
 none is wanted.
 
@@ -1346,20 +1450,36 @@ would fail the suite rather than quietly skip it.
 Suites run at `--test-concurrency=1` so the tests that count D1 rows can compare
 a before and an after without another file writing between them.
 
-### The positive control
+### The positive controls — one per protocol version
 
-`x402-settlement.test.mjs` ends by driving the **real `x402-fetch` client**
-against the real 402 envelope: it parses our response, signs a genuine EIP-3009
-authorization with a genuine key, and the Worker verifies it. No funds are
-involved — the key is generated in the test and the mock does not look at the
-chain — but the *signing* is real, and that is the half a mock cannot fake.
+`x402-settlement.test.mjs` drives **two real clients** against the real 402:
+`x402-fetch` 1.x for v1, and `@x402/fetch` + `@x402/evm` 2.23.0 for v2 — the
+same pair that paid a live third-party v2 seller on 2026-08-19. Each parses our
+response, signs a genuine EIP-3009 authorization with a genuine key, and the
+Worker verifies it. No funds are involved — the keys are generated in the test
+and the mock does not look at the chain — but the *parsing* and the *signing*
+are real, and those are the halves a mock cannot fake.
 
-It earns its place: every other test in the file builds its own `X-PAYMENT`
+They earn their place: every other test in the file builds its own payment
 header, which proves the Worker handles the payload *the test writes*, not that
 a real client can produce one. The missing-`extra` bug lived exactly in that
 gap — the envelope was spec-shaped, every envelope assertion passed, and no
 genuine payment could ever have verified. Removing `extra` from the Worker now
-fails this test (measured, not assumed).
+fails both tests (measured, not assumed).
+
+The v2 control is also the only proof that the **header** is what a v2 client
+reads: it registers no v1 scheme at all, so a client that fell back to the 402's
+v1 body would throw `No client registered for x402 version: 1` rather than pay.
+And it is the evidence that omitting `PAYMENT-RESPONSE` costs a real client
+nothing — the run asserts the header is absent *and* that the payment completed.
+
+The mock facilitator **shape-checks every call against its declared version**
+and answers `400` on a mismatch, so a Worker that paired a v2 payload with v1
+requirements fails here instead of failing in production against a facilitator
+that recovers the signature from what it was handed. That check is itself
+positive-controlled: one test feeds it three deliberately wrong bodies and
+requires each to be caught, plus the shape the Worker really sends and requires
+it to pass.
 
 ### Running one suite
 

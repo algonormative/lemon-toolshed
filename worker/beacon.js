@@ -102,6 +102,32 @@ const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const USDC_DECIMALS = 6;
 const X402_TIMEOUT_SECONDS = 60;
 
+// ONE CHAIN, TWO SPELLINGS. Base mainnet is `base` in x402 v1 and the CAIP-2
+// `eip155:8453` in v2 — the same network, and the version decides which name is
+// legal. v2's schema REQUIRES a colon (NetworkSchemaV2: min length 3, must
+// contain ":"), so shipping "base" in a v2 envelope is not a cosmetic slip, it
+// is an invalid envelope.
+const NETWORK_V1 = 'base';
+const NETWORK_V2 = 'eip155:8453';
+
+// The v2 `resource` block's service identity. `serviceName` is capped at 32
+// printable-ASCII characters and `tags` at 5 entries of 32 (ResourceInfoSchema
+// in @x402/core 2.23.0).
+const SERVICE_NAME = 'Toolshed';
+const RESOURCE_TAGS = ['x402', 'conversion'];
+
+// The three x402 header names, and which version owns which.
+//
+//   X-PAYMENT          v1 request  — the payment payload
+//   PAYMENT-SIGNATURE  v2 request  — the same job, renamed
+//   PAYMENT-REQUIRED   v2 response — where the v2 envelope lives (v1 uses the body)
+//
+// Lower-case because Request/Response header lookup is case-insensitive and
+// these are also used as object keys on the way out.
+const PAYMENT_HEADER_V1 = 'x-payment';
+const PAYMENT_HEADER_V2 = 'payment-signature';
+const PAYMENT_REQUIRED_HEADER = 'payment-required';
+
 // The EIP-712 domain of that contract, carried in the envelope's `extra`.
 //
 // This is NOT decoration, and getting it wrong is silent: the client signs the
@@ -279,6 +305,11 @@ function handleCheck(request, env) {
   return json(
     {
       query: { from: from ?? null, to: to ?? null },
+      // Which x402 versions a caller can pay these tools in. Published because
+      // /check is the machine front door and the answer decides which header a
+      // client reads the envelope out of — see the dual-stack note under
+      // §tiers & x402. Both, since 2026-08-19.
+      x402_versions: [1, 2],
       matches: matches.map((e) => ({
         id: e.id,
         x: e.x,
@@ -331,8 +362,12 @@ async function handleConvert(request, env, path, ctx) {
 
   // The paid tier needs BOTH halves: an address to pay to, and a payment
   // presented. Either alone leaves the caller unpaid.
+  //
+  // "Presented" spans both protocol versions and stays header-cheap: the value
+  // is not decoded here, only counted, because this runs in front of the 402
+  // fast path where the whole point is to do nothing.
   const payTo = env.PAYTO || '';
-  const presented = !!request.headers.get('x-payment');
+  const presented = !!(request.headers.get(PAYMENT_HEADER_V2) || request.headers.get(PAYMENT_HEADER_V1));
   const tier = freeTierDaily(env);
 
   // THE 402 IS THE FRONT DOOR, and answering it is the cheapest thing this
@@ -410,7 +445,15 @@ async function handleConvert(request, env, path, ctx) {
 
       const price = entry.hosted.price;
       const requirements = paymentRequirements(entry, conv, price, payTo);
-      const verdict = await verifyPayment(request, env, requirements);
+
+      // VERSION IS DECIDED HERE, ONCE, and everything downstream follows it:
+      // which shape the facilitator sees on verify and on settle, and which
+      // `resource` a settle body is completed with. It is read out of the
+      // PAYLOAD rather than out of the header it arrived in — see
+      // presentedPayment().
+      const payment = presentedPayment(request);
+      const facRequirements = payment?.version === 2 ? requirementsV2(requirements) : requirements;
+      const verdict = await verifyPayment(env, payment, facRequirements);
 
       // REJECTED. No conversion is served, so no quota is claimed and no event
       // is written — and the 402 names why, so the caller can fix it.
@@ -425,10 +468,14 @@ async function handleConvert(request, env, path, ctx) {
           txHash: null,
           error: verdict.reason,
         });
-        return paymentRequired(requirements, {
+        return paymentRequired(requirements, conv, {
           error: 'the payment presented was not accepted',
           invalidReason: verdict.reason,
           invalidMessage: verdict.message ?? null,
+          // v2 carries one `error` and it is a CODE, not prose — x402's own
+          // client branches on it (`error === 'permit2_allowance_required'`),
+          // so the facilitator's reason is the honest value to put there.
+          v2Error: verdict.reason,
         });
       }
 
@@ -439,7 +486,14 @@ async function handleConvert(request, env, path, ctx) {
 
       if (verdict.verified) {
         outcome = { kind: 'paid', presented };
-        settle = { requirements, payload: verdict.payload, payer: verdict.payer, tool: id };
+        settle = {
+          requirements,
+          facRequirements,
+          version: payment.version,
+          payload: verdict.payload,
+          payer: verdict.payer,
+          tool: id,
+        };
       } else {
         // UNREACHABLE / UNCONFIGURED. Availability-first: the price is a signal
         // until the payment infrastructure is reliable, so the caller is served
@@ -533,11 +587,28 @@ const tooLarge = () =>
 // Every hosted tool is priced, and as of 2026-08-19 that is ALL it is: an
 // unauthenticated call answers immediately, and the answer has two forms:
 //
-//   PAYTO set (production) → HTTP 402 with a spec-valid x402 v1 envelope: pay
-//                            to continue. The first call, not the fourth.
+//   PAYTO set (production) → HTTP 402 with a spec-valid x402 envelope, in BOTH
+//                            protocol versions at once: pay to continue. The
+//                            first call, not the fourth.
 //   PAYTO unset            → HTTP 429. There is nowhere to pay, so the answer
 //                            says exactly that instead of sending a 402 nobody
 //                            can satisfy.
+//
+// DUAL-STACK, and the two versions do not share a transport (2026-08-19):
+//
+//   v1  the envelope is the 402's JSON BODY, and the payment comes back in an
+//       `X-PAYMENT` request header. Unchanged, byte for byte — one real payment
+//       has verified and settled on this rail, and nothing here may regress it.
+//   v2  the envelope is a base64 `PAYMENT-REQUIRED` RESPONSE HEADER, and the
+//       payment comes back in a `PAYMENT-SIGNATURE` request header.
+//
+// A v2 client reads the header and never looks at the body; a v1 client reads
+// the body and never looks at the header (x402HTTPClient.getPaymentRequiredResponse
+// in @x402/core 2.23.0: header first, body only when `x402Version === 1`). So
+// the two can be served from the same 402 without either noticing the other,
+// which is what "dual-stack" buys — and it is required, because Coinbase's
+// Bazaar validator now answers a v1-only endpoint with "upgrade to x402 v2 to
+// be discoverable".
 //
 // A deployment that sets FREE_TIER_DAILY = N gets the old behaviour back: N
 // calls per caller per UTC day are simply served, with the count that is left
@@ -567,6 +638,31 @@ const tooLarge = () =>
 //   malformed input; with every call paid, it is the rule the service would be
 //   most unforgivable for breaking.
 
+/**
+ * The payment headers on a SERVED response.
+ *
+ * WHY THERE IS NO `PAYMENT-RESPONSE` HEADER, which a v2 reader will look for.
+ * In v2 that header is a settlement RECEIPT — `{ success, transaction, network,
+ * payer }`, base64 — and this Worker does not have one to give at the moment it
+ * answers. Settlement is deliberately queued behind the response (see the note
+ * above the body read in handleConvert): the caller paid for a conversion, not
+ * for a chain confirmation, so the ~2 s settle runs in ctx.waitUntil and lands
+ * in the `settlements` table instead of in these headers.
+ *
+ * The alternative is to emit one anyway, with `success: true` and an empty
+ * transaction, before anything has settled. That is a receipt for a payment
+ * that has not happened yet, and it would be the first fake thing this file
+ * says — the rule one line down from here is that nothing is ever
+ * fake-verified. So the header is absent, and its absence is honest.
+ *
+ * It costs nothing to a real client: @x402/fetch reads the receipt inside a
+ * try/catch and carries on without one (x402HTTPClient.processPaymentResult),
+ * which the v2 positive control in the suite proves end to end. What a caller
+ * gets instead is `x-payment-verified: true` — the claim we can actually
+ * support, which is that the facilitator checked the payment before we served.
+ * Moving settlement in front of the response would buy the receipt and cost the
+ * ordering that guarantees nobody is charged for a conversion we did not serve.
+ */
 function servedHeaders({ kind, presented, remaining, error }) {
   const headers = {};
   if (kind === 'free') {
@@ -604,8 +700,12 @@ function servedHeaders({ kind, presented, remaining, error }) {
 function overQuota(entry, conv, { payTo, tier, now, dayStart }) {
   const price = entry.hosted.price;
   if (payTo && price !== 'free') {
-    return paymentRequired(paymentRequirements(entry, conv, price, payTo), {
+    return paymentRequired(paymentRequirements(entry, conv, price, payTo), conv, {
       error: 'X-PAYMENT header is required',
+      // v2 renamed the header, so the v1 sentence would name the wrong thing.
+      // "Payment required" is what x402's own resource server puts here for an
+      // unpaid call (x402HTTPResourceServer.processHTTPRequest).
+      v2Error: 'Payment required',
     });
   }
 
@@ -690,7 +790,7 @@ function paidCeilingReached({ now, dayStart }) {
 function paymentRequirements(entry, conv, price, payTo) {
   return {
     scheme: price.scheme || 'exact',
-    network: 'base',
+    network: NETWORK_V1,
     maxAmountRequired: atomicAmount(price.amount_usd),
     resource: `${SITE_BASE}${entry.hosted.path}`,
     description: conv.description,
@@ -716,9 +816,179 @@ function paymentRequirements(entry, conv, price, payTo) {
   };
 }
 
-/** 402, carrying the envelope plus whatever we can say about why. */
-function paymentRequired(requirements, fields) {
-  return json({ x402Version: 1, ...fields, accepts: [requirements] }, 402);
+// ------------------------------------------------------------------ x402 v2
+//
+// The v2 view of the SAME facts. Everything below is derived from the v1
+// `requirements` object built above rather than assembled a second time from
+// entry/conv/price — that is what keeps the invariant at the top of
+// paymentRequirements() true across the version split. The two envelopes cannot
+// disagree about price, payTo, asset or resource, because there is nothing for
+// them to disagree with: one is a projection of the other.
+//
+// What v2 moved, and it is more than a rename:
+//
+//   maxAmountRequired          → amount
+//   network: "base"            → network: "eip155:8453"   (CAIP-2, colon required)
+//   resource: "<url>"          → the top-level `resource` OBJECT
+//   description, mimeType      → onto that same object
+//   outputSchema               → extensions.bazaar
+//
+// so a v2 `accepts` entry is SEVEN fields and nothing else. Adding a stray one
+// is not harmless: the client echoes our entry back as `accepted`, the server
+// side deep-equals the two (paymentRequirementsMatchAccepted), and the
+// facilitator validates the shape it is handed.
+
+/**
+ * The v2 `accepts[0]` entry. Exactly the fields PaymentRequirementsV2Schema
+ * defines — scheme, network, amount, asset, payTo, maxTimeoutSeconds, extra.
+ */
+function requirementsV2(requirements) {
+  return {
+    scheme: requirements.scheme,
+    network: NETWORK_V2,
+    amount: requirements.maxAmountRequired,
+    asset: requirements.asset,
+    payTo: requirements.payTo,
+    maxTimeoutSeconds: requirements.maxTimeoutSeconds,
+    extra: requirements.extra,
+  };
+}
+
+/**
+ * The v2 top-level `resource` block — what is being sold, as opposed to the
+ * terms it is sold on.
+ *
+ * `method` is here because the live v2 sellers already in Coinbase's index put
+ * it here (observed on x402scan's own paid API, 2026-08-19) and a POST-only
+ * resource that does not say so is a listing an agent will call wrong. It is
+ * NOT in @x402/core's ResourceInfoSchema, which knows url, description,
+ * mimeType, serviceName, tags and iconUrl — zod strips what it does not know,
+ * so the field is inert for a v2 client and legible to a crawler. The same
+ * fact is stated again, schema-legally, as extensions.bazaar.info.input.method.
+ */
+function resourceInfoV2(requirements) {
+  return {
+    url: requirements.resource,
+    method: 'POST',
+    description: requirements.description,
+    mimeType: requirements.mimeType,
+    tags: RESOURCE_TAGS,
+    serviceName: SERVICE_NAME,
+  };
+}
+
+/**
+ * `extensions.bazaar` — the v2 successor to v1's `outputSchema`, and the thing
+ * that makes the resource INDEXABLE rather than merely payable.
+ *
+ * The extension is two halves and both are required: `info` is one concrete
+ * example of the call, and `schema` is the JSON Schema `info` is validated
+ * against — the bazaar spec says a facilitator MUST validate one against the
+ * other before cataloguing, so a schema that does not admit its own info is a
+ * silent delisting. They are written next to each other here for that reason.
+ *
+ * `info.input` is a discriminated union on method. POST is a BODY method, so
+ * the shape is { type, method, bodyType, body } — `body` being an example
+ * request body, not a description of one. `discoverable` is deliberately absent:
+ * that was v1's opt-in flag, and in v2 the presence of this extension IS the
+ * opt-in. The 256 KB cap and the file format live in the schema's `description`
+ * fields, which is both where a JSON Schema puts a constraint and the only
+ * place the union leaves room for prose.
+ */
+function bazaarExtension(requirements, conv) {
+  const input = requirements.outputSchema.input;
+  return {
+    bazaar: {
+      info: {
+        input: { type: 'http', method: input.method, bodyType: input.bodyType, body: conv.sample },
+        // `example` is the sample body actually run through this converter —
+        // computed, not typed, so it cannot drift from what the tool returns.
+        // Closes the validator's last advisory (bazaar.info.output.example).
+        output: { type: 'text', format: requirements.mimeType, example: sampleOutput(conv) },
+      },
+      schema: {
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        type: 'object',
+        properties: {
+          input: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', const: 'http' },
+              method: { type: 'string', const: 'POST' },
+              bodyType: { type: 'string', const: 'text' },
+              body: {
+                type: 'string',
+                description: input.description,
+                maxLength: MAX_CONVERT_BODY,
+              },
+            },
+            required: ['type', 'method', 'bodyType', 'body'],
+            additionalProperties: false,
+          },
+          output: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', const: 'text' },
+              format: {
+                type: 'string',
+                const: requirements.mimeType,
+                description: requirements.outputSchema.output.description,
+              },
+              example: {
+                type: 'string',
+                description: `the sample request body above, converted — what a ${requirements.outputSchema.output.description || 'response'} looks like`,
+              },
+            },
+            required: ['type', 'format'],
+            additionalProperties: false,
+          },
+        },
+        required: ['input'],
+      },
+    },
+  };
+}
+
+/**
+ * The sample body run through its own converter, memoized. The converters are
+ * pure and the samples tiny, so this costs sub-millisecond once per isolate
+ * per tool — and the example in the envelope is by construction the truth.
+ */
+const sampleOutputCache = new Map();
+function sampleOutput(conv) {
+  let out = sampleOutputCache.get(conv);
+  if (out === undefined) {
+    out = String(conv.run(conv.sample));
+    sampleOutputCache.set(conv, out);
+  }
+  return out;
+}
+
+/** The whole v2 PaymentRequired envelope, ready to base64 into the header. */
+function paymentRequiredV2(requirements, conv, error) {
+  return {
+    x402Version: 2,
+    ...(error ? { error } : {}),
+    resource: resourceInfoV2(requirements),
+    accepts: [requirementsV2(requirements)],
+    extensions: bazaarExtension(requirements, conv),
+  };
+}
+
+/**
+ * 402, carrying the envelope plus whatever we can say about why — in both
+ * protocol versions, from the one `requirements` object.
+ *
+ * The BODY is the v1 envelope, unchanged. The v2 envelope rides in the
+ * `PAYMENT-REQUIRED` header, which is where a v2 client looks first and a v1
+ * client never looks at all. `no-store` because an envelope is per-request:
+ * a cached 402 hands the next caller someone else's terms.
+ */
+function paymentRequired(requirements, conv, { v2Error, ...body }) {
+  return json({ x402Version: 1, ...body, accepts: [requirements] }, 402, {
+    [PAYMENT_REQUIRED_HEADER]: base64Json(paymentRequiredV2(requirements, conv, v2Error)),
+    'cache-control': 'no-store',
+  });
 }
 
 const atomicAmount = (usd) => String(Math.round(usd * 10 ** USDC_DECIMALS));
@@ -740,7 +1010,38 @@ const atomicAmount = (usd) => String(Math.round(usd * 10 ** USDC_DECIMALS));
 // Verified against the SDK source and the CDP auth docs; see README § Settlement.
 
 /**
+ * The payment presented on this request, in whichever version it arrived.
+ *
+ * PAYMENT-SIGNATURE is read first because it is the newer transport and a
+ * client that sends it means it; X-PAYMENT stays accepted because v1 clients
+ * are still real and one of them has already paid us.
+ *
+ * THE VERSION COMES OUT OF THE PAYLOAD, NOT THE HEADER. `x402Version` is a
+ * required field of both payload schemas, it is what the facilitator's own
+ * client keys on (`x402Version: paymentPayload.x402Version`), and it survives a
+ * client that puts a v2 payload in the old header. Anything that is not exactly
+ * 2 is treated as v1 — which is the pre-existing behaviour for a payload that
+ * omits the field, and leaves a hypothetical v3 to be forwarded verbatim and
+ * refused by the facilitator rather than mis-shaped by us.
+ *
+ * Returns null when no payment was presented at all; `decoded` is null when one
+ * was presented and could not be decoded, which is a rejection, not an absence.
+ */
+function presentedPayment(request) {
+  const raw = request.headers.get(PAYMENT_HEADER_V2) || request.headers.get(PAYMENT_HEADER_V1);
+  if (!raw) return null;
+  const decoded = decodePaymentHeader(raw);
+  return { decoded, version: decoded?.x402Version === 2 ? 2 : 1 };
+}
+
+/**
  * Ask the facilitator whether a presented payment is good.
+ *
+ * `requirements` is already the VERSION-APPROPRIATE shape — the v1 envelope for
+ * a v1 payload, the v2 accepts entry for a v2 one. Getting that pairing wrong
+ * is invisible locally and fatal in production: the facilitator recovers the
+ * signature against what it is handed, so a v2 payload checked against a v1
+ * envelope verifies as invalid however good the payment was.
  *
  * NEVER THROWS — every failure is a verdict, because the caller is mid-request
  * and an exception here would become a 503 for something that should be served.
@@ -749,15 +1050,16 @@ const atomicAmount = (usd) => String(Math.round(usd * 10 ** USDC_DECIMALS));
  *   { rejected: true, reason, message }  the facilitator said no — 402
  *   { unavailable: '<reason>' }          we could not ask — serve, unverified
  */
-async function verifyPayment(request, env, requirements) {
-  const decoded = decodePaymentHeader(request.headers.get('x-payment'));
+async function verifyPayment(env, payment, requirements) {
+  const decoded = payment?.decoded;
   // A header we cannot even decode is the caller's bug, not an outage: there is
   // nothing to send the facilitator, so it is a rejection rather than a serve.
   if (!decoded) {
     return {
       rejected: true,
       reason: 'malformed_payment_header',
-      message: 'X-PAYMENT must be base64-encoded JSON — an x402 payment payload',
+      message:
+        'X-PAYMENT (x402 v1) or PAYMENT-SIGNATURE (x402 v2) must be base64-encoded JSON — an x402 payment payload',
       payer: null,
     };
   }
@@ -794,7 +1096,7 @@ async function verifyPayment(request, env, requirements) {
  * Never throws, for the same reason as above and one more: it runs inside
  * ctx.waitUntil, where an exception is invisible.
  */
-async function settleAndRecord(env, db, { requirements, payload, payer, tool }) {
+async function settleAndRecord(env, db, { requirements, facRequirements, version, payload, payer, tool }) {
   let settleOk = 0;
   let txHash = null;
   let error = null;
@@ -813,10 +1115,15 @@ async function settleAndRecord(env, db, { requirements, payload, payer, tool }) 
   // signature check, and the payload it sees stays byte-for-byte what arrived.
   // `resource` is envelope metadata and is not covered by the EIP-712
   // signature, so adding it here cannot invalidate anything.
-  const settlePayload = payload?.resource ? payload : { ...payload, resource: requirements.resource };
+  //
+  // The VALUE is version-shaped: v1's `resource` is the URL string, v2's is the
+  // ResourceInfo object. A v2 client built by @x402/core echoes ours back
+  // already, so this is a backstop for one that does not.
+  const ownResource = version === 2 ? resourceInfoV2(requirements) : requirements.resource;
+  const settlePayload = payload?.resource ? payload : { ...payload, resource: ownResource };
 
   try {
-    const call = await facilitatorCall(env, 'settle', settlePayload, requirements, SETTLE_TIMEOUT_MS);
+    const call = await facilitatorCall(env, 'settle', settlePayload, facRequirements, SETTLE_TIMEOUT_MS);
     if (!call.ok) {
       error = call.reason;
     } else if (call.data?.success === true) {
@@ -851,6 +1158,16 @@ async function settleAndRecord(env, db, { requirements, payload, payer, tool }) 
  *
  * The body shape is the x402 spec's, and matches what `useFacilitator` in the
  * `x402` package sends, field for field.
+ *
+ * IT IS THE SAME BODY IN BOTH VERSIONS — `{ x402Version, paymentPayload,
+ * paymentRequirements }` — and the same two endpoints. Confirmed twice:
+ * @x402/core 2.23.0's HTTPFacilitatorClient sends exactly this for v1 and v2
+ * alike, differing only in the version number and in the shapes of the two
+ * objects; and CDP's own reference pages for
+ * /platform/v2/x402/{verify,settle} document `x402Version` as `1 | 2` with no
+ * separate v2 route. (The `v2` in that path is CDP's platform API version and
+ * has nothing to do with the protocol version.) So the version travels in the
+ * payload and the shapes, and this function needs no branch.
  */
 async function facilitatorCall(env, endpoint, payload, requirements, timeoutMs) {
   const base = (env.FACILITATOR_URL || DEFAULT_FACILITATOR_URL).replace(/\/+$/, '');
@@ -936,7 +1253,7 @@ async function cdpAuthHeader(env, method, url) {
   return `Bearer ${signingInput}.${base64url(new Uint8Array(signature))}`;
 }
 
-/** The X-PAYMENT header is base64-encoded JSON. Returns null if it is not. */
+/** The payment header is base64-encoded JSON. Returns null if it is not. */
 function decodePaymentHeader(raw) {
   if (!raw) return null;
   try {
@@ -1000,13 +1317,24 @@ function base64Bytes(b64) {
 
 const base64Text = (b64) => new TextDecoder().decode(base64Bytes(b64));
 
-function base64url(bytes) {
+function base64Encode(bytes) {
   let binary = '';
   for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return btoa(binary);
 }
 
+const base64url = (bytes) =>
+  base64Encode(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
 const base64urlJson = (value) => base64url(new TextEncoder().encode(JSON.stringify(value)));
+
+// STANDARD base64 with padding, NOT the url-safe form above. The x402 v2
+// headers are validated against /^[A-Za-z0-9+/]*={0,2}$/ before they are
+// decoded (@x402/core's Base64EncodedRegex), so a url-safe envelope is thrown
+// out unread — which reads, from the client side, as a seller that sent no
+// envelope at all. The JWT above wants the opposite encoding; that is why there
+// are two.
+const base64Json = (value) => base64Encode(new TextEncoder().encode(JSON.stringify(value)));
 
 // ------------------------------------------------------------------ converters
 
@@ -1017,6 +1345,12 @@ function oneLineMessage(err) {
   return raw.replace(/\s+/g, ' ').trim().slice(0, 200);
 }
 
+// `sample` is a REAL request body for that tool, and it is published: it is
+// what `extensions.bazaar.info.input.body` carries in every v2 envelope, which
+// the bazaar spec treats as a worked example of the call rather than as a
+// description of one. So it has to actually convert — an example that 400s is
+// worse than no example, and the suite pays for each of these and asserts a 200.
+// Kept short because it rides in a response HEADER on every unpaid call.
 const CONVERTERS = {
   'md-html': {
     description: 'Markdown to HTML conversion',
@@ -1024,6 +1358,7 @@ const CONVERTERS = {
     inputFormat: 'Markdown',
     outputFormat: 'HTML',
     contentType: 'text/html; charset=utf-8',
+    sample: '# Title\n\nSome **bold** text.\n',
     run: (input) => marked.parse(input),
   },
 
@@ -1033,6 +1368,7 @@ const CONVERTERS = {
     inputFormat: 'JSON',
     outputFormat: 'YAML',
     contentType: 'application/yaml; charset=utf-8',
+    sample: '{"name":"toolshed","tags":["x402"]}',
     run: (input) => {
       let parsed;
       try {
@@ -1050,6 +1386,7 @@ const CONVERTERS = {
     inputFormat: 'YAML',
     outputFormat: 'JSON',
     contentType: 'application/json; charset=utf-8',
+    sample: 'name: toolshed\ntags:\n  - x402\n',
     run: (input) => {
       let docs;
       try {
@@ -1069,6 +1406,7 @@ const CONVERTERS = {
     inputFormat: 'CSV',
     outputFormat: 'JSON',
     contentType: 'application/json; charset=utf-8',
+    sample: 'name,tags\ntoolshed,x402\n',
     run: (input) => `${JSON.stringify(csvToRecords(input), null, 2)}\n`,
   },
 
@@ -1078,6 +1416,7 @@ const CONVERTERS = {
     inputFormat: 'HTML',
     outputFormat: 'Markdown',
     contentType: 'text/markdown; charset=utf-8',
+    sample: '<h1>Title</h1>\n<p>Some <strong>bold</strong> text.</p>\n',
     run: (input) => {
       // Turndown's browser build reaches for a global `document` that workerd
       // does not have, so the HTML is parsed with domino here and the resulting

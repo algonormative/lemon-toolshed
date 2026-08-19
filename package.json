@@ -28,6 +28,9 @@
     "turndown": "^7.2.4"
   },
   "devDependencies": {
+    "@x402/evm": "2.23.0",
+    "@x402/fetch": "2.23.0",
+    "ajv": "^8.20.0",
     "serve": "^14.2.6",
     "viem": "^2.55.18",
     "wrangler": "4.42.2",

@@ -29,6 +29,14 @@
 // allowance to spend before any of this. The FIRST unauthenticated call is the
 // 402, so every test below that used to open with `await exhaust(ip)` simply
 // makes its call. The assertions are unchanged; only the setup went away.
+//
+// AND AGAIN, the same day, when the payment surface went DUAL-STACK: the same
+// 402 now also carries the x402 v2 envelope, base64, in a PAYMENT-REQUIRED
+// response header. The v1 assertions below are untouched on purpose — one real
+// v1 payment has settled on this rail, and the body it was signed against must
+// stay byte-for-byte what it was. The v2 assertions are a separate describe at
+// the bottom, and the one that matters most is that the two AGREE: the header
+// is a projection of the body, not a second envelope written by hand.
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -324,5 +332,217 @@ describe('a payment that cannot be checked is never treated as checked', () => {
     } finally {
       await scratch.stop();
     }
+  });
+});
+
+// ------------------------------------------------------------------ x402 v2
+//
+// The dual-stack half. A v2 client never reads the 402's body — it reads the
+// PAYMENT-REQUIRED header and stops (x402HTTPClient.getPaymentRequiredResponse
+// in @x402/core: header first, body only when x402Version === 1) — so a missing
+// or malformed header is, from a v2 client's side, a seller that published no
+// terms at all. Which is also what Coinbase's Bazaar validator now says: a
+// v1-only endpoint is told to "upgrade to x402 v2 to be discoverable".
+
+/** The v2 envelope carried by a 402, decoded. Throws if it is not there. */
+function v2Envelope(res) {
+  const header = res.headers.get('payment-required');
+  assert.ok(header, 'the 402 carries no PAYMENT-REQUIRED header — a v2 client sees no envelope');
+  // The client validates the header against /^[A-Za-z0-9+/]*={0,2}$/ BEFORE
+  // decoding it, so url-safe base64 is thrown out unread. Asserted here because
+  // the failure is silent everywhere else.
+  assert.match(header, /^[A-Za-z0-9+/]*={0,2}$/, 'the envelope is not standard base64');
+  return JSON.parse(Buffer.from(header, 'base64').toString('utf8'));
+}
+
+describe('the v2 envelope in the PAYMENT-REQUIRED header', () => {
+  test('an unpaid call carries a spec-shaped x402 v2 envelope', async () => {
+    const res = await api.convert('md-html', '# hi\n', { ip: ips.pinned(10), ua: 'x402-suite/1' });
+    assert.equal(res.status, 402, `expected 402, got ${res.status}: ${res.text}`);
+
+    const env = v2Envelope(res);
+    assert.deepEqual(Object.keys(env).sort(), ['accepts', 'error', 'extensions', 'resource', 'x402Version']);
+    assert.equal(env.x402Version, 2);
+    // v2's `error` is a CODE a client branches on, not the v1 sentence.
+    assert.equal(env.error, 'Payment required');
+
+    // `resource` is an OBJECT in v2 — the thing being sold, split out from the
+    // terms it is sold on.
+    assert.deepEqual(env.resource, {
+      url: `${SITE_BASE}/convert/md-html`,
+      method: 'POST',
+      description: TOOLS['md-html'].description,
+      mimeType: TOOLS['md-html'].mimeType,
+      tags: ['x402', 'conversion'],
+      serviceName: 'Toolshed',
+    });
+
+    // …and `accepts[0]` is SEVEN fields, no more: everything v1 kept here that
+    // v2 moved out must be gone, or the facilitator is handed a shape it did
+    // not ask for.
+    assert.equal(env.accepts.length, 1);
+    assert.deepEqual(env.accepts[0], {
+      scheme: 'exact',
+      network: 'eip155:8453', // CAIP-2. "base" is a v1 spelling and invalid here.
+      amount: '1000', // renamed from maxAmountRequired
+      asset: USDC_BASE,
+      payTo: PAYTO_TEST,
+      maxTimeoutSeconds: 60,
+      // Same EIP-712 domain as v1, and load-bearing for the same reason: the
+      // client signs over `extra.name`/`extra.version` with no fallback.
+      extra: { name: 'USD Coin', version: '2' },
+    });
+  });
+
+  test('the v2 header and the v1 body are the same offer', async () => {
+    // THE INVARIANT THIS WHOLE DESIGN RESTS ON. The two envelopes are built
+    // from one object — the v2 view is a projection of the v1 one — so a
+    // disagreement here is not a copy error, it is a broken projection. And it
+    // would be invisible: each envelope is independently valid, and only the
+    // client that reads the OTHER one pays the wrong price.
+    for (const [id, tool] of Object.entries(TOOLS)) {
+      const res = await api.convert(id, tool.input, { ip: ips.next(), ua: 'x402-suite/1' });
+      assert.equal(res.status, 402, `${id} answered ${res.status}: ${res.text}`);
+
+      const v1 = res.json().accepts[0];
+      const env = v2Envelope(res);
+      const v2 = env.accepts[0];
+
+      assert.equal(v2.amount, v1.maxAmountRequired, `${id}: the two envelopes name different prices`);
+      assert.equal(v2.payTo, v1.payTo, `${id}: the two envelopes name different payees`);
+      assert.equal(v2.asset, v1.asset, `${id}: the two envelopes name different assets`);
+      assert.equal(v2.scheme, v1.scheme, `${id}: the two envelopes name different schemes`);
+      assert.equal(v2.maxTimeoutSeconds, v1.maxTimeoutSeconds, `${id}: different timeouts`);
+      assert.deepEqual(v2.extra, v1.extra, `${id}: different EIP-712 domains`);
+      assert.equal(env.resource.url, v1.resource, `${id}: the two envelopes name different resources`);
+      assert.equal(env.resource.description, v1.description, `${id}: different descriptions`);
+      assert.equal(env.resource.mimeType, v1.mimeType, `${id}: different mimeTypes`);
+    }
+  });
+
+  test('every tool carries an extensions.bazaar block that describes its own call', async () => {
+    for (const [id, tool] of Object.entries(TOOLS)) {
+      const res = await api.convert(id, tool.input, { ip: ips.next(), ua: 'x402-suite/1' });
+      assert.equal(res.status, 402, `${id} answered ${res.status}: ${res.text}`);
+      const env = v2Envelope(res);
+
+      // v1's outputSchema moved here wholesale. No bazaar block, no listing.
+      const bazaar = env.extensions?.bazaar;
+      assert.ok(bazaar, `${id} carries no extensions.bazaar — it cannot be indexed`);
+      assert.deepEqual(Object.keys(bazaar).sort(), ['info', 'schema'], `${id} bazaar has the wrong halves`);
+
+      // POST is a BODY method, so the input union is { type, method, bodyType,
+      // body } — `body` an example request, not a description of one.
+      assert.deepEqual(bazaar.info.input, {
+        type: 'http',
+        method: 'POST',
+        bodyType: 'text',
+        body: bazaar.info.input.body,
+      });
+      assert.equal(typeof bazaar.info.input.body, 'string');
+      assert.ok(bazaar.info.input.body.trim().length > 0, `${id} publishes an empty example body`);
+      // `discoverable` was v1's opt-in flag. In v2 the extension IS the opt-in,
+      // and the field is not in the union — it would fail the schema below.
+      assert.equal(bazaar.info.input.discoverable, undefined, `${id} leaks the v1 discoverable flag`);
+
+      // `example` is the sample body run through the converter itself (computed
+      // in the Worker, not typed — it cannot drift from what the tool returns;
+      // the converter suites pin the real outputs). Closes the validator's
+      // last advisory (bazaar.info.output.example). Here: shape + a per-tool
+      // marker proving the example is genuinely converted output, not input.
+      assert.deepEqual(Object.keys(bazaar.info.output).sort(), ['example', 'format', 'type']);
+      assert.equal(bazaar.info.output.type, 'text');
+      assert.equal(bazaar.info.output.format, tool.mimeType);
+      const EXAMPLE_MARK = {
+        'md-html': '<h1>',
+        'json-yaml': 'name: toolshed',
+        'yaml-json': '"name"',
+        'csv-json': '"toolshed"',
+        'html-markdown': '# Title',
+      };
+      assert.equal(typeof bazaar.info.output.example, 'string');
+      assert.ok(
+        bazaar.info.output.example.includes(EXAMPLE_MARK[id]),
+        `${id} output example does not look converted: ${JSON.stringify(bazaar.info.output.example.slice(0, 60))}`
+      );
+
+      // The facilitator rejects a description past 500 characters at LISTING
+      // time, not at call time, so a long string is invisible until discovery
+      // silently stops working.
+      for (const [where, text] of [
+        ['resource.description', env.resource.description],
+        ['bazaar.schema input.body.description', bazaar.schema.properties.input.properties.body.description],
+        ['bazaar.schema output.format.description', bazaar.schema.properties.output.properties.format.description],
+      ]) {
+        assert.ok(text.length <= 500, `${id} ${where} is ${text.length} chars, over the 500 limit`);
+      }
+    }
+  });
+
+  test('the bazaar schema actually validates the bazaar info it is published with', async (t) => {
+    // The bazaar spec makes this a facilitator's job: it MUST validate `info`
+    // against `schema` before cataloguing. A schema that does not admit its own
+    // info is therefore a silent delisting — everything looks right, nothing
+    // gets indexed, and no error is reported anywhere. So it is checked here
+    // with a real JSON Schema validator rather than by reading the two.
+    let Ajv2020;
+    try {
+      ({ default: Ajv2020 } = await import('ajv/dist/2020.js'));
+    } catch {
+      return t.skip('ajv not installed (npm install)');
+    }
+    const ajv = new Ajv2020({ strict: false });
+
+    for (const [id, tool] of Object.entries(TOOLS)) {
+      const res = await api.convert(id, tool.input, { ip: ips.next(), ua: 'x402-suite/1' });
+      assert.equal(res.status, 402, `${id} answered ${res.status}: ${res.text}`);
+      const { info, schema } = v2Envelope(res).extensions.bazaar;
+
+      const validate = ajv.compile(schema);
+      assert.ok(validate(info), `${id}: info fails its own schema — ${ajv.errorsText(validate.errors)}`);
+
+      // …and the schema has to have teeth. A permissive one would pass the
+      // line above while proving nothing, so a deliberately wrong info must
+      // fail it.
+      const wrong = { ...info, input: { ...info.input, method: 'GET' } };
+      assert.equal(validate(wrong), false, `${id}: the schema accepts a GET input — it is not constraining`);
+    }
+  });
+
+  test('a rejected payment answers with the v2 error code as well as the v1 reason', async () => {
+    // No facilitator in this phase, so the reachable rejection is the one that
+    // never gets that far: an undecodable payment header.
+    const ip = ips.pinned(11);
+    const res = await api.convert('md-html', '# hi\n', { ip, headers: { 'x-payment': 'not-base64-!!' } });
+    assert.equal(res.status, 402);
+    assert.equal(res.json().invalidReason, 'malformed_payment_header');
+    // v2 has one error field and it carries the code, so a v2 client sees the
+    // same fact the v1 body's invalidReason carries.
+    assert.equal(v2Envelope(res).error, 'malformed_payment_header');
+  });
+
+  test('a v2 payment header is recognised as a payment', async () => {
+    // PAYMENT-SIGNATURE is v2's X-PAYMENT. A worker that only looks at the old
+    // name answers 402 to a paying v2 client forever, which is the exact
+    // failure this dual-stack change exists to prevent — and it looks identical
+    // to "the client did not pay".
+    const ip = ips.pinned(12);
+    const res = await api.convert('md-html', '# hi\n', {
+      ip,
+      headers: { 'payment-signature': Buffer.from(JSON.stringify({ x402Version: 2 })).toString('base64') },
+    });
+    // This phase has no CDP credentials, so the honest answer to a payment we
+    // cannot check is the conversion plus `facilitator-unconfigured` — the same
+    // availability-first answer a v1 payment gets above. What matters is that
+    // it is NOT the 402: the header was seen.
+    assert.equal(res.status, 200, `a v2 payment header was ignored: ${res.status} ${res.text}`);
+    assert.equal(res.headers.get('x-payment-verified'), 'false');
+    assert.equal(res.headers.get('x-payment-error'), 'facilitator-unconfigured');
+  });
+
+  test('the 402 is not cacheable — an envelope is per-request', async () => {
+    const res = await api.convert('md-html', '# hi\n', { ip: ips.pinned(13), ua: 'x402-suite/1' });
+    assert.equal(res.status, 402);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
   });
 });
