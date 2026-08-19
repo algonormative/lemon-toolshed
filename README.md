@@ -1171,6 +1171,16 @@ The binding is declared **unrestricted** (no `destination_address` in
 repo; the recipient comes from the secret instead. Cloudflare still enforces the
 verified-destination rule, so unrestricted is not unlimited.
 
+> **Status (2026-08-19): the email channel is dormant on this deployment, and
+> that is a product mismatch, not a bug.** `send_email` only works on zones
+> whose MX is Cloudflare Email Routing, and `lemon-agent.dev`'s email is hosted
+> on **Protonmail** (Proton MX + SPF, verified with `dig MX` the day the
+> channel shipped — a live-fire test rang Telegram and silently skipped email,
+> exactly as the try/catch design intends). The code stays: it costs nothing,
+> no-ops cleanly, and lights up on its own if the zone ever moves to Email
+> Routing. Until then, **Telegram is the alert channel**, and inbound mail to
+> `support@lemon-agent.dev` (registry verification etc.) lands in Proton.
+
 **Until Email Routing and its DNS records are live, the email channel silently
 no-ops** — the binding call throws, it is caught, and the Telegram ping is
 unaffected. That is the intended state during setup, not a fault to chase.
