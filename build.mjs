@@ -1749,6 +1749,9 @@ const openapi = {
           'answers HTTP 402 with an x402 envelope, and paying it is the whole authentication story. ' +
           'You are charged only for conversions that are actually served.') +
       `\n\nThe same catalog is published as ${BASE}/catalog.json, ${BASE}/llms.txt and ${BASE}/llms-full.txt.`,
+    // The registries key ownership verification on this address (x402scan told
+    // us so verbatim when we registered). Owner-chosen 2026-08-19.
+    contact: { name: HOUSE, email: 'support@lemon-agent.dev', url: 'https://lemon-agent.dev' },
     license: { name: 'Proprietary', identifier: 'LicenseRef-Proprietary' },
   },
   servers: [{ url: API_BASE, description: 'Production' }],
