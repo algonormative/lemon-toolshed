@@ -52,6 +52,20 @@ const INPUTS = {
   'yaml-json': 'a: 1\n',
   'csv-json': 'a\n1\n',
   'html-markdown': '<p>hi</p>',
+  'json-csv': '[{"a":1}]',
+  'csv-yaml': 'a\n1\n',
+  'yaml-csv': '- a: 1\n',
+  'json-ndjson': '[{"a":1}]',
+  'ndjson-json': '{"a":1}\n',
+  'frontmatter-json': '---\ntitle: hi\n---\nbody\n',
+  'markdown-json': '# hi\n',
+  'srt-vtt': '1\n00:00:01,000 --> 00:00:02,000\nhi\n',
+  'vtt-srt': 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n',
+  'toml-json': 'a = 1\n',
+  'json-toml': '{"a":1}',
+  'xml-json': '<r><a>1</a></r>',
+  'html-text': '<p>hi</p>',
+  'html-json': '<table><tr><th>a</th></tr><tr><td>1</td></tr></table>',
 };
 
 before(async () => {

@@ -179,7 +179,7 @@ function paymentHeader({ from = THIRD_PARTY_PAYER } = {}) {
         authorization: {
           from,
           to: PAYTO_TEST,
-          value: '1000',
+          value: '5000',
           validAfter: String(now - 600),
           validBefore: String(now + 60),
           nonce: `0x${'cd'.repeat(32)}`,
@@ -309,7 +309,7 @@ describe('a settled payment pings the owner', () => {
     // …and it says the things a phone-glance has to answer.
     assert.match(hit.text, /THIRD PARTY PAID/, 'a stranger paying did not read as a sale');
     assert.match(hit.text, /md-html/, 'the alert does not name the tool');
-    assert.match(hit.text, /\$0\.001/, 'the alert does not carry the amount in dollars');
+    assert.match(hit.text, /\$0\.005/, 'the alert does not carry the amount in dollars');
     assert.match(hit.text, new RegExp(THIRD_PARTY_PAYER, 'i'), 'the alert does not name the payer');
     assert.match(hit.text, new RegExp(TX_HASH, 'i'), 'the alert does not carry the transaction');
     assert.match(hit.text, /settled/, 'the alert does not say the settlement landed');
@@ -339,7 +339,7 @@ describe('a settled payment pings the owner', () => {
       'THE OWNER’S OWN TEST BUY WAS ANNOUNCED AS A THIRD-PARTY SALE'
     );
     assert.match(hit.text, /csv-json/);
-    assert.match(hit.text, /\$0\.001/);
+    assert.match(hit.text, /\$0\.005/);
   });
 
   test('the house match is case-insensitive, as an address written anywhere is', async () => {
@@ -409,7 +409,7 @@ describe('a call served without verification is its own alarm', () => {
     assert.match(hit.text, /SERVED WITHOUT VERIFICATION/, 'the leak did not announce itself');
     assert.match(hit.text, /facilitator-unreachable/, 'the alert does not say what failed');
     assert.match(hit.text, /md-html/);
-    assert.match(hit.text, /\$0\.001/);
+    assert.match(hit.text, /\$0\.005/);
     // Distinct from both settlement messages, which is the whole point.
     assert.ok(!/THIRD PARTY PAID/.test(hit.text), 'a leak was announced as a sale');
     assert.ok(!/test settlement/.test(hit.text), 'a leak was announced as a drill');
@@ -686,7 +686,7 @@ describe('the email channel produces a valid RFC 5322 message', () => {
 
     // …and the body carries the detail.
     assert.match(mail.body, /yaml-json/);
-    assert.match(mail.body, /\$0\.001/);
+    assert.match(mail.body, /\$0\.005/);
     assert.match(mail.body, new RegExp(TX_HASH, 'i'));
     assert.match(mail.body, /basescan\.org/, 'no explorer link for a settled payment');
   });

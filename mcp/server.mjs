@@ -51,9 +51,10 @@ const TOOLS = [
       '`to` against what you need — case-insensitive substrings, each bound to its own ' +
       'side, and extensions and MIME types hit too ("md", ".md", "text/markdown", "yml", ' +
       '"text/html"). Omit both to get every hosted tool. Call this before toolshed_convert ' +
-      'rather than guessing a tool_id. Each match carries its own `hosted.price` — every ' +
-      'hosted tool is $0.001 a call — and `hosted.free_tier_daily`, which is 0 unless that ' +
-      'deployment has enabled a free tier.',
+      'rather than guessing a tool_id. Each match carries its own `hosted.price` — prices are ' +
+      'PER TOOL and are not uniform, so read the amount off the match rather than assuming one ' +
+      'figure across the API — and `hosted.free_tier_daily`, which is 0 unless that deployment ' +
+      'has enabled a free tier.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -69,7 +70,9 @@ const TOOLS = [
       'Run a hosted conversion. `tool_id` is an id from toolshed_check (for example ' +
       '"md-html"); `input` is the file content, sent as the request body. The converted ' +
       'text comes back. Input is capped at 256 KB. The first call answers HTTP 402 with an ' +
-      'x402 envelope — payment is the front door, $0.001 in USDC on Base per call. A 402 is ' +
+      "x402 envelope — payment is the front door, and the envelope names THAT tool's price in " +
+      'USDC on Base. Prices differ per tool, so the envelope (or toolshed_check) is the only ' +
+      'authority on what a call costs. A 402 is ' +
       'not an error: it is the price. You are only charged for conversions that are actually ' +
       'served — a 400 on malformed input costs nothing. A 429 means either that deployment ' +
       'has no receiving address to take payment, or this caller hit the daily conversion ' +
@@ -159,7 +162,7 @@ async function convert(args) {
     if (Number.isFinite(left) && left <= LOW_TIER_WARN) {
       return text(
         `${body}\n\n[toolshed: free tier — ${left} conversions left today for this caller. ` +
-          'At zero, calls answer 402 and payment is live: $0.001 in USDC on Base via x402.]'
+          "At zero, calls answer 402 and payment is live: that tool's price in USDC on Base via x402.]"
       );
     }
   }

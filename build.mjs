@@ -85,17 +85,11 @@ const FREE_TIER_ON = FREE_TIER_DAILY > 0;
 const SITE_NAME = 'Toolshed';
 const HOUSE = 'Lemon';
 const KICKER = 'the Lemon';
-const STRAPLINE = FREE_TIER_ON
-  ? 'A collection of tools for agents — no install required. Privacy-first: no login, no credit card, ' +
-    'no account. Every tool is free to try.'
-  : 'Tools for agents — no install, no login, no account, no card. Pay per call in USDC: $0.001 a ' +
-    'call over x402, where the payment is the auth.';
 const TITLE = `${SITE_NAME} — tools for agents · ${HOUSE}`;
-const META_DESCRIPTION = FREE_TIER_ON
-  ? `Conversion tools an agent can call over HTTP with nothing installed. No login, no credit card. ` +
-    `Every tool is free to try — ${FREE_TIER_DAILY} conversions a day — then priced per call in USDC with x402.`
-  : `Conversion tools an agent can call over HTTP with nothing installed. No login, no account, no ` +
-    `card — every call is priced per call in USDC with x402 ($0.001), and the payment is the auth.`;
+// STRAPLINE and META_DESCRIPTION used to be here, with "$0.001" typed into both.
+// They now live below the load, next to PRICE_PHRASE, because the figure is
+// DERIVED from entries.yaml — see PRICE_RANGE. Typing a price into page copy is
+// how a repricing ships a site that lies about itself for a week.
 
 // Refresh cadence is monthly (~4 h/month, dossier § Estimates). Entries whose
 // `verified` date predates it are flagged in the build (dossier § Components 7).
@@ -131,7 +125,11 @@ const CATEGORY_RULES = [
   [/markdown|docx|\bhtml\b|\bdom\b|ebook|mobi|azw3|office|pptx/, 'Documents & markup'],
   [/video|audio|speech|\bwav\b|flac/, 'Audio & video'],
   [/image|photo|heic|\bsvg\b|screenshot/, 'Images'],
-  [/json|\bcsv\b|sqlite|yaml|xlsx|spreadsheet/, 'Data & tabular'],
+  // Subtitles are timed text for a video, so they shelve with the media rather
+  // than with the data formats. It sits after the media rule above because that
+  // one is about the media file itself; neither can match the other's phrasing.
+  [/subtitle|subrip|webvtt/, 'Audio & video'],
+  [/json|\bcsv\b|sqlite|yaml|xlsx|spreadsheet|\btoml\b|\bxml\b|ndjson/, 'Data & tabular'],
 ];
 
 const CATEGORY_ORDER = [
@@ -163,6 +161,9 @@ const LABEL_RULES = [
   [/scanned/, 'scanned pdf'],
   [/digital-born/, 'digital-born pdf'],
   [/searchable pdf/, 'searchable pdf'],
+  // Ahead of the /tables/ rule below, which was written for the PDF entry and
+  // would otherwise label an HTML page that happens to carry tables `pdf tables`.
+  [/\bhtml\b.*\btables?\b/, 'html'],
   [/tables/, 'pdf tables'],
   [/docx\/xlsx\/pptx/, 'office docs'],
   [/messy document/, 'messy document'],
@@ -175,15 +176,27 @@ const LABEL_RULES = [
   [/structured records/, 'structured records'],
   [/structured metadata/, 'metadata json'],
   [/transcript/, 'transcript'],
+  // AFTER /transcript/ on purpose: the speech entry's "Transcript (text/SRT/VTT)"
+  // is a transcript that happens to name two container formats, not a subtitle
+  // file. The two hosted subtitle entries name their format first.
+  [/subrip|\bsrt\b/, 'srt'],
+  [/webvtt|\bvtt\b/, 'vtt'],
   [/photo \/ video \/ pdf/, 'media file'],
   [/heic/, 'heic photos'],
   [/batch of source images/, 'images'],
   [/web-sized/, 'web images'],
   [/page images/, 'page images'],
   [/plain text|layout-preserved/, 'plain text'],
+  // Before /ndjson/, which is the OR-list label the json-reshape entry wants
+  // ("Flat JSON / NDJSON / CSV rows"). An entry whose whole subject is the
+  // format spells it out in full and gets the format's own label.
+  [/newline-delimited json/, 'ndjson'],
   [/ndjson/, 'json / ndjson'],
   [/audio file/, 'audio file'],
   [/mp3 or opus/, 'mp3 / opus'],
+  // Before /\bmarkdown\b/: the input IS Markdown, but what the tool operates on
+  // is the fence at the top of it, and `?from=frontmatter` is what an agent asks.
+  [/frontmatter/, 'frontmatter'],
   [/\bmarkdown\b/, 'markdown'],
   [/\bhtml\b/, 'html'],
   [/\bdocx\b/, 'docx'],
@@ -196,6 +209,8 @@ const LABEL_RULES = [
   [/\bwav\b|flac|arbitrary audio/, 'audio'],
   [/\bvideo\b/, 'video'],
   [/sqlite/, 'sqlite'],
+  [/\btoml\b/, 'toml'],
+  [/\bxml\b/, 'xml'],
   [/\byaml\b/, 'yaml'],
   [/\bjson\b/, 'json'],
   [/\bcsv\b/, 'csv'],
@@ -203,7 +218,21 @@ const LABEL_RULES = [
 ];
 
 // File extension used in each hosted card's example curl, keyed by the x label.
-const SAMPLE_EXT = { markdown: 'md', html: 'html', json: 'json', yaml: 'yaml', csv: 'csv' };
+const SAMPLE_EXT = {
+  markdown: 'md',
+  html: 'html',
+  json: 'json',
+  yaml: 'yaml',
+  csv: 'csv',
+  ndjson: 'ndjson',
+  toml: 'toml',
+  xml: 'xml',
+  srt: 'srt',
+  vtt: 'vtt',
+  // The input is a Markdown file; the fence at the top of it is only what the
+  // tool reads. `input.frontmatter` would name a file nobody has.
+  frontmatter: 'md',
+};
 
 // The Content-Type each hosted conversion answers with, keyed by the y label.
 //
@@ -217,6 +246,13 @@ const RESPONSE_MIME = {
   json: 'application/json',
   yaml: 'application/yaml',
   csv: 'text/csv',
+  ndjson: 'application/x-ndjson',
+  toml: 'application/toml',
+  // No registered media type exists for SubRip; `application/x-subrip` is what
+  // ffmpeg, VLC and every player in practice use, so it is what we publish.
+  srt: 'application/x-subrip',
+  vtt: 'text/vtt',
+  'plain text': 'text/plain',
 };
 const responseMime = (e) => RESPONSE_MIME[e._ylabel] || 'text/plain';
 
@@ -256,6 +292,16 @@ const FORMAT_ALIASES = {
   'metadata json': ['json', 'application/json'],
   yaml: ['yml', 'application/yaml', 'text/yaml', 'application/x-yaml'],
   csv: ['text/csv', 'application/csv'],
+  // One JSON value per line. `jsonl` and `ldjson` are the two other names the
+  // same file gets given, and both turn up in the wild as extensions.
+  ndjson: ['jsonl', 'ldjson', 'application/x-ndjson', 'application/jsonl'],
+  toml: ['application/toml', 'text/toml'],
+  xml: ['application/xml', 'text/xml'],
+  srt: ['subrip', 'application/x-subrip', 'text/srt'],
+  vtt: ['webvtt', 'text/vtt'],
+  // The file on disk is a .md, so the Markdown spellings have to hit too — an
+  // agent holding a post with a `---` fence knows it as Markdown first.
+  frontmatter: ['md', 'markdown', 'yaml frontmatter', 'text/markdown'],
   'clean csv': ['csv', 'text/csv'],
   'messy csv': ['csv', 'text/csv'],
   pdf: ['application/pdf'],
@@ -471,9 +517,37 @@ const localOnly = entries.filter((e) => !e._hosted);
 // them differently and the phrasing degrades honestly instead of lying.
 const priceAmounts = Array.from(
   new Set(hostedEntries.filter((e) => !isFree(e._hosted)).map((e) => e._hosted.price.amount_usd))
-);
-const PRICE_PHRASE =
-  priceAmounts.length === 1 ? `$${priceAmounts[0]} in USDC via x402` : 'a per-call price in USDC via x402';
+).sort((a, b) => a - b);
+
+// The figure, in the shortest honest form: one price when the tools agree, the
+// span when they do not. It is used everywhere the page and the machine files
+// used to carry a typed "$0.001" — reprice a tool in entries.yaml and every one
+// of those sentences moves with it, which is the whole point of deriving it.
+//
+// The span is a RANGE, not a hedge: "$0.005–$0.01" tells a caller what to budget
+// for, where the old degraded phrasing ("a per-call price") told it nothing and
+// sent it to /check to find out. Per-tool exactness still lives on each card,
+// in catalog.json and in the 402 envelope.
+const PRICE_RANGE = !priceAmounts.length
+  ? 'a per-call price'
+  : priceAmounts.length === 1
+    ? `$${priceAmounts[0]}`
+    : `$${priceAmounts[0]}–$${priceAmounts[priceAmounts.length - 1]}`;
+const PRICE_PHRASE = priceAmounts.length ? `${PRICE_RANGE} in USDC via x402` : 'a per-call price in USDC via x402';
+
+// Moved down from the top of the file so it can read PRICE_RANGE. Both strings
+// state the price and neither types it.
+const STRAPLINE = FREE_TIER_ON
+  ? 'A collection of tools for agents — no install required. Privacy-first: no login, no credit card, ' +
+    'no account. Every tool is free to try.'
+  : `Tools for agents — no install, no login, no account, no card. Pay per call in USDC: ${PRICE_RANGE} a ` +
+    'call over x402, where the payment is the auth.';
+const META_DESCRIPTION = FREE_TIER_ON
+  ? `Conversion tools an agent can call over HTTP with nothing installed. No login, no credit card. ` +
+    `Every tool is free to try — ${FREE_TIER_DAILY} conversions a day — then priced per call in USDC with x402.`
+  : `Conversion tools an agent can call over HTTP with nothing installed. No login, no account, no ` +
+    `card — every call is priced per call in USDC with x402 (${PRICE_RANGE}), and the payment is the auth.`;
+
 const PRICING_LINE = FREE_TIER_ON
   ? `Every tool is free to try: ${FREE_TIER_DAILY} conversions a day, no login. ` +
     `Past that it's a paid call — ${PRICE_PHRASE}, with much higher limits.`
@@ -729,8 +803,8 @@ code {
   margin: 0 0 0.5rem;
   display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap;
 }
-/* Deliberately NOT uppercased, unlike .kind: the pill carries "x402" and
-   "$0.001/call", and shouting them as X402 misspells a protocol name. */
+/* Deliberately NOT uppercased, unlike .kind: the pill carries "x402" and the
+   tool's own price, and shouting it as X402 misspells a protocol name. */
 .pill {
   flex: 0 0 auto;
   font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em;
@@ -1296,19 +1370,21 @@ ${
       Coinbase CDP facilitator before the conversion is served — a verified call
       comes back with <code>x-payment-verified: true</code> and settles on Base
       immediately afterwards. If the facilitator cannot be reached, the call is
-      served anyway and says so with <code>x-payment-error</code>: at $0.001 the
-      price is a signal, and an outage on our side should not turn a paying
-      caller away.</p>`
+      served anyway and says so with <code>x-payment-error</code>: at ${PRICE_RANGE} a
+      call the price is a signal, and an outage on our side should not turn a
+      paying caller away.</p>`
     : `      <p><span class="status-label">Honest status</span>The free tier is
-      <strong>switched off</strong>: every conversion is a paid call, at $0.001.
+      <strong>switched off</strong>: every conversion is a paid call, priced per
+      tool — ${PRICE_RANGE}, with the exact figure on each card and in the
+      <code>402</code> envelope.
       Payment is <strong>live and verified</strong> — a payment presented
       against the <code>402</code> envelope above is checked with the Coinbase
       CDP facilitator before the conversion is served, a verified call comes
       back with <code>x-payment-verified: true</code>, and it settles on Base
       immediately afterwards. If the facilitator cannot be reached, the call is
-      served anyway and says so with <code>x-payment-error</code>: at $0.001 the
-      price is a signal, and an outage on our side should not turn a paying
-      caller away.</p>`
+      served anyway and says so with <code>x-payment-error</code>: at these
+      prices the price is a signal, and an outage on our side should not turn a
+      paying caller away.</p>`
 }
     </div>
   </section>
@@ -1568,8 +1644,10 @@ const X402_ENVELOPE_SCHEMA = {
     network: { type: 'string', enum: ['base'] },
     maxAmountRequired: {
       type: 'string',
-      description: 'Price in atomic units of `asset`. USDC has 6 decimals, so "1000" is $0.001.',
-      examples: ['1000'],
+      description:
+        'Price in atomic units of `asset`. USDC has 6 decimals, so "5000" is $0.005. Each tool ' +
+        'names its own amount; do not assume one price across the API.',
+      examples: ['5000'],
     },
     resource: { type: 'string', format: 'uri', description: 'The URL being paid for.' },
     description: { type: 'string' },

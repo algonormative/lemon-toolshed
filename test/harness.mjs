@@ -104,6 +104,22 @@ const SUITE_OCTET = {
   settlement: 20,
   'tier-off': 21,
   alerts: 22,
+  // The 2026-08-30 wave. One octet each, same rule: a suite that shares a worker
+  // with another must never share a convert_quota row with it.
+  'json-csv': 23,
+  'csv-yaml': 24,
+  'yaml-csv': 25,
+  'json-ndjson': 26,
+  'ndjson-json': 27,
+  'frontmatter-json': 28,
+  'markdown-json': 29,
+  'srt-vtt': 30,
+  'vtt-srt': 31,
+  'toml-json': 32,
+  'json-toml': 33,
+  'xml-json': 34,
+  'html-text': 35,
+  'html-json': 36,
 };
 
 /**

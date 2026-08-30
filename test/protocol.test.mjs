@@ -28,6 +28,56 @@ const ips = callers('protocol');
 
 const HOSTED_IDS = CATALOG.filter((e) => e.hosted).map((e) => e.id).sort();
 
+// A real body for every hosted tool, in ONE place — the two tests below both
+// need one, and a tool added to the catalog without an entry here fails loudly
+// on the completeness assertion rather than quietly converting the string 'x'.
+const INPUTS = {
+  'md-html': '# hi\n',
+  'json-yaml': '{"a":1}',
+  'yaml-json': 'a: 1\n',
+  'csv-json': 'a\n1\n',
+  'html-markdown': '<p>hi</p>',
+  'json-csv': '[{"a":1}]',
+  'csv-yaml': 'a\n1\n',
+  'yaml-csv': '- a: 1\n',
+  'json-ndjson': '[{"a":1}]',
+  'ndjson-json': '{"a":1}\n',
+  'frontmatter-json': '---\ntitle: hi\n---\nbody\n',
+  'markdown-json': '# hi\n',
+  'srt-vtt': '1\n00:00:01,000 --> 00:00:02,000\nhi\n',
+  'vtt-srt': 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n',
+  'toml-json': 'a = 1\n',
+  'json-toml': '{"a":1}',
+  'xml-json': '<r><a>1</a></r>',
+  'html-text': '<p>hi</p>',
+  'html-json': '<table><tr><th>a</th></tr><tr><td>1</td></tr></table>',
+};
+
+// The Content-Type each hosted tool answers a 200 with. Keyed on the same ids as
+// INPUTS, and the pair is what proves a tool is routed to its own converter
+// rather than to a neighbour that happens to accept the same body.
+const CONTENT_TYPES = {
+  'md-html': /^text\/html/,
+  'json-yaml': /^application\/yaml/,
+  'yaml-json': /^application\/json/,
+  'csv-json': /^application\/json/,
+  'html-markdown': /^text\/markdown/,
+  'json-csv': /^text\/csv/,
+  'csv-yaml': /^application\/yaml/,
+  'yaml-csv': /^text\/csv/,
+  'json-ndjson': /^application\/x-ndjson/,
+  'ndjson-json': /^application\/json/,
+  'frontmatter-json': /^application\/json/,
+  'markdown-json': /^application\/json/,
+  'srt-vtt': /^text\/vtt/,
+  'vtt-srt': /^application\/x-subrip/,
+  'toml-json': /^application\/json/,
+  'json-toml': /^application\/toml/,
+  'xml-json': /^application\/json/,
+  'html-text': /^text\/plain/,
+  'html-json': /^application\/json/,
+};
+
 before(async () => {
   worker = await useWorker({ vars: TIER_ON_VARS });
   api = client(worker);
@@ -46,7 +96,7 @@ describe('GET /check', () => {
   test('no parameters lists exactly the hosted tools', async () => {
     const { status, body } = await check();
     assert.equal(status, 200);
-    assert.equal(HOSTED_IDS.length, 5, 'the catalog no longer has 5 hosted tools — update this test');
+    assert.equal(HOSTED_IDS.length, 19, 'the hosted tool count changed — update this test and INPUTS below');
     assert.deepEqual(body.matches.map((m) => m.id).sort(), HOSTED_IDS);
     assert.deepEqual(body.query, { from: null, to: null });
   });
@@ -204,15 +254,13 @@ describe('POST /convert routing', () => {
   test('every hosted id in the catalog actually answers', async () => {
     // The 501 path exists for an entry listed live with no implementation. This
     // asserts nobody is standing on it.
-    const inputs = {
-      'md-html': '# hi\n',
-      'json-yaml': '{"a":1}',
-      'yaml-json': 'a: 1\n',
-      'csv-json': 'a\n1\n',
-      'html-markdown': '<p>hi</p>',
-    };
+    assert.deepEqual(
+      HOSTED_IDS.filter((id) => !(id in INPUTS)),
+      [],
+      'a hosted tool has no fixture body in INPUTS — add one rather than letting it convert "x"'
+    );
     for (const id of HOSTED_IDS) {
-      const res = await api.convert(id, inputs[id] ?? 'x', { ip: ips.next() });
+      const res = await api.convert(id, INPUTS[id], { ip: ips.next() });
       assert.notEqual(res.status, 501, `${id} is listed live with no implementation behind it`);
       assert.notEqual(res.status, 404, `${id} is in the catalog but not routed`);
       assert.equal(res.status, 200, `${id} answered ${res.status}: ${res.text}`);
@@ -220,23 +268,15 @@ describe('POST /convert routing', () => {
   });
 
   test('each tool answers with its own content-type', async () => {
-    const expected = {
-      'md-html': /^text\/html/,
-      'json-yaml': /^application\/yaml/,
-      'yaml-json': /^application\/json/,
-      'csv-json': /^application\/json/,
-      'html-markdown': /^text\/markdown/,
-    };
-    const inputs = {
-      'md-html': '# hi\n',
-      'json-yaml': '{"a":1}',
-      'yaml-json': 'a: 1\n',
-      'csv-json': 'a\n1\n',
-      'html-markdown': '<p>hi</p>',
-    };
-    for (const [id, pattern] of Object.entries(expected)) {
-      const res = await api.convert(id, inputs[id], { ip: ips.next() });
-      assert.match(res.contentType, pattern, `${id} answered ${res.contentType}`);
+    assert.deepEqual(
+      HOSTED_IDS.filter((id) => !(id in CONTENT_TYPES)),
+      [],
+      'a hosted tool has no expected content-type — add one to CONTENT_TYPES'
+    );
+    for (const id of HOSTED_IDS) {
+      const res = await api.convert(id, INPUTS[id], { ip: ips.next() });
+      assert.equal(res.status, 200, `${id} answered ${res.status}: ${res.text}`);
+      assert.match(res.contentType, CONTENT_TYPES[id], `${id} answered ${res.contentType}`);
     }
   });
 });

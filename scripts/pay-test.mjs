@@ -3,7 +3,7 @@
 //  ┌──────────────────────────────────────────────────────────────────────┐
 //  │  THIS SCRIPT SPENDS REAL MONEY.                                      │
 //  │                                                                      │
-//  │  It makes one paid call to the live Toolshed: $0.001 in USDC on      │
+//  │  It makes one paid call to the live Toolshed: $0.005-$0.01 USDC on  │
 //  │  Base, signed with the key in .buyer.env and settled on chain by     │
 //  │  the CDP facilitator. There is no free tier to burn through first —  │
 //  │  the paywall answers on the very first call — so the run spends      │
@@ -12,7 +12,7 @@
 //  │  It then signs ONE more call with malformed input, to prove the      │
 //  │  "you are only charged for served conversions" claim. A correct      │
 //  │  Worker answers 400 and settles nothing, so that probe costs $0.000. │
-//  │  If it costs $0.001, it has just found the bug it went looking for.  │
+//  │  If it costs a real per-tool price, it found what it came for.       │
 //  │  Skip it with --skip-400-check. Worst case for a whole run: $0.002.  │
 //  │                                                                      │
 //  │  FOR THE OWNER TO RUN, DELIBERATELY, ONCE. Not part of `npm test`,   │
@@ -157,7 +157,7 @@ console.log(`
   ───────────────────────────────────────────────────────────
   endpoint     ${ENDPOINT}
   buyer        ${account.address}
-  price        $0.001 USDC on Base (1000 atomic units)
+  price        per tool, $0.005-$0.01 USDC on Base (read from the 402)
   paid calls   1 served conversion — there is no free tier, so the first call is the paid one
   400 probe    ${plannedProbe}
   mode         ${DRY_RUN ? 'DRY RUN — nothing will be spent' : 'LIVE — this spends real USDC'}
@@ -401,7 +401,7 @@ if (res.status === 200 && verified === 'true') {
      Confirm the money actually moved — and, if the probe ran, that it did
      NOT move a second time:
        - the CDP x402 chart in the Coinbase Developer Platform dashboard
-       - the receiving wallet (PAYTO) — the $0.001 should land within seconds,
+       - the receiving wallet (PAYTO) — the tool's price should land within seconds,
          and there should be exactly ONE of them
        - the Worker's ledger:
            npx wrangler d1 execute DB --remote \\

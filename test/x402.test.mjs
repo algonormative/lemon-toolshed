@@ -58,14 +58,36 @@ const ips = callers('x402');
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 
 // Per-tool facts the envelope has to carry — its own resource, its own
-// description, its own mimeType. One shared envelope for every tool would be
-// the regression this catches.
+// description, its own mimeType, its OWN PRICE. One shared envelope for every
+// tool would be the regression this catches, and since 2026-08-30 the price is
+// part of that: the tools are no longer uniformly priced, so an envelope built
+// from a constant instead of from the entry would pass every other assertion
+// here and quote the wrong figure.
+//
+// `amount` is the atomic USDC (6 decimals) for that tool's amount_usd in
+// entries.yaml: $0.005 is "5000", $0.01 is "10000". The descriptions are
+// asserted verbatim rather than derived — the string is published in the
+// envelope and in the Bazaar listing, so a silent edit to one is worth failing on.
 const TOOLS = {
-  'md-html': { input: '# hi\n', description: 'Markdown to HTML conversion', mimeType: 'text/html', from: 'Markdown', to: 'HTML' },
-  'csv-json': { input: 'a\n1\n', description: 'CSV to JSON conversion', mimeType: 'application/json', from: 'CSV', to: 'JSON' },
-  'json-yaml': { input: '{"a":1}', description: 'JSON to YAML conversion', mimeType: 'application/yaml', from: 'JSON', to: 'YAML' },
-  'yaml-json': { input: 'a: 1\n', description: 'YAML to JSON conversion', mimeType: 'application/json', from: 'YAML', to: 'JSON' },
-  'html-markdown': { input: '<p>hi</p>', description: 'HTML to Markdown conversion', mimeType: 'text/markdown', from: 'HTML', to: 'Markdown' },
+  'md-html': { input: '# hi\n', amount: '5000', description: 'Markdown to HTML conversion', mimeType: 'text/html', from: 'Markdown', to: 'HTML' },
+  'csv-json': { input: 'a\n1\n', amount: '5000', description: 'CSV to JSON conversion', mimeType: 'application/json', from: 'CSV', to: 'JSON' },
+  'json-yaml': { input: '{"a":1}', amount: '5000', description: 'JSON to YAML conversion', mimeType: 'application/yaml', from: 'JSON', to: 'YAML' },
+  'yaml-json': { input: 'a: 1\n', amount: '5000', description: 'YAML to JSON conversion', mimeType: 'application/json', from: 'YAML', to: 'JSON' },
+  'html-markdown': { input: '<p>hi</p>', amount: '10000', description: 'HTML to Markdown conversion', mimeType: 'text/markdown', from: 'HTML', to: 'Markdown' },
+  'json-csv': { input: '[{"a":1}]', amount: '5000', mimeType: 'text/csv', from: 'JSON', to: 'CSV' },
+  'csv-yaml': { input: 'a\n1\n', amount: '5000', mimeType: 'application/yaml', from: 'CSV', to: 'YAML' },
+  'yaml-csv': { input: '- a: 1\n', amount: '5000', mimeType: 'text/csv', from: 'YAML', to: 'CSV' },
+  'json-ndjson': { input: '[{"a":1}]', amount: '5000', mimeType: 'application/x-ndjson', from: 'JSON', to: 'NDJSON' },
+  'ndjson-json': { input: '{"a":1}\n', amount: '5000', mimeType: 'application/json', from: 'NDJSON', to: 'JSON' },
+  'frontmatter-json': { input: '---\ntitle: hi\n---\nbody\n', amount: '5000', mimeType: 'application/json', from: 'Markdown with YAML frontmatter', to: 'JSON' },
+  'markdown-json': { input: '# hi\n', amount: '5000', mimeType: 'application/json', from: 'Markdown', to: 'JSON' },
+  'srt-vtt': { input: '1\n00:00:01,000 --> 00:00:02,000\nhi\n', amount: '5000', mimeType: 'text/vtt', from: 'SubRip', to: 'WebVTT' },
+  'vtt-srt': { input: 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n', amount: '5000', mimeType: 'application/x-subrip', from: 'WebVTT', to: 'SubRip' },
+  'toml-json': { input: 'a = 1\n', amount: '5000', mimeType: 'application/json', from: 'TOML', to: 'JSON' },
+  'json-toml': { input: '{"a":1}', amount: '5000', mimeType: 'application/toml', from: 'JSON', to: 'TOML' },
+  'xml-json': { input: '<r><a>1</a></r>', amount: '10000', mimeType: 'application/json', from: 'XML', to: 'JSON' },
+  'html-text': { input: '<p>hi</p>', amount: '10000', mimeType: 'text/plain', from: 'HTML', to: 'plain text' },
+  'html-json': { input: '<table><tr><th>a</th></tr><tr><td>1</td></tr></table>', amount: '10000', mimeType: 'application/json', from: 'HTML', to: 'JSON' },
 };
 
 /** The outputSchema the envelope must carry for one tool. See §Bazaar in README. */
@@ -111,7 +133,8 @@ function paymentHeader() {
         authorization: {
           from: '0x000000000000000000000000000000000000dEaD',
           to: PAYTO_TEST,
-          value: '1000',
+          // The md-html price, which is the tool every test in this file pays for.
+          value: TOOLS['md-html'].amount,
           validAfter: String(now - 600),
           validBefore: String(now + 60),
           nonce: `0x${'cd'.repeat(32)}`,
@@ -161,7 +184,7 @@ describe('the 402 envelope', () => {
     assert.deepEqual(body.accepts[0], {
       scheme: 'exact',
       network: 'base',
-      maxAmountRequired: '1000', // $0.001 in USDC atomic units, 6 decimals
+      maxAmountRequired: TOOLS['md-html'].amount, // $0.005 in USDC atomic units, 6 decimals
       resource: `${SITE_BASE}/convert/md-html`,
       description: TOOLS['md-html'].description,
       mimeType: TOOLS['md-html'].mimeType,
@@ -223,10 +246,12 @@ describe('the 402 envelope', () => {
       assert.equal(res.status, 402, `${id} answered ${res.status}: ${res.text}`);
       const offer = res.json().accepts[0];
       assert.equal(offer.resource, `${SITE_BASE}/convert/${id}`, `${id} names the wrong resource`);
-      assert.equal(offer.description, tool.description, `${id} carries the wrong description`);
+      if (tool.description) {
+        assert.equal(offer.description, tool.description, `${id} carries the wrong description`);
+      }
       assert.equal(offer.mimeType, tool.mimeType, `${id} carries the wrong mimeType`);
       assert.equal(offer.payTo, PAYTO_TEST);
-      assert.equal(offer.maxAmountRequired, '1000');
+      assert.equal(offer.maxAmountRequired, tool.amount, `${id} quotes the wrong price`);
       assert.equal(offer.asset, USDC_BASE);
       // The resource must be the PRODUCTION URL, not the local dev origin: it
       // is what an x402 client signs over.
@@ -384,7 +409,7 @@ describe('the v2 envelope in the PAYMENT-REQUIRED header', () => {
     assert.deepEqual(env.accepts[0], {
       scheme: 'exact',
       network: 'eip155:8453', // CAIP-2. "base" is a v1 spelling and invalid here.
-      amount: '1000', // renamed from maxAmountRequired
+      amount: TOOLS['md-html'].amount, // renamed from maxAmountRequired
       asset: USDC_BASE,
       payTo: PAYTO_TEST,
       maxTimeoutSeconds: 60,
@@ -453,13 +478,32 @@ describe('the v2 envelope in the PAYMENT-REQUIRED header', () => {
       assert.deepEqual(Object.keys(bazaar.info.output).sort(), ['example', 'format', 'type']);
       assert.equal(bazaar.info.output.type, 'text');
       assert.equal(bazaar.info.output.format, tool.mimeType);
+      // A per-tool marker chosen so it can ONLY appear in converted output, not
+      // in that tool's sample input — which is what makes this an assertion that
+      // the example was run rather than echoed.
       const EXAMPLE_MARK = {
         'md-html': '<h1>',
         'json-yaml': 'name: toolshed',
         'yaml-json': '"name"',
         'csv-json': '"toolshed"',
         'html-markdown': '# Title',
+        'json-csv': 'name,qty\nlemon,3',
+        'csv-yaml': '- name: lemon',
+        'yaml-csv': 'name,qty\nlemon,3',
+        'json-ndjson': '{"a":1}\n{"a":2}',
+        'ndjson-json': '"a": 1',
+        'frontmatter-json': '"content"',
+        'markdown-json': '"toc"',
+        'srt-vtt': 'WEBVTT',
+        // The comma is the whole conversion: the sample went in with a dot.
+        'vtt-srt': '00:00:01,000',
+        'toml-json': '"title": "toolshed"',
+        'json-toml': '[owner]',
+        'xml-json': '"@_id"',
+        'html-text': 'Title\n\nSome text.',
+        'html-json': '"columns"',
       };
+      assert.ok(EXAMPLE_MARK[id], `${id} has no EXAMPLE_MARK — add one rather than passing vacuously`);
       assert.equal(typeof bazaar.info.output.example, 'string');
       assert.ok(
         bazaar.info.output.example.includes(EXAMPLE_MARK[id]),

@@ -108,7 +108,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/html-markdown",
       "price": {
-        "amount_usd": 0.001,
+        "amount_usd": 0.01,
         "scheme": "exact"
       },
       "status": "live",
@@ -140,7 +140,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/md-html",
       "price": {
-        "amount_usd": 0.001,
+        "amount_usd": 0.005,
         "scheme": "exact"
       },
       "status": "live",
@@ -360,7 +360,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/json-yaml",
       "price": {
-        "amount_usd": 0.001,
+        "amount_usd": 0.005,
         "scheme": "exact"
       },
       "status": "live",
@@ -391,7 +391,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/yaml-json",
       "price": {
-        "amount_usd": 0.001,
+        "amount_usd": 0.005,
         "scheme": "exact"
       },
       "status": "live",
@@ -420,7 +420,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/csv-json",
       "price": {
-        "amount_usd": 0.001,
+        "amount_usd": 0.005,
         "scheme": "exact"
       },
       "status": "live",
@@ -805,5 +805,428 @@ export const CATALOG = [
       "install": "built-in (GNU/BSD iconv); brew install uchardet for detection"
     },
     "url": "https://www.gnu.org/software/libiconv/"
+  },
+  {
+    "id": "json-csv",
+    "x": "JSON array of records",
+    "y": "CSV with a header row",
+    "xa": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "ya": [
+      "csv",
+      "text/csv",
+      "application/csv"
+    ],
+    "hosted": {
+      "path": "/convert/json-csv",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "csvkit",
+      "install": "pip install csvkit"
+    },
+    "url": "https://csvkit.readthedocs.io"
+  },
+  {
+    "id": "csv-yaml",
+    "x": "CSV",
+    "y": "YAML",
+    "xa": [
+      "csv",
+      "text/csv",
+      "application/csv"
+    ],
+    "ya": [
+      "yaml",
+      "yml",
+      "application/yaml",
+      "text/yaml",
+      "application/x-yaml"
+    ],
+    "hosted": {
+      "path": "/convert/csv-yaml",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "yq",
+      "install": "brew install yq"
+    },
+    "url": "https://github.com/mikefarah/yq"
+  },
+  {
+    "id": "yaml-csv",
+    "x": "YAML list of records",
+    "y": "CSV with a header row",
+    "xa": [
+      "yaml",
+      "yml",
+      "application/yaml",
+      "text/yaml",
+      "application/x-yaml"
+    ],
+    "ya": [
+      "csv",
+      "text/csv",
+      "application/csv"
+    ],
+    "hosted": {
+      "path": "/convert/yaml-csv",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "yq",
+      "install": "brew install yq"
+    },
+    "url": "https://github.com/mikefarah/yq"
+  },
+  {
+    "id": "json-ndjson",
+    "x": "JSON array",
+    "y": "NDJSON (newline-delimited JSON)",
+    "xa": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "ya": [
+      "ndjson",
+      "jsonl",
+      "ldjson",
+      "application/x-ndjson",
+      "application/jsonl"
+    ],
+    "hosted": {
+      "path": "/convert/json-ndjson",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "jq",
+      "install": "brew install jq"
+    },
+    "url": "https://jqlang.github.io/jq/"
+  },
+  {
+    "id": "ndjson-json",
+    "x": "NDJSON (newline-delimited JSON)",
+    "y": "JSON array",
+    "xa": [
+      "ndjson",
+      "jsonl",
+      "ldjson",
+      "application/x-ndjson",
+      "application/jsonl"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "hosted": {
+      "path": "/convert/ndjson-json",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "jq",
+      "install": "brew install jq"
+    },
+    "url": "https://jqlang.github.io/jq/"
+  },
+  {
+    "id": "frontmatter-json",
+    "x": "Markdown with a frontmatter fence",
+    "y": "JSON with the metadata and the body split apart",
+    "xa": [
+      "frontmatter",
+      "md",
+      "markdown",
+      "yaml frontmatter",
+      "text/markdown"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "hosted": {
+      "path": "/convert/frontmatter-json",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "python-frontmatter",
+      "install": "pip install python-frontmatter"
+    },
+    "url": "https://python-frontmatter.readthedocs.io"
+  },
+  {
+    "id": "markdown-json",
+    "x": "Markdown",
+    "y": "JSON token tree plus a table of contents",
+    "xa": [
+      "markdown",
+      "md",
+      "mdown",
+      "text/markdown",
+      "text/x-markdown"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "hosted": {
+      "path": "/convert/markdown-json",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "pandoc",
+      "install": "brew install pandoc"
+    },
+    "url": "https://pandoc.org"
+  },
+  {
+    "id": "srt-vtt",
+    "x": "SubRip subtitle file (.srt)",
+    "y": "WebVTT (.vtt)",
+    "xa": [
+      "srt",
+      "subrip",
+      "application/x-subrip",
+      "text/srt"
+    ],
+    "ya": [
+      "vtt",
+      "webvtt",
+      "text/vtt"
+    ],
+    "hosted": {
+      "path": "/convert/srt-vtt",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "ffmpeg",
+      "install": "brew install ffmpeg"
+    },
+    "url": "https://ffmpeg.org"
+  },
+  {
+    "id": "vtt-srt",
+    "x": "WebVTT (.vtt)",
+    "y": "SubRip subtitle file (.srt)",
+    "xa": [
+      "vtt",
+      "webvtt",
+      "text/vtt"
+    ],
+    "ya": [
+      "srt",
+      "subrip",
+      "application/x-subrip",
+      "text/srt"
+    ],
+    "hosted": {
+      "path": "/convert/vtt-srt",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "ffmpeg",
+      "install": "brew install ffmpeg"
+    },
+    "url": "https://ffmpeg.org"
+  },
+  {
+    "id": "toml-json",
+    "x": "TOML config file",
+    "y": "JSON",
+    "xa": [
+      "toml",
+      "application/toml",
+      "text/toml"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "hosted": {
+      "path": "/convert/toml-json",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "dasel",
+      "install": "brew install dasel"
+    },
+    "url": "https://daseldocs.tomwright.me"
+  },
+  {
+    "id": "json-toml",
+    "x": "JSON object",
+    "y": "TOML",
+    "xa": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "ya": [
+      "toml",
+      "application/toml",
+      "text/toml"
+    ],
+    "hosted": {
+      "path": "/convert/json-toml",
+      "price": {
+        "amount_usd": 0.005,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "dasel",
+      "install": "brew install dasel"
+    },
+    "url": "https://daseldocs.tomwright.me"
+  },
+  {
+    "id": "xml-json",
+    "x": "XML document (feed, export, SOAP payload)",
+    "y": "JSON",
+    "xa": [
+      "xml",
+      "application/xml",
+      "text/xml"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "hosted": {
+      "path": "/convert/xml-json",
+      "price": {
+        "amount_usd": 0.01,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "yq",
+      "install": "brew install yq"
+    },
+    "url": "https://github.com/mikefarah/yq"
+  },
+  {
+    "id": "html-text",
+    "x": "Saved HTML page / static HTML file",
+    "y": "Plain text, readable",
+    "xa": [
+      "html",
+      "htm",
+      "text/html",
+      "application/xhtml+xml"
+    ],
+    "ya": [
+      "plain text",
+      "txt",
+      "text",
+      "text/plain"
+    ],
+    "hosted": {
+      "path": "/convert/html-text",
+      "price": {
+        "amount_usd": 0.01,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "lynx",
+      "install": "brew install lynx"
+    },
+    "url": "https://lynx.invisible-island.net"
+  },
+  {
+    "id": "html-json",
+    "x": "HTML page containing data tables",
+    "y": "JSON rows keyed by the header row",
+    "xa": [
+      "html",
+      "htm",
+      "text/html",
+      "application/xhtml+xml"
+    ],
+    "ya": [
+      "json",
+      "application/json",
+      "text/json"
+    ],
+    "hosted": {
+      "path": "/convert/html-json",
+      "price": {
+        "amount_usd": 0.01,
+        "scheme": "exact"
+      },
+      "status": "live",
+      "free_tier_daily": 0
+    },
+    "local": {
+      "tool": "pandas",
+      "install": "pip install pandas lxml"
+    },
+    "url": "https://pandas.pydata.org/docs/reference/api/pandas.read_html.html"
   }
 ];

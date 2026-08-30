@@ -53,6 +53,13 @@ import { marked } from 'marked';
 import yaml from 'js-yaml';
 import TurndownService from 'turndown';
 import domino from '@mixmark-io/domino';
+// Both added 2026-08-30 with the second hosted wave, and both were checked for
+// the one property that matters in workerd: no `node:` builtins anywhere in the
+// graph the package's ESM entry actually reaches. wrangler.toml sets NO
+// nodejs_compat flag, and it must not need to — a dependency that wants one is a
+// dependency this Worker does not take.
+import { parse as tomlParse, stringify as tomlStringify } from 'smol-toml';
+import { XMLParser, XMLValidator } from 'fast-xml-parser';
 // Cloudflare's built-in email module, backing the `send_email` binding. It is a
 // workerd built-in rather than an npm package, so it adds nothing to the bundle
 // and it is present whether or not the binding is configured — the ALERT_EMAIL
@@ -102,7 +109,8 @@ const SECONDS_PER_DAY = 86_400;
 const MAX_CONVERT_BODY = 256 * 1024; // 256 KB
 const MAX_QUERY_LEN = 64;
 
-// USDC on Base, 6 decimals. $0.001 is therefore "1000" atomic units.
+// USDC on Base, 6 decimals. $0.005 is therefore "5000" atomic units. Prices are
+// per tool since 2026-08-30; the figure comes from the entry, never from here.
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const USDC_DECIMALS = 6;
 const X402_TIMEOUT_SECONDS = 60;
@@ -589,7 +597,7 @@ async function handleConvert(request, env, path, ctx) {
   // conversion, not for a chain confirmation, so the ~2 s settlement runs in
   // ctx.waitUntil and its outcome lands in `settlements` rather than in this
   // response. A settlement that fails here is the accepted exposure: one
-  // conversion served for $0.001 that never arrived, recorded as settle_ok = 0.
+  // conversion served for the tool's price that never arrived, recorded as settle_ok = 0.
   //
   // The owner's ALERT rides in the same deferred slot, for the same reason and
   // one more: a notification must never be able to slow, fail or change a
@@ -656,7 +664,7 @@ const tooLarge = () =>
 //                         invalidReason, so the caller can see what to fix
 //   facilitator down    → the conversion, `x-payment-verified: false` and
 //                         `x-payment-error`. Availability-first, on purpose:
-//                         at $0.001 a call the price is a signal, and turning
+//                         at these prices the price is a signal, and turning
 //                         paying callers away because OUR dependency is down is
 //                         the worse failure. Every one of these is recorded.
 //
@@ -1400,7 +1408,7 @@ const DEFAULT_TELEGRAM_API_BASE = 'https://api.telegram.org';
 const ALERT_TIMEOUT_MS = 10_000;
 
 /**
- * Atomic USDC (6 decimals) rendered as money: "1000" → "$0.001".
+ * Atomic USDC (6 decimals) rendered as money: "5000" → "$0.005".
  *
  * Anything that is not a run of digits is passed through labelled rather than
  * coerced — a NaN in a revenue alert is worse than an ugly one.
@@ -1418,7 +1426,7 @@ function formatUsdc(atomic) {
  * Is this payer one of the house's own wallets?
  *
  * HOUSE_PAYERS is a non-secret var of public chain addresses (wrangler.toml),
- * and it exists so the owner's own $0.001 probes read as a drill. The
+ * and it exists so the owner's own test buys read as a drill. The
  * distinction is the entire point of the channel: if a test buy and a stranger's
  * purchase produced the same message, the loud one would stop meaning anything.
  * Unset means every payer is a third party, which fails towards TOO LOUD — the
@@ -1478,7 +1486,7 @@ function alertMessage(env, alert) {
     lines.push('');
     lines.push('This conversion was SERVED and the payment was never checked, so');
     lines.push('nobody paid for it. Serving anyway is deliberate (availability-first');
-    lines.push('at $0.001 a call), but a run of these is the paid rail quietly down.');
+    lines.push('at these prices), but a run of these is the paid rail quietly down.');
   } else {
     lines.push('checked  yes — the facilitator returned isValid');
     lines.push(
@@ -1802,9 +1810,259 @@ const CONVERTERS = {
       // Turndown's browser build reaches for a global `document` that workerd
       // does not have, so the HTML is parsed with domino here and the resulting
       // element handed to Turndown, which skips its own parser entirely.
+      guardHtmlComplexity(input);
       const doc = domino.createDocument(input, true);
       return turndown.turndown(doc.body);
     },
+  },
+
+  // ---------------------------------------------------------------- 2026-08-30
+  // The second wave. Same rule as the first: one parser in, one serializer out,
+  // and a ConvertError wherever the two formats genuinely disagree about what
+  // can be expressed — because a 400 naming the disagreement is worth more than
+  // a 200 carrying a guess, and a 400 is never charged.
+
+  'json-csv': {
+    description:
+      'JSON to CSV. POST an array of objects; the response is a CSV file whose header row is the ' +
+      "union of every record's keys in first-seen order, so a record missing a key gets an empty " +
+      'cell instead of a shifted row. One level of nesting flattens to dotted columns (user.id); ' +
+      'deeper values and arrays are written as compact JSON in the cell. RFC 4180 quoting.',
+    mimeType: 'text/csv',
+    inputFormat: 'JSON',
+    outputFormat: 'CSV',
+    contentType: 'text/csv; charset=utf-8',
+    sample: '[{"name":"lemon","qty":3},{"name":"lime","qty":4}]',
+    run: (input) => recordsToCsv(parseJsonInput(input), 'the input'),
+  },
+
+  'csv-yaml': {
+    description:
+      'CSV to YAML. POST a CSV file with a header row; the response is block-style YAML — a list ' +
+      'of maps, one per data row. Parsed to RFC 4180, so quoted commas and embedded newlines ' +
+      'survive. Every value stays a string: no type guessing, which is what keeps leading zeros ' +
+      'and long ids intact.',
+    mimeType: 'application/yaml',
+    inputFormat: 'CSV',
+    outputFormat: 'YAML',
+    contentType: 'application/yaml; charset=utf-8',
+    sample: 'name,qty\nlemon,3\n',
+    run: (input) => yaml.dump(csvToRecords(input)),
+  },
+
+  'yaml-csv': {
+    description:
+      'YAML to CSV. POST a YAML list of maps; the response is a CSV file with a header row. The ' +
+      'first document of a stream is used and anchors are resolved. One level of nesting flattens ' +
+      'to dotted columns; any other top-level shape is refused rather than flattened into a ' +
+      'plausible-looking sheet.',
+    mimeType: 'text/csv',
+    inputFormat: 'YAML',
+    outputFormat: 'CSV',
+    contentType: 'text/csv; charset=utf-8',
+    sample: '- name: lemon\n  qty: 3\n',
+    run: (input) => recordsToCsv(parseYamlFirstDoc(input), 'the first YAML document'),
+  },
+
+  'json-ndjson': {
+    description:
+      'JSON array to NDJSON. POST a JSON array; the response is one compact JSON value per line — ' +
+      'the shape streaming loaders, log shippers and jq pipelines take. A non-array input is ' +
+      'refused rather than emitted as a stream of one, because that is the mistake this endpoint ' +
+      'exists to catch.',
+    mimeType: 'application/x-ndjson',
+    inputFormat: 'JSON',
+    outputFormat: 'NDJSON',
+    contentType: 'application/x-ndjson; charset=utf-8',
+    sample: '[{"a":1},{"a":2}]',
+    run: (input) => {
+      const parsed = parseJsonInput(input);
+      if (!Array.isArray(parsed)) {
+        throw new ConvertError(`input must be a JSON array; got ${describeShape(parsed)}`);
+      }
+      return parsed.length ? `${parsed.map((value) => JSON.stringify(value)).join('\n')}\n` : '';
+    },
+  },
+
+  'ndjson-json': {
+    description:
+      'NDJSON to a JSON array. POST newline-delimited JSON; the response is a pretty-printed array ' +
+      'of the parsed values. Blank lines are skipped and a line that does not parse is refused ' +
+      'naming the 1-based line number — which is the reason to run a parser over a log file ' +
+      'instead of wrapping it in brackets.',
+    mimeType: 'application/json',
+    inputFormat: 'NDJSON',
+    outputFormat: 'JSON',
+    contentType: 'application/json; charset=utf-8',
+    sample: '{"a":1}\n{"a":2}\n',
+    run: (input) => {
+      const lines = normaliseNewlines(input).split('\n');
+      const values = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].trim()) continue;
+        try {
+          values.push(JSON.parse(lines[i]));
+        } catch (err) {
+          throw new ConvertError(`line ${i + 1} is not valid JSON: ${oneLineMessage(err)}`);
+        }
+      }
+      return `${JSON.stringify(values, null, 2)}\n`;
+    },
+  },
+
+  'frontmatter-json': {
+    description:
+      'Markdown frontmatter to JSON. POST a Markdown file that begins with a --- fence; the ' +
+      'response is {"data": the parsed YAML frontmatter, "content": the body returned byte for ' +
+      'byte}. A file with no opening fence is refused rather than reported as having no metadata, ' +
+      'because a mistyped fence should not look like an empty one.',
+    mimeType: 'application/json',
+    inputFormat: 'Markdown with YAML frontmatter',
+    outputFormat: 'JSON',
+    contentType: 'application/json; charset=utf-8',
+    sample: '---\ntitle: Toolshed\n---\n\nBody text.\n',
+    run: (input) => `${JSON.stringify(splitFrontmatter(input), null, 2)}\n`,
+  },
+
+  'markdown-json': {
+    description:
+      'Markdown to a JSON token tree. POST Markdown; the response is {"toc": [{depth, text}], ' +
+      '"tokens": [...]} — the marked lexer\'s token stream plus a table of contents derived from ' +
+      'the real headings. The document\'s structure without rendering it to HTML and parsing that ' +
+      'back. A bold line pretending to be a heading was never structure and is not in the toc.',
+    mimeType: 'application/json',
+    inputFormat: 'Markdown',
+    outputFormat: 'JSON',
+    contentType: 'application/json; charset=utf-8',
+    sample: '# Title\n\nSome text.\n',
+    run: (input) => markdownToJson(input),
+  },
+
+  'srt-vtt': {
+    description:
+      'SubRip to WebVTT. POST an .srt file; the response is a .vtt file — a WEBVTT header and ' +
+      'timestamps written with a decimal point instead of a comma. Cue numbers are kept as WebVTT ' +
+      'cue identifiers and caption text is passed through untouched, so a comma inside a line of ' +
+      'dialogue is not mistaken for a timestamp separator.',
+    mimeType: 'text/vtt',
+    inputFormat: 'SubRip',
+    outputFormat: 'WebVTT',
+    contentType: 'text/vtt; charset=utf-8',
+    sample: '1\n00:00:01,000 --> 00:00:02,000\nHello.\n',
+    run: (input) => srtToVtt(input),
+  },
+
+  'vtt-srt': {
+    description:
+      'WebVTT to SubRip. POST a .vtt file; the response is an .srt file. Cues are renumbered from ' +
+      '1 and hour-less timestamps are expanded to hh:mm:ss,mmm. The WEBVTT header, NOTE/STYLE/' +
+      'REGION blocks and per-cue settings are dropped, because SubRip cannot express them. Input ' +
+      'that does not begin with WEBVTT is refused.',
+    mimeType: 'application/x-subrip',
+    inputFormat: 'WebVTT',
+    outputFormat: 'SubRip',
+    contentType: 'application/x-subrip; charset=utf-8',
+    sample: 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello.\n',
+    run: (input) => vttToSrt(input),
+  },
+
+  'toml-json': {
+    description:
+      'TOML to JSON. POST a TOML document; the response is pretty-printed JSON. A conforming ' +
+      'parser handles the parts hand-rolled readers get wrong — dotted keys, arrays of tables, ' +
+      'offset date-times. Dates become ISO-8601 strings and comments are dropped, because JSON has ' +
+      'neither; this is a read path, not a round trip.',
+    mimeType: 'application/json',
+    inputFormat: 'TOML',
+    outputFormat: 'JSON',
+    contentType: 'application/json; charset=utf-8',
+    sample: 'title = "toolshed"\n\n[owner]\nname = "lemon"\n',
+    run: (input) => {
+      let parsed;
+      try {
+        parsed = tomlParse(input);
+      } catch (err) {
+        throw new ConvertError(`input is not valid TOML: ${oneLineMessage(err)}`);
+      }
+      return `${JSON.stringify(parsed, null, 2)}\n`;
+    },
+  },
+
+  'json-toml': {
+    description:
+      "JSON to TOML. POST a JSON object; the response is a TOML document. The root must be an " +
+      "object, because TOML's root is a table, and a null anywhere in the document is refused — " +
+      'TOML has no spelling for one. Both are errors rather than a file that quietly parses to ' +
+      'something you did not write.',
+    mimeType: 'application/toml',
+    inputFormat: 'JSON',
+    outputFormat: 'TOML',
+    contentType: 'application/toml; charset=utf-8',
+    sample: '{"title":"toolshed","owner":{"name":"lemon"}}',
+    run: (input) => {
+      const parsed = parseJsonInput(input);
+      if (!isPlainObject(parsed)) {
+        throw new ConvertError(
+          `TOML's root is a table, so the input must be a JSON object; got ${describeShape(parsed)}`
+        );
+      }
+      // CHECKED BEFORE STRINGIFY, because smol-toml does not refuse a null — it
+      // DROPS the key, and a 200 that silently lost a field is the worst answer
+      // available. TOML genuinely has no spelling for null, so the honest reply
+      // is a 400 naming the path.
+      const nulled = findNullPath(parsed);
+      if (nulled) {
+        throw new ConvertError(`TOML has no null, and \`${nulled}\` is null — remove it or give it a value`);
+      }
+      try {
+        return `${tomlStringify(parsed)}\n`;
+      } catch (err) {
+        throw new ConvertError(`input cannot be written as TOML: ${oneLineMessage(err)}`);
+      }
+    },
+  },
+
+  'xml-json': {
+    description:
+      'XML to JSON. POST an XML document; the response is JSON in fast-xml-parser\'s convention — ' +
+      'attributes prefixed @_, text content under #text, and repeated sibling elements collapsed ' +
+      'into an array (so an element appearing once is an object and twice is an array). Values stay ' +
+      'strings; no type guessing. A document carrying a <!DOCTYPE> is refused, because internal ' +
+      'entities are an expansion attack.',
+    mimeType: 'application/json',
+    inputFormat: 'XML',
+    outputFormat: 'JSON',
+    contentType: 'application/json; charset=utf-8',
+    sample: '<shed><tool id="1">lemon</tool></shed>',
+    run: (input) => xmlToJson(input),
+  },
+
+  'html-text': {
+    description:
+      'HTML to readable plain text. POST an HTML file; the response is its prose. The page is ' +
+      'parsed with a real DOM, so script, style, noscript, nav, header, footer and aside are ' +
+      'dropped WITH their contents, block elements become paragraph breaks, and <pre> is preserved ' +
+      'verbatim. Links become their text, not their URL.',
+    mimeType: 'text/plain',
+    inputFormat: 'HTML',
+    outputFormat: 'plain text',
+    contentType: 'text/plain; charset=utf-8',
+    sample: '<h1>Title</h1>\n<p>Some text.</p>\n',
+    run: (input) => htmlToText(input),
+  },
+
+  'html-json': {
+    description:
+      'HTML tables to JSON. POST an HTML page; the response is {"tables": [{caption, columns, ' +
+      'rows}]} — every <table> read into row objects keyed by its header cells, in the same shape ' +
+      'whether the page has one table or nine. Values stay strings with whitespace collapsed. ' +
+      'colspan and rowspan are NOT expanded, and a page with no table is refused.',
+    mimeType: 'application/json',
+    inputFormat: 'HTML',
+    outputFormat: 'JSON',
+    contentType: 'application/json; charset=utf-8',
+    sample: '<table><tr><th>name</th><th>qty</th></tr><tr><td>lemon</td><td>3</td></tr></table>',
+    run: (input) => htmlTablesToJson(input),
   },
 };
 
@@ -1903,6 +2161,524 @@ function csvToRecords(input) {
     records.push(record);
   }
   return records;
+}
+
+// ------------------------------------------------------------------ shared parses
+//
+// Everything below throws ConvertError and nothing else. handleConvert turns
+// that into a one-line JSON 400, and a 400 settles nothing — so the honest
+// refusal is also the free one, for the caller and for us.
+
+function parseJsonInput(input) {
+  try {
+    return JSON.parse(input);
+  } catch (err) {
+    throw new ConvertError(`input is not valid JSON: ${oneLineMessage(err)}`);
+  }
+}
+
+// The same first-document-of-a-stream rule yaml-json states, in one place so the
+// two endpoints cannot drift apart on it.
+function parseYamlFirstDoc(input) {
+  let docs;
+  try {
+    docs = yaml.loadAll(input);
+  } catch (err) {
+    throw new ConvertError(`input is not valid YAML: ${oneLineMessage(err)}`);
+  }
+  if (!docs.length || docs[0] === undefined) throw new ConvertError('input has no YAML document');
+  return docs[0];
+}
+
+const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+// Used in refusals, so it has to read as a sentence: "got an array", "got a
+// string". Naming the shape we actually received is what turns a 400 into
+// something a caller can act on without guessing.
+const describeShape = (value) => {
+  if (value === null) return 'null';
+  if (value === undefined) return 'nothing';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'object') return 'an object';
+  return `a ${typeof value}`;
+};
+
+// A leading BOM is stripped and CRLF/CR collapse to LF, which every line-oriented
+// converter below assumes. Doing it once means none of them has to remember.
+const normaliseNewlines = (input) => input.replace(/^﻿/, '').replace(/\r\n?/g, '\n');
+
+// ------------------------------------------------------------------ CSV out
+//
+// RFC 4180 in the writing direction: a field is quoted only when it holds a
+// comma, a double quote or a line break, and an interior quote is doubled.
+// Everything else is written bare, which keeps the output diff-friendly.
+
+function csvField(value) {
+  const s = String(value);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// CSV cells are scalars. Null and undefined become the empty cell; anything
+// structural is written back as compact JSON rather than as "[object Object]".
+const scalarCell = (value) => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+};
+
+/**
+ * Records to CSV, flattening exactly ONE level.
+ *
+ * The column set is the union of every record's keys IN FIRST-SEEN ORDER, not
+ * the first record's keys — a record that omits a key gets an empty cell rather
+ * than shifting every later value one column left, which is the bug that
+ * `records.map(r => Object.values(r).join(','))` has the first time two records
+ * differ. The header is therefore a function of the whole document.
+ *
+ * One level of nesting becomes dotted columns (`user.id`). Arrays and anything
+ * deeper are written as compact JSON in the cell: CSV cannot express them, and
+ * deriving columns from an array's length would make the header depend on the
+ * data rather than on the shape.
+ *
+ * `what` names the input in refusals, because this is shared between json-csv
+ * ("the input") and yaml-csv ("the first YAML document") and a caller reading a
+ * 400 has to know which one it is being told about.
+ */
+function recordsToCsv(records, what) {
+  if (!Array.isArray(records)) {
+    throw new ConvertError(`${what} must be an array of objects; got ${describeShape(records)}`);
+  }
+
+  const columns = [];
+  const seen = new Set();
+  const rows = [];
+
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (!isPlainObject(record)) {
+      throw new ConvertError(`element ${i} of ${what} is ${describeShape(record)}, not an object`);
+    }
+    // Object.create(null) for the same reason csvToRecords uses it: a key named
+    // `__proto__` has to become an own property, not a silent no-op.
+    const row = Object.create(null);
+    const put = (column, value) => {
+      if (!seen.has(column)) {
+        seen.add(column);
+        columns.push(column);
+      }
+      row[column] = scalarCell(value);
+    };
+
+    for (const [key, value] of Object.entries(record)) {
+      if (isPlainObject(value)) {
+        for (const [sub, inner] of Object.entries(value)) put(`${key}.${sub}`, inner);
+        continue;
+      }
+      put(key, value);
+    }
+    rows.push(row);
+  }
+
+  if (!records.length) throw new ConvertError(`${what} is an empty array — there is no header row to write`);
+  if (!columns.length) throw new ConvertError(`${what} has no fields to write as columns`);
+
+  const lines = [columns.map(csvField).join(',')];
+  for (const row of rows) lines.push(columns.map((c) => csvField(row[c] ?? '')).join(','));
+  return `${lines.join('\n')}\n`;
+}
+
+// ------------------------------------------------------------------ frontmatter
+//
+// The fence has to be the FIRST thing in the file. A `---` in the middle of a
+// document is a horizontal rule, and treating it as a delimiter is how a naive
+// splitter eats half a post. `^` is multiline so the closing fence has to be on
+// a line of its own; `...` is YAML's other document terminator and is accepted.
+const FRONTMATTER = /^---[ \t]*\n([\s\S]*?)^(?:---|\.\.\.)[ \t]*(?:\n|$)/m;
+
+function splitFrontmatter(input) {
+  const text = normaliseNewlines(input);
+  if (!/^---[ \t]*\n/.test(text)) {
+    throw new ConvertError('input has no YAML frontmatter — the file must begin with a --- fence line');
+  }
+  const match = FRONTMATTER.exec(text);
+  if (!match) throw new ConvertError('the frontmatter fence is never closed — expected a --- line of its own');
+
+  let data;
+  try {
+    data = yaml.load(match[1]);
+  } catch (err) {
+    throw new ConvertError(`the frontmatter is not valid YAML: ${oneLineMessage(err)}`);
+  }
+  // An empty fence parses to undefined, which JSON.stringify would DROP from the
+  // object entirely — so the caller would get a reply with no `data` key at all
+  // rather than one saying there was nothing in the fence.
+  return { data: data === undefined ? null : data, content: text.slice(match[0].length) };
+}
+
+/**
+ * The dotted path of the first null in a document, or null when there is none.
+ *
+ * Depth-first and returns the FIRST one rather than collecting them all: a
+ * caller fixing a config wants one place to look, and the second null is found
+ * by the next call.
+ */
+function findNullPath(value, path = '') {
+  if (value === null) return path || '(the root)';
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const hit = findNullPath(value[i], `${path}[${i}]`);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  if (isPlainObject(value)) {
+    for (const [key, inner] of Object.entries(value)) {
+      const hit = findNullPath(inner, path ? `${path}.${key}` : key);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------ markdown AST
+
+function markdownToJson(input) {
+  let tokens;
+  try {
+    tokens = marked.lexer(input);
+  } catch (err) {
+    throw new ConvertError(`input could not be lexed as Markdown: ${oneLineMessage(err)}`);
+  }
+
+  // Headings nest inside blockquotes and list items, so the toc is built by
+  // walking rather than by filtering the top level.
+  const toc = [];
+  const walk = (list) => {
+    for (const token of list) {
+      if (!token || typeof token !== 'object') continue;
+      if (token.type === 'heading') toc.push({ depth: token.depth, text: token.text });
+      if (Array.isArray(token.tokens)) walk(token.tokens);
+      if (Array.isArray(token.items)) walk(token.items);
+    }
+  };
+  walk(tokens);
+
+  // `tokens` is an array carrying a non-index `links` property that
+  // JSON.stringify drops; spreading it into a plain array makes that explicit
+  // rather than surprising.
+  return `${JSON.stringify({ toc, tokens: [...tokens] }, null, 2)}\n`;
+}
+
+// ------------------------------------------------------------------ subtitles
+//
+// SubRip and WebVTT differ in three mechanical ways: the WEBVTT header, the
+// decimal separator inside a timestamp, and what each format allows around a
+// cue. Nothing here recomputes timing, because none of the timing changes — the
+// reason to parse rather than find-and-replace is that a comma inside a line of
+// dialogue is not a timestamp separator.
+
+const SRT_STAMP = /^\s*(\d+:\d{2}:\d{2})[,.](\d{3})\s*-->\s*(\d+:\d{2}:\d{2})[,.](\d{3})(.*)$/;
+// WebVTT allows the hour field to be omitted. SubRip does not, so it is filled in.
+const VTT_STAMP =
+  /^\s*(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{3})(.*)$/;
+
+function srtToVtt(input) {
+  const lines = normaliseNewlines(input).split('\n');
+  let stamps = 0;
+
+  const converted = lines.map((line) => {
+    const m = SRT_STAMP.exec(line);
+    if (!m) return line;
+    stamps++;
+    // Whatever followed the end stamp is SubRip's coordinate extension
+    // (`X1:… Y1:…`). It is NOT a WebVTT cue setting, so it is dropped rather
+    // than emitted as one a player would read as positioning.
+    return `${m[1]}.${m[2]} --> ${m[3]}.${m[4]}`;
+  });
+
+  if (!stamps) {
+    throw new ConvertError('input has no SubRip timestamp line (hh:mm:ss,mmm --> hh:mm:ss,mmm)');
+  }
+  return `WEBVTT\n\n${converted.join('\n').replace(/^\n+/, '').replace(/\n+$/, '')}\n`;
+}
+
+function vttToSrt(input) {
+  const text = normaliseNewlines(input);
+  if (!/^\s*WEBVTT/.test(text)) {
+    throw new ConvertError('input does not begin with WEBVTT — this endpoint takes a WebVTT file');
+  }
+
+  const cues = [];
+  for (const block of text.split(/\n{2,}/)) {
+    const lines = block.split('\n').filter((line) => line.trim() !== '');
+    if (!lines.length) continue;
+    // The header block, and the three block types WebVTT has that SubRip has
+    // nowhere to put.
+    if (/^WEBVTT\b/.test(lines[0])) continue;
+    if (/^(NOTE|STYLE|REGION)\b/.test(lines[0])) continue;
+
+    const at = lines.findIndex((line) => VTT_STAMP.test(line));
+    if (at === -1) continue;
+
+    const m = VTT_STAMP.exec(lines[at]);
+    const start = `${(m[1] || '0').padStart(2, '0')}:${m[2]}:${m[3]},${m[4]}`;
+    const end = `${(m[5] || '0').padStart(2, '0')}:${m[6]}:${m[7]},${m[8]}`;
+
+    // Lines BEFORE the stamp are the cue identifier, which SubRip replaces with
+    // a sequence number; everything after the end stamp on the stamp line is cue
+    // settings, which SubRip cannot express. Both are dropped, loudly, in the
+    // entry's caveats.
+    cues.push(`${cues.length + 1}\n${start} --> ${end}\n${lines.slice(at + 1).join('\n')}`);
+  }
+
+  if (!cues.length) throw new ConvertError('input has no WebVTT cue with a timestamp line');
+  return `${cues.join('\n\n')}\n`;
+}
+
+// ------------------------------------------------------------------ XML
+
+// parseTagValue/parseAttributeValue OFF, deliberately. The parser's default is
+// to coerce anything numeric-looking, which turns an id of "007" into 7 and a
+// long account number into a float — the same destruction csv-json refuses to
+// do, and for the same reason. Every value comes back a string; cast downstream
+// where the schema is known.
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  textNodeName: '#text',
+  trimValues: true,
+  parseTagValue: false,
+  parseAttributeValue: false,
+});
+
+function xmlToJson(input) {
+  const text = input.replace(/^﻿/, '');
+
+  // REFUSED, not parsed. Internal DTD entities are how an entity-expansion bomb
+  // fits inside a 256 KB body — a few hundred bytes of nested entities expand to
+  // gigabytes — and there is no XML document worth spending a Worker's CPU limit
+  // on. The check is a substring rather than a parse because it has to happen
+  // BEFORE the parser sees the DOCTYPE. Stated as a caveat on the entry.
+  if (/<!DOCTYPE/i.test(text)) {
+    throw new ConvertError(
+      'input carries a <!DOCTYPE> — DTDs are refused here, because internal entities are an expansion attack'
+    );
+  }
+
+  const verdict = XMLValidator.validate(text, { allowBooleanAttributes: true });
+  if (verdict !== true) {
+    const err = verdict && verdict.err;
+    const detail = err ? `${err.msg}${err.line ? ` (line ${err.line})` : ''}` : 'unknown error';
+    throw new ConvertError(`input is not well-formed XML: ${oneLineMessage(detail)}`);
+  }
+
+  let parsed;
+  try {
+    parsed = xmlParser.parse(text);
+  } catch (err) {
+    throw new ConvertError(`input could not be parsed as XML: ${oneLineMessage(err)}`);
+  }
+  return `${JSON.stringify(parsed, null, 2)}\n`;
+}
+
+// ------------------------------------------------------------------ HTML readers
+//
+// Both of these parse with domino for the same reason html-markdown does: a
+// regex over markup is the thirty-year-old failure mode, and workerd has no
+// `document` for a browser-oriented library to reach for.
+
+// The complexity gate every HTML converter runs BEFORE domino sees the input.
+// domino's parse is superlinear in nesting depth (measured: depth 5,000 →
+// ~109 ms, 15,000 → ~877 ms on a 256 KB body) and the recursive walkers below
+// overflow the stack around depth 10,000 — so a crafted <div>*20000 body burns
+// ~3 s of billed CPU to produce a 400. Real documents don't look like that:
+// depth caps at 512 (browsers themselves flatten around 512), and a single
+// tag longer than 16 KB is an attribute bomb, not markup. Linear scan, void
+// elements approximated — it is a guard, not a parser, and it only ever
+// refuses; anything it mis-reads still gets parsed properly by domino.
+const HTML_MAX_DEPTH = 512;
+const HTML_MAX_TAG_CHARS = 16 * 1024;
+const HTML_VOID = new Set([
+  'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta',
+  'param', 'source', 'track', 'wbr',
+]);
+function guardHtmlComplexity(input) {
+  const re = /<(\/?)([a-zA-Z][^\s/>]*)([^>]*)/g;
+  let depth = 0;
+  let m;
+  while ((m = re.exec(input)) !== null) {
+    if (m[3].length > HTML_MAX_TAG_CHARS) {
+      throw new ConvertError('input has a single tag longer than 16 KB — that is not markup this tool converts');
+    }
+    const name = m[2].toLowerCase();
+    if (m[1]) {
+      if (depth > 0) depth -= 1;
+    } else if (!HTML_VOID.has(name) && !m[3].endsWith('/')) {
+      depth += 1;
+      if (depth > HTML_MAX_DEPTH) {
+        throw new ConvertError(`input nests deeper than ${HTML_MAX_DEPTH} elements — real documents do not, and parsing it would burn seconds of CPU`);
+      }
+    }
+  }
+}
+
+// Dropped WITH their subtrees. Turndown's rule set drops script/style/noscript
+// for the same reason; the page-chrome elements are added here because "readable
+// plain text" means the article, not the navigation. It is a heuristic and the
+// entry's caveat says so — a page that puts its article inside <aside> loses it.
+const TEXT_DROP = new Set([
+  'SCRIPT', 'STYLE', 'NOSCRIPT', 'NAV', 'HEADER', 'FOOTER', 'ASIDE', 'IFRAME', 'TEMPLATE', 'SVG', 'CANVAS',
+]);
+
+// Elements that end a paragraph. TD/TH are handled separately — as a tab, not a
+// paragraph break, so a table row stays one line.
+const TEXT_BLOCK = new Set([
+  'ADDRESS', 'ARTICLE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION', 'FIGURE',
+  'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HR', 'LI', 'MAIN', 'OL', 'P', 'SECTION', 'TABLE',
+  'TR', 'UL',
+]);
+
+const tagOf = (node) => String(node.tagName || '').toUpperCase();
+
+function htmlToText(input) {
+  guardHtmlComplexity(input);
+  const doc = domino.createDocument(input, true);
+  const body = doc.body;
+  if (!body) throw new ConvertError('input has no <body> to read');
+
+  // <pre> is the one place whitespace is content, so its text is lifted OUT
+  // before the collapsing pass and put back afterwards. Doing it any other way
+  // means the pass that turns "one     two" into "one two" also eats a code
+  // block's indentation — which it did, and which is why this is a placeholder
+  // rather than a flag. NUL is the marker because it cannot occur in the text
+  // (it is stripped from every text node below) and it is not whitespace, so
+  // none of the collapsing regexes touch it.
+  const preserved = [];
+  let out = '';
+  const visit = (node) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) {
+        out += String(child.nodeValue).replace(/\u0000/g, '').replace(/\s+/g, ' ');
+        continue;
+      }
+      if (child.nodeType !== 1) continue;
+
+      const tag = tagOf(child);
+      if (TEXT_DROP.has(tag)) continue;
+      if (tag === 'BR') {
+        out += '\n';
+        continue;
+      }
+      if (tag === 'PRE') {
+        out += `\n\n\u0000${preserved.push(String(child.textContent || '')) - 1}\u0000\n\n`;
+        continue;
+      }
+      if (tag === 'TD' || tag === 'TH') {
+        visit(child);
+        out += '\t';
+        continue;
+      }
+      const block = TEXT_BLOCK.has(tag);
+      if (block) out += '\n\n';
+      visit(child);
+      if (block) out += '\n\n';
+    }
+  };
+  visit(body);
+
+  const text = out
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+    .replace(/\u0000(\d+)\u0000/g, (_, index) => preserved[Number(index)])
+    .replace(/\n+$/, '');
+  if (!text.trim()) {
+    throw new ConvertError('input has no readable text once scripts, styles and page chrome are dropped');
+  }
+  return `${text}\n`;
+}
+
+// Rows belonging to THIS table. Descending only through THEAD/TBODY/TFOOT is
+// what keeps a NESTED table's rows out — `querySelectorAll('tr')` would swallow
+// them into the outer table silently, which is a wrong answer with no error.
+function tableRows(table) {
+  const rows = [];
+  const collect = (parent) => {
+    for (const child of parent.childNodes) {
+      if (child.nodeType !== 1) continue;
+      const tag = tagOf(child);
+      if (tag === 'TR') rows.push(child);
+      else if (tag === 'THEAD' || tag === 'TBODY' || tag === 'TFOOT') collect(child);
+    }
+  };
+  collect(table);
+  return rows;
+}
+
+function rowCells(row) {
+  const cells = [];
+  for (const child of row.childNodes) {
+    if (child.nodeType !== 1) continue;
+    const tag = tagOf(child);
+    if (tag === 'TD' || tag === 'TH') cells.push(child);
+  }
+  return cells;
+}
+
+const cellText = (node) => String(node.textContent || '').replace(/\s+/g, ' ').trim();
+
+// Header cells are written by people, so they repeat and they go missing. Both
+// have to become distinct keys or a row silently loses a column — the same class
+// of bug as the `__proto__` one csvToRecords fixed.
+function uniqueColumns(names) {
+  const used = new Set();
+  return names.map((raw, i) => {
+    const base = raw || `column_${i + 1}`;
+    let name = base;
+    let n = 2;
+    while (used.has(name)) name = `${base}_${n++}`;
+    used.add(name);
+    return name;
+  });
+}
+
+function htmlTablesToJson(input) {
+  guardHtmlComplexity(input);
+  const doc = domino.createDocument(input, true);
+  const tables = Array.from(doc.getElementsByTagName('table'));
+  if (!tables.length) throw new ConvertError('input contains no <table> element');
+
+  const out = [];
+  for (const table of tables) {
+    const rows = tableRows(table);
+    if (!rows.length) continue;
+
+    // The header is the first row made of <th>, else the first row. A table
+    // whose header is <td> is common enough that refusing it would be pedantry.
+    const headerIndex = rows.findIndex((row) => rowCells(row).some((cell) => tagOf(cell) === 'TH'));
+    const at = headerIndex === -1 ? 0 : headerIndex;
+    const columns = uniqueColumns(rowCells(rows[at]).map(cellText));
+
+    const body = [];
+    for (let i = 0; i < rows.length; i++) {
+      if (i === at) continue;
+      const cells = rowCells(rows[i]);
+      if (!cells.length) continue;
+      const record = Object.create(null);
+      const width = Math.max(columns.length, cells.length);
+      for (let c = 0; c < width; c++) {
+        record[columns[c] ?? `column_${c + 1}`] = c < cells.length ? cellText(cells[c]) : '';
+      }
+      body.push(record);
+    }
+
+    const caption = Array.from(table.childNodes).find((n) => n.nodeType === 1 && tagOf(n) === 'CAPTION');
+    out.push({ caption: caption ? cellText(caption) : null, columns, rows: body });
+  }
+
+  if (!out.length) throw new ConvertError('input has a <table> but no rows in it');
+  return `${JSON.stringify({ tables: out }, null, 2)}\n`;
 }
 
 // Live hosted entries, by id — the routing table for /convert.

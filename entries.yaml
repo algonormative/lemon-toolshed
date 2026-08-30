@@ -10,7 +10,7 @@
 #
 #   hosted:              # present = we run this conversion on our server
 #     path: "/convert/<id>"   # must equal /convert/ + the entry id
-#     price: {amount_usd: 0.001, scheme: exact}   # or `free`
+#     price: {amount_usd: 0.005, scheme: exact}   # or `free`
 #     status: live            # or planned
 #
 # Every hosted tool is priced, and the price below is what every call costs:
@@ -26,6 +26,20 @@
 # An entry with no `hosted:` block is a local-only reference entry. The top-level
 # `install:` field still works and is read as `local.install`, so the entries that
 # predate this split need no edit.
+#
+# PRICES ARE PER TOOL, and as of 2026-08-30 they are no longer uniform. Two
+# bands, and the split is about what a call actually costs us to run:
+#
+#   $0.005  a parse-and-re-emit between two structured text formats. One parser,
+#           one serializer, both linear in the input.
+#   $0.01   anything that has to build a DOM or a full document tree first —
+#           the HTML tools and the XML reader. More CPU per byte, and a larger
+#           blast radius of input weirdness to have got right.
+#
+# NOTHING outside entries.yaml hard-codes a figure any more: build.mjs derives
+# the site's pricing sentence (a single price when they agree, a range when they
+# do not) from the numbers here, and the Worker reads each price out of the
+# compiled catalog. Change a number here, rebuild, and every surface follows.
 
 entries:
   - id: markdown-to-pdf
@@ -116,7 +130,7 @@ entries:
     hosted:
       path: "/convert/html-markdown"
       price:
-        amount_usd: 0.001
+        amount_usd: 0.01
         scheme: exact
       status: live
 
@@ -143,7 +157,7 @@ entries:
     hosted:
       path: "/convert/md-html"
       price:
-        amount_usd: 0.001
+        amount_usd: 0.005
         scheme: exact
       status: live
 
@@ -321,7 +335,7 @@ entries:
     hosted:
       path: "/convert/json-yaml"
       price:
-        amount_usd: 0.001
+        amount_usd: 0.005
         scheme: exact
       status: live
 
@@ -348,7 +362,7 @@ entries:
     hosted:
       path: "/convert/yaml-json"
       price:
-        amount_usd: 0.001
+        amount_usd: 0.005
         scheme: exact
       status: live
 
@@ -378,7 +392,7 @@ entries:
     hosted:
       path: "/convert/csv-json"
       price:
-        amount_usd: 0.001
+        amount_usd: 0.005
         scheme: exact
       status: live
 
@@ -733,3 +747,434 @@ entries:
       Never for the conversion; a model is at most a tie-breaker when detection is
       ambiguous and you have a sample of known-correct text to compare against.
     verified: 2026-08-18
+
+  # ---------------------------------------------------------------- 2026-08-30
+  # The second hosted wave. Same editorial rule as the first: we host the ones
+  # where a single parser and a single serializer settle the question, and we
+  # say plainly where that stops being true.
+
+  - id: json-csv
+    x: "JSON array of records"
+    y: "CSV with a header row"
+    tool: csvkit
+    kind: deterministic
+    verdict: >-
+      `in2csv --format json` is the local answer, and the hosted endpoint is the inverse of
+      our own csv-json: an array of objects in, a header row plus one line per record out,
+      RFC-4180 quoted so commas, quotes and newlines inside values survive. The column set
+      is the union of every record's keys in first-seen order, so a record missing a key
+      gets an empty cell rather than a shifted row — which is what hand-rolled
+      `Object.values().join(',')` gets wrong the first time a record differs.
+    local:
+      tool: csvkit
+      install: "pip install csvkit"
+    url: "https://csvkit.readthedocs.io"
+    caveats: >-
+      CSV is flat and JSON is not. One level of nesting is flattened to dotted columns
+      (`user.id`), and anything deeper — or any array — is written back as compact JSON in
+      the cell rather than being invented into columns. A top-level value that is not an
+      array of objects is an error, not a one-row guess.
+    escalate: >-
+      Never for the serialization. A model is only worth reaching for upstream, when the
+      question is which fields a human-facing spreadsheet should even have.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/json-csv"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: csv-yaml
+    x: "CSV"
+    y: "YAML"
+    tool: yq
+    kind: deterministic
+    verdict: >-
+      `yq -p=csv -o=yaml` does this locally; the hosted endpoint runs the same RFC-4180
+      parser csv-json uses and dumps block-style YAML, which is the shape you want when a
+      spreadsheet export has to become a config file or a fixture. The reason to bother
+      rather than eyeballing it: quoted commas and embedded newlines become correctly
+      quoted YAML scalars instead of a document that parses to the wrong thing silently.
+    local:
+      tool: yq
+      install: "brew install yq"
+    url: "https://github.com/mikefarah/yq"
+    caveats: >-
+      Every value stays a string, deliberately — the same no-type-guessing rule csv-json
+      states, so `007` and long ids survive. If you want numbers, cast them downstream
+      where you know the schema. Header cells are trimmed; values are not.
+    escalate: >-
+      Never. Naming and typing the columns is the judgment half, and it belongs upstream of
+      this call.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/csv-yaml"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: yaml-csv
+    x: "YAML list of records"
+    y: "CSV with a header row"
+    tool: yq
+    kind: deterministic
+    verdict: >-
+      `yq -o=csv` locally. The hosted endpoint takes the first document of a stream,
+      resolves anchors, and requires the result to be a list of maps — because that is the
+      only YAML shape that is a table. Anything else is refused rather than flattened into
+      a plausible-looking sheet, which is the failure this endpoint exists to avoid.
+    local:
+      tool: yq
+      install: "brew install yq"
+    url: "https://github.com/mikefarah/yq"
+    caveats: >-
+      Multi-document input collapses to its first document. Nested maps flatten one level
+      to dotted columns and deeper structures are written as compact JSON in the cell;
+      YAML dates and other non-JSON scalars are stringified.
+    escalate: >-
+      Never for the conversion. Deciding which nested fields deserve to be columns is a
+      schema decision, not a parse.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/yaml-csv"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: json-ndjson
+    x: "JSON array"
+    y: "NDJSON (newline-delimited JSON)"
+    tool: jq
+    kind: deterministic
+    verdict: >-
+      `jq -c '.[]'` is the local one-liner and it is the right one. The hosted endpoint is
+      the no-install version: one compact JSON value per line, which is the format every
+      streaming consumer — BigQuery loads, log shippers, `jq --stream` pipelines — actually
+      wants. Doing it with string surgery on the array's commas is the failure mode:
+      commas inside strings and nested arrays are not delimiters.
+    local:
+      tool: jq
+      install: "brew install jq"
+    url: "https://jqlang.github.io/jq/"
+    caveats: >-
+      The input must be a JSON array; a bare object or scalar is an error rather than a
+      one-line file, because guessing there is how a caller ends up with a stream of one.
+      Elements are re-serialized compactly, so key order is preserved but formatting is not.
+    escalate: "Never."
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/json-ndjson"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: ndjson-json
+    x: "NDJSON (newline-delimited JSON)"
+    y: "JSON array"
+    tool: jq
+    kind: deterministic
+    verdict: >-
+      `jq -s '.'` slurps a stream back into an array locally. The hosted endpoint does the
+      same and, when a line does not parse, says which line — which is the whole value of
+      running a real parser over a log file instead of wrapping it in brackets and hoping.
+      Blank lines are skipped; everything else must be a complete JSON value.
+    local:
+      tool: jq
+      install: "brew install jq"
+    url: "https://jqlang.github.io/jq/"
+    caveats: >-
+      The whole stream is materialised in memory, so the 256 KB body cap is the real limit
+      here — for anything larger use local `jq -s` rather than splitting the file, since a
+      split changes what the array means. A trailing partial line is an error, not a
+      truncation.
+    escalate: "Never."
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/ndjson-json"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: frontmatter-json
+    # NOT "Markdown with YAML frontmatter". /check matches `from` as a substring of
+    # this field, and that phrasing made `?from=yaml` offer an endpoint that cannot
+    # take a YAML file — the same mis-routing the rendered-dom entry's alias note
+    # describes. The fence is what the tool reads; the file is Markdown.
+    x: "Markdown with a frontmatter fence"
+    y: "JSON with the metadata and the body split apart"
+    tool: python-frontmatter
+    kind: deterministic
+    verdict: >-
+      Splitting on the `---` fence is three lines of code that everyone writes slightly
+      wrong: the fence has to be the first thing in the file, the closing fence has to be
+      on its own line, and a `---` inside the body is a horizontal rule rather than a
+      delimiter. The hosted endpoint returns `{"data": ..., "content": ...}` — parsed
+      frontmatter and the untouched body — which is what a static-site pipeline or a
+      content audit actually needs.
+    local:
+      tool: python-frontmatter
+      install: "pip install python-frontmatter"
+    url: "https://python-frontmatter.readthedocs.io"
+    caveats: >-
+      YAML frontmatter only — TOML (`+++`) and JSON frontmatter are not recognised. A file
+      with no opening fence is an error rather than an empty `data` object, because
+      silently reporting "no metadata" for a file whose fence you mistyped is the bug this
+      would otherwise hide. The body is returned byte-for-byte, unrendered.
+    escalate: >-
+      Never for the split. A model is the right tool only for the different job of
+      inferring metadata a document never carried.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/frontmatter-json"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: markdown-json
+    x: "Markdown"
+    y: "JSON token tree plus a table of contents"
+    tool: pandoc
+    kind: deterministic
+    verdict: >-
+      `pandoc -t json` gives you pandoc's AST locally. The hosted endpoint returns
+      `marked`'s token stream plus a derived `toc` array of `{depth, text}` — the cheap
+      thing an agent usually wants, which is the document's shape without having to render
+      it and re-parse the HTML. Asking a model to "extract the headings" costs tokens for
+      an answer that quietly renumbers on the next input; a lexer does not.
+    local:
+      tool: pandoc
+      install: "brew install pandoc"
+    url: "https://pandoc.org"
+    caveats: >-
+      The token shape is `marked`'s, not pandoc's and not a standard — it is stable across
+      a call but it is a library's data structure, so pin behaviour you depend on with your
+      own test. `toc` is built from ATX and setext headings only; a bold line pretending to
+      be a heading was never structure and does not appear.
+    escalate: >-
+      Only when the headings you want do not exist as headings and someone has to decide
+      what the document's sections really are.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/markdown-json"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: srt-vtt
+    x: "SubRip subtitle file (.srt)"
+    y: "WebVTT (.vtt)"
+    tool: ffmpeg
+    kind: deterministic
+    verdict: >-
+      `ffmpeg -i in.srt out.vtt` converts locally. The difference between the two formats
+      is small and entirely mechanical — a `WEBVTT` header line and a decimal point where
+      SubRip writes a comma — which is exactly why it is worth doing with a parser rather
+      than a global find-and-replace: a comma inside the caption text is not a timestamp
+      separator, and replacing it corrupts the dialogue instead of the timing.
+    local:
+      tool: ffmpeg
+      install: "brew install ffmpeg"
+    url: "https://ffmpeg.org"
+    caveats: >-
+      Cue numbers are kept as WebVTT cue identifiers, which is legal and which some players
+      display; strip them first if that matters. SubRip's `{\an8}` and `<font>` positioning
+      tags are passed through untouched rather than translated to VTT cue settings.
+    escalate: "Never — this is a format rewrite, not a judgment."
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/srt-vtt"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: vtt-srt
+    x: "WebVTT (.vtt)"
+    y: "SubRip subtitle file (.srt)"
+    tool: ffmpeg
+    kind: deterministic
+    verdict: >-
+      The harder direction, and the reason to use a parser: WebVTT is the larger format, so
+      the `WEBVTT` header, `NOTE`/`STYLE`/`REGION` blocks, cue settings after the timestamp
+      and hour-less `mm:ss.mmm` stamps all have to land somewhere in SubRip, which has none
+      of them. The hosted endpoint drops what SubRip cannot express, expands short
+      timestamps to `hh:mm:ss,mmm` and renumbers cues from 1, which is what players expect.
+    local:
+      tool: ffmpeg
+      install: "brew install ffmpeg"
+    url: "https://ffmpeg.org"
+    caveats: >-
+      Cue settings (`align`, `line`, `position`) and styling blocks are DISCARDED — SubRip
+      has nowhere to put them, and dropping them loudly here beats a player ignoring them
+      later. Cue identifiers are replaced by sequential numbers. Input that does not begin
+      with `WEBVTT` is refused rather than parsed hopefully.
+    escalate: "Never."
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/vtt-srt"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: toml-json
+    x: "TOML config file"
+    y: "JSON"
+    tool: dasel
+    kind: deterministic
+    verdict: >-
+      `dasel -r toml -w json` locally. TOML's whole point is that it has a spec and one
+      reading, so a conforming parser gives you the same document every time — including
+      the parts hand-rolled readers get wrong, like dotted keys, arrays of tables and
+      offset date-times. Regexing a `pyproject.toml` or a `Cargo.toml` for a version string
+      works until a value moves into a table header.
+    local:
+      tool: dasel
+      install: "brew install dasel"
+    url: "https://daseldocs.tomwright.me"
+    caveats: >-
+      Comments are dropped, because JSON has none — this is a read path, not a round trip.
+      TOML dates and date-times become ISO-8601 strings, since JSON has no date type, and
+      integers outside JavaScript's safe range lose precision.
+    escalate: "Never."
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/toml-json"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: json-toml
+    x: "JSON object"
+    y: "TOML"
+    tool: dasel
+    kind: deterministic
+    verdict: >-
+      `dasel -r json -w toml` is the local answer. The direction that bites is this one:
+      TOML's root must be a table, so a JSON array or scalar has nowhere to go, and `null`
+      has no TOML spelling at all. The hosted endpoint refuses both rather than emitting a
+      file that parses to something you did not write.
+    local:
+      tool: dasel
+      install: "brew install dasel"
+    url: "https://daseldocs.tomwright.me"
+    caveats: >-
+      A non-object root, or a `null` anywhere in the document, is an error — TOML cannot
+      express either, and there is no honest substitute. Key order follows the JSON
+      document; the emitted file is valid TOML but it is not formatted the way a human
+      would have laid it out.
+    escalate: >-
+      Never for the encoding. Whether a generated config should be checked in at all is a
+      different conversation.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/json-toml"
+      price:
+        amount_usd: 0.005
+        scheme: exact
+      status: live
+
+  - id: xml-json
+    x: "XML document (feed, export, SOAP payload)"
+    y: "JSON"
+    tool: yq
+    kind: deterministic
+    verdict: >-
+      `yq -p=xml -o=json` locally. XML-to-JSON is not a bijection and every tool picks a
+      convention; ours is `fast-xml-parser`'s — attributes prefixed `@_`, text content
+      under `#text`, repeated sibling elements collapsed into an array. Stating the
+      convention is the product: a model asked to "turn this XML into JSON" invents a
+      different one per call, which is unusable in a pipeline.
+    local:
+      tool: yq
+      install: "brew install yq"
+    url: "https://github.com/mikefarah/yq"
+    caveats: >-
+      A document with a `<!DOCTYPE>` is REFUSED, not parsed — internal DTD entities are how
+      an entity-expansion bomb fits inside a 256 KB body, and no output is worth that.
+      Namespace prefixes are kept verbatim as part of the key, and an element that appears
+      once is an object while the same element appearing twice is an array, so consumers
+      must handle both. Values stay strings: the parser's number coercion is switched off,
+      because it turns an id of `007` into `7`.
+    escalate: >-
+      Never for the parse. Mapping someone's XML schema onto the JSON shape your system
+      wants is a separate, genuinely judgment-shaped job.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/xml-json"
+      price:
+        amount_usd: 0.01
+        scheme: exact
+      status: live
+
+  - id: html-text
+    x: "Saved HTML page / static HTML file"
+    y: "Plain text, readable"
+    tool: lynx
+    kind: deterministic
+    verdict: >-
+      `lynx -dump -nolist` is the classic local answer. The hosted endpoint parses the page
+      with a real DOM and walks it, so block elements become paragraph breaks and
+      `<script>`, `<style>`, `<nav>`, `<header>`, `<footer>` and `<aside>` are dropped with
+      their contents — which is the difference between readable prose and an analytics
+      snippet wedged between two sentences. Stripping tags with a regex is the failure mode
+      and it has been for thirty years.
+    local:
+      tool: lynx
+      install: "brew install lynx"
+    url: "https://lynx.invisible-island.net"
+    caveats: >-
+      Dropping the chrome elements is a heuristic, not readability extraction: a page that
+      puts its article inside `<aside>` loses it, and a page with no semantic elements keeps
+      its navigation. Links become their text, not their URL. `<pre>` content is preserved
+      verbatim; everything else has its whitespace collapsed.
+    escalate: >-
+      Only where the article body is genuinely ambiguous. Try a readability extractor
+      (trafilatura, readability-lxml) before a model — it is cheaper and reproducible.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/html-text"
+      price:
+        amount_usd: 0.01
+        scheme: exact
+      status: live
+
+  - id: html-json
+    x: "HTML page containing data tables"
+    y: "JSON rows keyed by the header row"
+    tool: pandas
+    kind: deterministic
+    verdict: >-
+      `pandas.read_html` locally. The hosted endpoint parses the page with a real DOM and
+      returns every `<table>` as `{caption, columns, rows}` with each row an object keyed
+      by the header cells — a stable shape whether the page has one table or nine. Handing
+      a table to a model to "read the numbers out" is the expensive way to get a
+      transcription error you cannot see.
+    local:
+      tool: pandas
+      install: "pip install pandas lxml"
+    url: "https://pandas.pydata.org/docs/reference/api/pandas.read_html.html"
+    caveats: >-
+      `colspan` and `rowspan` are NOT expanded — a merged-cell layout table comes back
+      misaligned, and this is a data-table reader, not a layout reader. Values stay strings
+      with whitespace collapsed; no type guessing, for the same reason csv-json refuses it.
+      Nested tables are returned as their own entries rather than inlined. A page with no
+      table at all is an error.
+    escalate: >-
+      When the table is not marked up as a table — a grid built from divs, or a merged-cell
+      report where a human has to say what the rows mean.
+    verified: 2026-08-30
+    hosted:
+      path: "/convert/html-json"
+      price:
+        amount_usd: 0.01
+        scheme: exact
+      status: live
