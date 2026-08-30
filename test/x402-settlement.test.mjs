@@ -232,10 +232,10 @@ async function startMockFacilitator() {
  * would prove nothing and would need a funded key. The SHAPE is real, because
  * the Worker reads `payload.authorization.from` out of it.
  */
-// The default `value` is the $0.005 price every tool this file pays for
+// The default `value` is md-html's $0.004; the mocked facilitator never cross-checks it
 // carries. It is typed rather than read off the envelope because these payloads
 // are deliberately hand-built — see paymentHeaderV2 for the version that is not.
-function paymentHeader({ from = CLAIMED_PAYER, value = '5000' } = {}) {
+function paymentHeader({ from = CLAIMED_PAYER, value = '4000' } = {}) { // default matches md-html; $0.002 tools under a mock facilitator are not cross-checked
   const now = Math.floor(Date.now() / 1000);
   return Buffer.from(
     JSON.stringify({
@@ -395,7 +395,7 @@ describe('verify says yes', () => {
 
     const verified = await awaitSettlement((r) => r.verify_ok === 1 && r.settle_ok === 1, 'a settled payment');
     assert.equal(verified.tool, 'md-html');
-    assert.equal(verified.amount, '5000', '$0.005 in USDC atomic units');
+    assert.equal(verified.amount, '4000', '$0.005 in USDC atomic units');
     assert.equal(verified.tx_hash, TX_HASH, 'the settlement hash did not come from the facilitator');
     // The FACILITATOR's payer, not the one the caller claimed in its payload.
     assert.equal(verified.payer, VERIFIED_PAYER);
@@ -431,7 +431,7 @@ describe('verify says yes', () => {
       assert.deepEqual(hit.body.paymentRequirements, {
         scheme: 'exact',
         network: 'base',
-        maxAmountRequired: '5000',
+        maxAmountRequired: '2000',
         resource: `${SITE_BASE}/convert/csv-json`,
         description: 'CSV to JSON conversion',
         mimeType: 'application/json',
@@ -643,7 +643,7 @@ describe('verify says no', () => {
     // …and the envelope is still there, so a client can just pay again.
     assert.equal(body.accepts.length, 1);
     assert.equal(body.accepts[0].payTo, PAYTO_TEST);
-    assert.equal(body.accepts[0].maxAmountRequired, '5000');
+    assert.equal(body.accepts[0].maxAmountRequired, '4000');
     assert.deepEqual(body.accepts[0].extra, { name: 'USD Coin', version: '2' });
 
     // Rejected means not settled: verify was called, settle was not.
@@ -768,7 +768,7 @@ describe('settlement fails after a good verify', () => {
     });
 
     // Verify passed, so the caller got what it paid for. Settlement is after
-    // the fact by design; this is the accepted $0.005 exposure.
+    // the fact by design; this is the accepted $0.002 exposure.
     assert.equal(res.status, 200, res.text);
     assert.equal(res.headers.get('x-payment-verified'), 'true');
     assert.ok(res.text.includes('a: 1'), 'the conversion did not run');
@@ -777,7 +777,7 @@ describe('settlement fails after a good verify', () => {
     assert.equal(row.settle_ok, 0, 'a failed settlement was recorded as successful');
     assert.equal(row.error, 'unexpected_settle_error');
     assert.ok(isSqlNull(row.tx_hash), 'a failed settlement recorded a transaction hash');
-    assert.equal(row.amount, '5000');
+    assert.equal(row.amount, '2000');
   });
 
   test('an unreachable facilitator at settle time is recorded too', async () => {
@@ -852,7 +852,7 @@ describe('a real x402 client can pay the envelope we publish', () => {
         chain: deps.chains.base,
         transport: deps.viem.http(),
       });
-      // maxValue 10,000 atomic units = $0.01, ten times the price.
+      // maxValue 10,000 atomic units = $0.01, above every tool price.
       const payingFetch = deps.fetchWrapper.wrapFetchWithPayment(fetch, wallet, BigInt(10_000));
 
       const res = await payingFetch(url, {
@@ -873,7 +873,7 @@ describe('a real x402 client can pay the envelope we publish', () => {
       assert.equal(sent.body.paymentPayload.scheme, 'exact');
       assert.equal(sent.body.paymentPayload.payload.authorization.from, account.address);
       assert.equal(sent.body.paymentPayload.payload.authorization.to, payTo);
-      assert.equal(sent.body.paymentPayload.payload.authorization.value, '5000');
+      assert.equal(sent.body.paymentPayload.payload.authorization.value, '4000');
       // A real 65-byte secp256k1 signature: 0x + 130 hex chars.
       assert.match(sent.body.paymentPayload.payload.signature, /^0x[0-9a-f]{130}$/i);
       // …and it was signed against OUR domain, unchanged in transit.
@@ -926,7 +926,7 @@ describe('a v2 payment is verified and settled in v2 shape', () => {
       assert.deepEqual(hit.body.paymentRequirements, {
         scheme: 'exact',
         network: 'eip155:8453',
-        amount: '5000',
+        amount: '4000',
         asset: USDC_BASE,
         payTo: PAYTO_TEST,
         maxTimeoutSeconds: 60,
@@ -1016,7 +1016,7 @@ describe('a v2 payment is verified and settled in v2 shape', () => {
       shapeProblem({
         x402Version: 2,
         paymentPayload: v2,
-        paymentRequirements: { ...v2.accepted, maxAmountRequired: '5000' },
+        paymentRequirements: { ...v2.accepted, maxAmountRequired: '4000' },
       }),
       'a v1 field smuggled into v2 requirements passed the shape check'
     );
@@ -1118,10 +1118,10 @@ describe('a real x402 v2 client can pay the envelope we publish', () => {
       // v2 payloads carry `accepted`, not a top-level scheme/network.
       assert.equal(sent.body.paymentPayload.scheme, undefined);
       assert.equal(sent.body.paymentPayload.accepted.network, 'eip155:8453');
-      assert.equal(sent.body.paymentPayload.accepted.amount, '5000');
+      assert.equal(sent.body.paymentPayload.accepted.amount, '4000');
       assert.equal(sent.body.paymentPayload.payload.authorization.from, account.address);
       assert.equal(sent.body.paymentPayload.payload.authorization.to, payTo);
-      assert.equal(sent.body.paymentPayload.payload.authorization.value, '5000');
+      assert.equal(sent.body.paymentPayload.payload.authorization.value, '4000');
       // A real 65-byte secp256k1 signature: 0x + 130 hex chars.
       assert.match(sent.body.paymentPayload.payload.signature, /^0x[0-9a-f]{130}$/i);
       // …signed over OUR EIP-712 domain, unchanged in transit.

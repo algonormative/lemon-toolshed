@@ -3,9 +3,10 @@
 **A collection of tools for agents — no install required.** Privacy-first: no
 login, no credit card, no account.
 
-**Every hosted tool is a paid call, priced per tool: $0.005 for a conversion
-between two structured text formats, $0.01 for the ones that build a DOM or a
-document tree (the HTML tools and the XML reader). Paid in USDC via x402. There
+**Every hosted tool is a paid call, priced per tool: $0.002 for a conversion
+between two structured text formats, $0.004 for a real parser (Markdown, TOML,
+frontmatter), $0.006 for the ones that build a DOM or a document tree (the HTML
+tools and the XML reader). Paid in USDC via x402. There
 is no free tier — the 402 is the front door, and the payment is the auth.**
 
 An agent posts a file to an HTTP endpoint and gets the converted file back. A
@@ -107,7 +108,7 @@ Two optional blocks decide what an entry is:
 hosted:                      # present = we run this conversion
   path: "/convert/md-html"   # must equal /convert/ + the entry id
   price:                     # what every call costs
-    amount_usd: 0.005        # (see the note on `price: free` below)
+    amount_usd: 0.002        # (see the note on `price: free` below)
     scheme: exact
   status: live               # or planned
 
@@ -415,13 +416,15 @@ printf '%s\n' \
 ## Pricing and payment (x402)
 
 **Every hosted tool is priced, and none of them has a trial.** A call costs
-**$0.005 or $0.01 in USDC on Base** depending on the tool, negotiated with x402
+**$0.002 to $0.006 in USDC on Base** depending on the tool, negotiated with x402
 — and the call that gets asked is the first one, not the fourth.
 
-**Prices stopped being uniform on 2026-08-30.** Two bands, and the split is what
-a call costs us to run: $0.005 for a parse-and-re-emit between two structured
-text formats, $0.01 for anything that has to build a DOM or a full document tree
-first. The figure lives in `entries.yaml` per entry and NOWHERE else — build.mjs
+**Prices stopped being uniform on 2026-08-30.** Three bands, and the split is
+what a call costs us to run: $0.002 for a parse-and-re-emit between two
+structured text formats, $0.004 for a real parser (Markdown, TOML,
+frontmatter), $0.006 for anything that has to build a DOM or a full document
+tree first (bands corrected downward the same day — the launch bands were
+$0.005/$0.01 for a few hours). The figure lives in `entries.yaml` per entry and NOWHERE else — build.mjs
 derives the site's pricing sentence from those numbers (a single price when they
 agree, a range when they do not), the Worker reads each price out of the
 compiled catalog, and the 402 envelope quotes the tool that was actually asked
@@ -680,7 +683,7 @@ error.
 
 The envelope (`x402Version: 1`) advertises `scheme: exact`, `network: base` and
 `asset` = USDC on Base (`0x8335…2913`). `maxAmountRequired` is in atomic units,
-6 decimals, so $0.005 is `"5000"` and $0.01 is `"10000"`. The price lives in
+6 decimals, so $0.002 is `"2000"` and $0.006 is `"6000"`. The price lives in
 `entries.yaml` PER ENTRY and the atomic conversion happens in the Worker, so
 changing a price is a one-line content edit — and no client should assume one
 figure across the API.
@@ -1036,7 +1039,7 @@ npm run buyer:pay -- --dry-run
 npm run buyer:pay -- --yes
 ```
 
-**What step 4 actually costs:** one payment at the target tool's price ($0.005
+**What step 4 actually costs:** one payment at the target tool's price ($0.004
 for `md-html`), and there is no free
 tier to burn through to reach it — the first call answers 402 and the script
 pays immediately. It makes one unpaid probe first, purely to read the envelope
@@ -1066,7 +1069,7 @@ with the minimum that proves the path, and treat the file as burnable.
 2. A `settlements` row carried `verify_ok = 1`, `settle_ok = 1` and a real
    `tx_hash` (`0xe2c8bb8d…`).
 3. The payment landed at the `PAYTO` address. (It was $0.001 then; the tools
-   were repriced to $0.005/$0.01 on 2026-08-30.)
+   were repriced on 2026-08-30 — now $0.002-$0.006 per tool.)
 
 **Rewritten 2026-08-19** when the tier was retired. The box now says, on the
 free-tier-off branch, that the free tier is **switched off** — every conversion
@@ -1100,7 +1103,7 @@ the push half: a **Telegram** message and an **email** when money moves.
 
 | event | alert |
 | --- | --- |
-| verified payment, settled | 🍋💰 `THIRD PARTY PAID — $0.005 md-html — payer 0x… — tx 0x… — settled` |
+| verified payment, settled | 🍋💰 `THIRD PARTY PAID — $0.004 md-html — payer 0x… — tx 0x… — settled` |
 | verified payment, from a wallet in `HOUSE_PAYERS` | 🧪 `test settlement — …` — same facts, quiet framing |
 | verified payment, settlement **failed** | the same message ending `SETTLE FAILED (<reason>)`. Verified means the caller was served, so this is money owed that did not arrive |
 | **served without verification** | ⚠️ `SERVED WITHOUT VERIFICATION — … — x-payment-error: <reason>`. Visually distinct because it is a different problem: the conversion went out and **nobody paid** |

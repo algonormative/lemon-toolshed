@@ -108,7 +108,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/html-markdown",
       "price": {
-        "amount_usd": 0.01,
+        "amount_usd": 0.006,
         "scheme": "exact"
       },
       "status": "live",
@@ -140,7 +140,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/md-html",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.004,
         "scheme": "exact"
       },
       "status": "live",
@@ -360,7 +360,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/json-yaml",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -391,7 +391,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/yaml-json",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -420,7 +420,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/csv-json",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -823,7 +823,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/json-csv",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -854,7 +854,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/csv-yaml",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -885,7 +885,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/yaml-csv",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -916,7 +916,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/json-ndjson",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -947,7 +947,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/ndjson-json",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -978,7 +978,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/frontmatter-json",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.004,
         "scheme": "exact"
       },
       "status": "live",
@@ -1009,7 +1009,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/markdown-json",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.004,
         "scheme": "exact"
       },
       "status": "live",
@@ -1039,7 +1039,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/srt-vtt",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -1069,7 +1069,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/vtt-srt",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.002,
         "scheme": "exact"
       },
       "status": "live",
@@ -1098,7 +1098,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/toml-json",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.004,
         "scheme": "exact"
       },
       "status": "live",
@@ -1127,7 +1127,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/json-toml",
       "price": {
-        "amount_usd": 0.005,
+        "amount_usd": 0.004,
         "scheme": "exact"
       },
       "status": "live",
@@ -1156,7 +1156,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/xml-json",
       "price": {
-        "amount_usd": 0.01,
+        "amount_usd": 0.006,
         "scheme": "exact"
       },
       "status": "live",
@@ -1187,7 +1187,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/html-text",
       "price": {
-        "amount_usd": 0.01,
+        "amount_usd": 0.006,
         "scheme": "exact"
       },
       "status": "live",
@@ -1217,7 +1217,7 @@ export const CATALOG = [
     "hosted": {
       "path": "/convert/html-json",
       "price": {
-        "amount_usd": 0.01,
+        "amount_usd": 0.006,
         "scheme": "exact"
       },
       "status": "live",

@@ -1645,7 +1645,7 @@ const X402_ENVELOPE_SCHEMA = {
     maxAmountRequired: {
       type: 'string',
       description:
-        'Price in atomic units of `asset`. USDC has 6 decimals, so "5000" is $0.005. Each tool ' +
+        'Price in atomic units of `asset`. USDC has 6 decimals, so "2000" is $0.002. Each tool ' +
         'names its own amount; do not assume one price across the API.',
       examples: ['5000'],
     },

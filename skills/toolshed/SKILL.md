@@ -1,12 +1,12 @@
 ---
 name: toolshed
-description: Convert files/data between formats using Lemon Toolshed's hosted conversion endpoints — $0.005-$0.01 a call in USDC via x402, no install, no login, no account; check pair availability first.
+description: Convert files/data between formats using Lemon Toolshed's hosted conversion endpoints — $0.002-$0.006 a call in USDC via x402, no install, no login, no account; check pair availability first.
 ---
 
 # Toolshed
 
 Conversion tools you call over HTTP with nothing installed. No login, no
-account, no card: you pay per call in USDC ($0.005-$0.01 depending on the tool),
+account, no card: you pay per call in USDC ($0.002-$0.006 depending on the tool),
 and the payment is the auth.
 
 **Prices are per tool.** They were uniform until 2026-08-30 and are not any
@@ -78,30 +78,31 @@ curl -X POST "https://toolshed.lemon-agent.dev/convert/md-html" \
   free tier through the `FREE_TIER_DAILY` env var. The hosted service does not
   send it.
 
-Live endpoints. The $0.005 band is a parse-and-re-emit between two structured
-text formats; the $0.01 band has to build a DOM or a full document tree first.
+Live endpoints. The $0.002 band is a parse-and-re-emit between two structured text formats;
+$0.004 buys real parsing (Markdown, TOML, frontmatter); the $0.006 band has
+to build a DOM or a full document tree first.
 
 | id | converts | price |
 | --- | --- | --- |
-| `md-html` | Markdown to HTML | $0.005/call |
-| `json-yaml` | JSON to YAML | $0.005/call |
-| `yaml-json` | YAML to JSON (first document of a stream) | $0.005/call |
-| `csv-json` | CSV to JSON (array of objects from the header row) | $0.005/call |
-| `json-csv` | JSON array of records to CSV (header = union of all keys) | $0.005/call |
-| `csv-yaml` | CSV to YAML (list of maps) | $0.005/call |
-| `yaml-csv` | YAML list of maps to CSV | $0.005/call |
-| `json-ndjson` | JSON array to newline-delimited JSON | $0.005/call |
-| `ndjson-json` | NDJSON to a JSON array | $0.005/call |
-| `frontmatter-json` | Markdown `---` fence to `{data, content}` | $0.005/call |
-| `markdown-json` | Markdown to `{toc, tokens}` (lexer AST) | $0.005/call |
-| `srt-vtt` | SubRip subtitles to WebVTT | $0.005/call |
-| `vtt-srt` | WebVTT to SubRip subtitles | $0.005/call |
-| `toml-json` | TOML to JSON | $0.005/call |
-| `json-toml` | JSON object to TOML | $0.005/call |
-| `html-markdown` | HTML to Markdown | $0.01/call |
-| `html-text` | HTML to readable plain text (chrome dropped) | $0.01/call |
-| `html-json` | HTML `<table>`s to `{tables: [{caption, columns, rows}]}` | $0.01/call |
-| `xml-json` | XML to JSON (`@_` attributes, `#text`) | $0.01/call |
+| `md-html` | Markdown to HTML | $0.004/call |
+| `json-yaml` | JSON to YAML | $0.002/call |
+| `yaml-json` | YAML to JSON (first document of a stream) | $0.002/call |
+| `csv-json` | CSV to JSON (array of objects from the header row) | $0.002/call |
+| `json-csv` | JSON array of records to CSV (header = union of all keys) | $0.002/call |
+| `csv-yaml` | CSV to YAML (list of maps) | $0.002/call |
+| `yaml-csv` | YAML list of maps to CSV | $0.002/call |
+| `json-ndjson` | JSON array to newline-delimited JSON | $0.002/call |
+| `ndjson-json` | NDJSON to a JSON array | $0.002/call |
+| `frontmatter-json` | Markdown `---` fence to `{data, content}` | $0.004/call |
+| `markdown-json` | Markdown to `{toc, tokens}` (lexer AST) | $0.004/call |
+| `srt-vtt` | SubRip subtitles to WebVTT | $0.002/call |
+| `vtt-srt` | WebVTT to SubRip subtitles | $0.002/call |
+| `toml-json` | TOML to JSON | $0.004/call |
+| `json-toml` | JSON object to TOML | $0.004/call |
+| `html-markdown` | HTML to Markdown | $0.006/call |
+| `html-text` | HTML to readable plain text (chrome dropped) | $0.006/call |
+| `html-json` | HTML `<table>`s to `{tables: [{caption, columns, rows}]}` | $0.006/call |
+| `xml-json` | XML to JSON (`@_` attributes, `#text`) | $0.006/call |
 
 Treat this table as a cache; `/check` is authoritative.
 
@@ -121,7 +122,7 @@ The v1 body:
 
 ```json
 {"x402Version": 1, "error": "X-PAYMENT header is required",
- "accepts": [{"scheme": "exact", "network": "base", "maxAmountRequired": "5000",
+ "accepts": [{"scheme": "exact", "network": "base", "maxAmountRequired": "4000",
               "resource": "https://toolshed.lemon-agent.dev/convert/md-html",
               "description": "Markdown to HTML conversion",
               "mimeType": "text/html",
@@ -141,7 +142,7 @@ The v2 header, decoded, is the same offer in v2 spelling:
  "resource": {"url": "https://toolshed.lemon-agent.dev/convert/md-html",
               "method": "POST", "description": "Markdown to HTML conversion",
               "mimeType": "text/html", "serviceName": "Toolshed"},
- "accepts": [{"scheme": "exact", "network": "eip155:8453", "amount": "5000",
+ "accepts": [{"scheme": "exact", "network": "eip155:8453", "amount": "4000",
               "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
               "payTo": "0x...", "maxTimeoutSeconds": 60,
               "extra": {"name": "USD Coin", "version": "2"}}],
@@ -153,8 +154,8 @@ The v2 header, decoded, is the same offer in v2 spelling:
 Then:
 
 - `asset` is USDC on Base. `maxAmountRequired` (v1) and `amount` (v2) are the
-  same number in atomic units — 6 decimals, so `"5000"` is $0.005 and `"10000"`
-  is $0.01. Read it from the envelope; do not assume one price across the API.
+  same number in atomic units — 6 decimals, so `"2000"` is $0.002 and `"6000"`
+  is $0.006. Read it from the envelope; do not assume one price across the API.
 - `network` is `base` in v1 and the CAIP-2 `eip155:8453` in v2. Same chain.
 - What you are buying is `outputSchema` in v1 and `extensions.bazaar.info` in
   v2: `input` describes the request the endpoint takes — and in v2 its `body`
@@ -216,8 +217,8 @@ the endpoints. `/robots.txt` sits alongside them.
 
 ## Limits
 
-- **Every call is priced, per tool, in USDC on Base** — $0.005 for the
-  structured-text conversions and $0.01 for the ones that build a DOM or a
+- **Every call is priced, per tool, in USDC on Base** — $0.002 for the
+  structured-text conversions, $0.004 for real parsers, $0.006 for the ones that build a DOM or a
   document tree. There is no allowance to
   spend first: an unpaid call answers `402` with the envelope to pay against,
   and that is the front door. A `429` means one of two other things — that

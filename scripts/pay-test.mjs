@@ -3,7 +3,7 @@
 //  ┌──────────────────────────────────────────────────────────────────────┐
 //  │  THIS SCRIPT SPENDS REAL MONEY.                                      │
 //  │                                                                      │
-//  │  It makes one paid call to the live Toolshed: $0.005-$0.01 USDC on  │
+//  │  It makes one paid call to the live Toolshed: $0.002-$0.006 USDC on │
 //  │  Base, signed with the key in .buyer.env and settled on chain by     │
 //  │  the CDP facilitator. There is no free tier to burn through first —  │
 //  │  the paywall answers on the very first call — so the run spends      │
@@ -157,7 +157,7 @@ console.log(`
   ───────────────────────────────────────────────────────────
   endpoint     ${ENDPOINT}
   buyer        ${account.address}
-  price        per tool, $0.005-$0.01 USDC on Base (read from the 402)
+  price        per tool, $0.002-$0.006 USDC on Base (read from the 402)
   paid calls   1 served conversion — there is no free tier, so the first call is the paid one
   400 probe    ${plannedProbe}
   mode         ${DRY_RUN ? 'DRY RUN — nothing will be spent' : 'LIVE — this spends real USDC'}
@@ -316,7 +316,7 @@ console.log('  2. Paid call — signing an EIP-3009 authorization and retrying.\
 const wallet = createWalletClient({ account, chain: base, transport: http() });
 // wrapFetchWithPayment retries a 402 once: it reads `accepts[0]`, signs the
 // transfer authorization, and re-sends with the X-PAYMENT header. maxValue is a
-// client-side ceiling in atomic units — 10,000 is $0.01, ten times the price, so
+// client-side ceiling in atomic units — 10,000 is $0.01, above every tool price, so
 // a Worker that suddenly asked for more would be refused here rather than paid.
 // It applies per call, and this run makes at most two.
 const fetchWithPayment = wrapFetchWithPayment(fetch, wallet, BigInt(10_000));

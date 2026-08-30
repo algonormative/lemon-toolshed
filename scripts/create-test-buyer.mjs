@@ -79,7 +79,7 @@ console.log(`
 
          node scripts/pay-test.mjs
 
-  A paid conversion costs $0.005-$0.01 (per tool), so $1 is 100-200 of them.
+  A paid conversion costs $0.002-$0.006 (per tool), so $1 buys 166-500 of them.
   You need far less than that; $1 is just the smallest amount that is not
   annoying to send.
 `);
