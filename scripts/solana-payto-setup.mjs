@@ -31,6 +31,19 @@ const PROPERTIES = ['lemon-toolshed', 'tenx402', 'kino402'];
 const FACILITATOR_HOST = 'api.cdp.coinbase.com';
 const SUPPORTED_PATH = '/platform/v2/x402/supported';
 
+// Fill missing credentials from the repo-root .env (gitignored, owner-written).
+// Real env vars win; values are never logged.
+try {
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, join } = await import('node:path');
+  const envPath = join(dirname(dirname(fileURLToPath(import.meta.url))), '.env');
+  for (const line of readFileSync(envPath, 'utf8').split('\n')) {
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  }
+} catch { /* no .env — env vars must carry everything */ }
+
 for (const name of ['CDP_API_KEY_ID', 'CDP_API_KEY_SECRET', 'CDP_WALLET_SECRET']) {
   if (!process.env[name]) {
     console.error(`Missing env var ${name}. See the header comment for the op-injected run command.`);
@@ -83,10 +96,11 @@ if (solanaEntries.length) {
   console.log('will not settle the rail. Check the CDP project/plan first.');
   process.exit(1);
 }
-const feePayerMatch = flat.match(/"feePayer"\s*:\s*"([1-9A-HJ-NP-Za-km-z]{32,44})"/);
-if (feePayerMatch) {
-  console.log(`\nCDP Solana feePayer: ${feePayerMatch[1]}`);
-  console.log('(goes into the chassis accepts entry as extra.feePayer)');
+const feePayers = [...new Set([...flat.matchAll(/"feePayer"\s*:\s*"([1-9A-HJ-NP-Za-km-z]{32,44})"/g)].map((m) => m[1]))];
+if (feePayers.length) {
+  console.log(`\nDistinct feePayers seen: ${feePayers.join(', ')}`);
+  console.log('CAUTION: CDP uses DIFFERENT feePayers per protocol version/network —');
+  console.log('pin each accepts entry to the feePayer of ITS version+network row above.');
 } else {
   console.log('\n⚠ No feePayer field found in /supported — capture it from a live');
   console.log('  402 once the chassis is up, or ask CDP support which address to pin.');
