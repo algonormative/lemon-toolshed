@@ -10,7 +10,7 @@
 #
 #   hosted:              # present = we run this conversion on our server
 #     path: "/convert/<id>"   # must equal /convert/ + the entry id
-#     price: {amount_usd: 0.005, scheme: exact}   # or `free`
+#     price: {amount_usd: 0.002, scheme: exact}   # or `free`
 #     status: live            # or planned
 #
 # Every hosted tool is priced, and the price below is what every call costs:
@@ -27,12 +27,15 @@
 # `install:` field still works and is read as `local.install`, so the entries that
 # predate this split need no edit.
 #
-# PRICES ARE PER TOOL, and as of 2026-08-30 they are no longer uniform. Two
-# bands, and the split is about what a call actually costs us to run:
+# PRICES ARE PER TOOL, and as of 2026-08-30 (second correction, E13) they sit
+# in three bands; the split is about what a call actually costs us to run:
 #
-#   $0.005  a parse-and-re-emit between two structured text formats. One parser,
-#           one serializer, both linear in the input.
-#   $0.01   anything that has to build a DOM or a full document tree first —
+#   $0.002  a parse-and-re-emit between two flat structured text formats
+#           (JSON/YAML/CSV/NDJSON/subtitles). One parser, one serializer,
+#           both linear in the input.
+#   $0.004  document-shaped text: markdown/frontmatter/TOML — a real grammar,
+#           still no tree of unbounded depth.
+#   $0.006  anything that has to build a DOM or a full document tree first —
 #           the HTML tools and the XML reader. More CPU per byte, and a larger
 #           blast radius of input weirdness to have got right.
 #
