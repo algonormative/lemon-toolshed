@@ -185,6 +185,12 @@ routes = [
 # case the facilitator reports it in.
 HOUSE_PAYERS = "0x632ff2f904cc6ab6d741a42014c4c483f328e92f,D7f9EifwoMdfwozWDNLFhBGwecVhryc5fs2SxLK93M45"
 
+# The Solana rail switch (see the long note above): this property's
+# receive-only CDP server account. Enabled 2026-08-31 for the buyer-kit smoke
+# settlement; if that settlement fails, comment this out and redeploy — the
+# envelope reverts to Base-only.
+PAYTO_SOLANA = "7zXRc8sYkhjezbwXQw43beBrKDmhTMA7mkNfqRjdZ6gw"
+
 # The email channel's binding. UNRESTRICTED — deliberately no
 # `destination_address` field, because that would put the owner's personal inbox
 # in a public repo. The recipient comes from the ALERT_EMAIL_TO secret instead,
