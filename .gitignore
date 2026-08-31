@@ -7,3 +7,4 @@ dist/
 # KEY in plaintext — never commit it. (It is chmod 600 as well; see
 # README § Settlement (live).)
 .buyer.env
+.env
