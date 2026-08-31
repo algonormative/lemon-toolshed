@@ -11,12 +11,13 @@ is no free tier — the 402 is the front door, and the payment is the auth.**
 
 An agent posts a file to an HTTP endpoint and gets the converted file back. A
 call carrying no payment answers HTTP 402 on the *first* request, and that 402
-carries an x402 envelope (USDC on Base) naming a live receiving address — in
+carries an x402 envelope (USDC on Base, or on Solana where that rail is
+configured) naming a live receiving address — in
 **both protocol versions at once** since 2026-08-19: v1 in the body, v2 base64
 in a `PAYMENT-REQUIRED` response header. Or HTTP 429 on a deployment with no
 receiving address configured (`PAYTO` unset). A payment presented against that envelope is
 verified with the Coinbase CDP facilitator before the conversion is served, and
-settled on Base immediately afterwards. **You are only charged for conversions
+settled on the rail it was paid on immediately afterwards. **You are only charged for conversions
 that are actually served**: a `400` on input we cannot convert settles nothing,
 and a body over the 256 KB cap is refused with a `413` before an envelope is
 even built.
@@ -416,8 +417,18 @@ printf '%s\n' \
 ## Pricing and payment (x402)
 
 **Every hosted tool is priced, and none of them has a trial.** A call costs
-**$0.002 to $0.006 in USDC on Base** depending on the tool, negotiated with x402
-— and the call that gets asked is the first one, not the fourth.
+**$0.002 to $0.006 in USDC** depending on the tool, negotiated with x402 — and
+the call that gets asked is the first one, not the fourth.
+
+**Two rails, one price.** The envelope's `accepts` array is the authority on
+which chains a call is payable on: **USDC on Base** first, and **USDC on
+Solana** as a second entry on a deployment with `PAYTO_SOLANA` set. USDC is six
+decimals on both, so the atomic amount is identical in both entries and there is
+no cheaper rail — pay whichever one you already hold. A client should take the
+first entry it can pay rather than assuming there is exactly one; a payment
+naming a chain that is not in `accepts` is refused with
+`invalidReason: unsupported_network` and nothing is charged. See
+[The Solana rail](#the-solana-rail).
 
 **Prices stopped being uniform on 2026-08-30.** Three bands, and the split is
 what a call costs us to run: $0.002 for a parse-and-re-emit between two
@@ -460,7 +471,7 @@ where a v2 client looks first and a v1 client never looks at all.
 | **envelope** | the 402's JSON body | `PAYMENT-REQUIRED` response header, base64 |
 | **payment** | `X-PAYMENT` request header | `PAYMENT-SIGNATURE` request header |
 | **price field** | `maxAmountRequired` | `amount` |
-| **network** | `base` | `eip155:8453` (CAIP-2 — the colon is required) |
+| **network** | `base` · `solana` | `eip155:8453` · `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` (CAIP-2 — the colon is required) |
 | **resource** | a URL string inside `accepts[0]` | a top-level object: `url`, `method`, `description`, `mimeType`, `tags`, `serviceName` |
 | **discovery** | `accepts[0].outputSchema` | `extensions.bazaar` — `{ info, schema }` |
 | **facilitator** | same two endpoints, same `{ x402Version, paymentPayload, paymentRequirements }` body | ditto, with `x402Version: 2` and the v2 shapes inside |
@@ -507,6 +518,82 @@ again schema-legally as `extensions.bazaar.info.input.method`. `serviceName` and
 `tags` *are* in `@x402/core` 2.23.0's `ResourceInfoSchema` (32-character
 printable ASCII, at most 5 tags) though not in the older published spec text.
 
+### The Solana rail
+
+Added 2026-08-31, and **gated on `PAYTO_SOLANA`**. Unset — the state this repo
+ships in — and every envelope is the single-entry Base one it has always been,
+byte for byte; the suite pins that with a whole-object deep-equal rather than an
+absence check, because the rail with real settlements on it is the one a second
+rail must not disturb. Set, and each envelope carries a second `accepts` entry:
+
+| | Base | Solana |
+| --- | --- | --- |
+| **v1 `network`** | `base` | `solana` |
+| **v2 `network`** | `eip155:8453` | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` |
+| **`asset`** | `0x8335…2913` (USDC) | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (USDC SPL mint) |
+| **`payTo`** | `PAYTO` | `PAYTO_SOLANA` |
+| **`extra`** | the EIP-712 domain to sign over | `{ feePayer }` — the account that pays the transaction fee |
+| **price** | *identical* — USDC is 6 decimals | *identical* — one atomic amount serves both entries |
+
+**Base is first, in both envelopes.** A buyer takes the first entry it can pay,
+and Base is the rail with a settlement history. Match entries by `network`,
+never by position: the two versions' fee payers are fetched independently and
+fail closed independently, so one version can carry the Solana entry while the
+other omits it.
+
+**The fee payer is fetched, never pinned.** The SVM `exact` scheme has the
+facilitator pay the transaction fee, so the entry must name the account that
+will. CDP draws those from a **pool**: two consecutive authenticated reads of
+`GET /platform/v2/x402/supported` returned *different* addresses for the same
+version+network row (observed 2026-08-31 — `scripts/solana-payto-setup.mjs`
+prints the caution). A pinned constant would therefore be correct on the day it
+was written and silently wrong later, and the failure would surface as buyers'
+payments not verifying. So the Worker reads `/supported` with the same CDP
+bearer JWT it uses for verify and settle, and caches per protocol version — the
+v1 and v2 rows have been seen carrying different fee payers, so one cached
+answer for both would publish a v2 entry naming the v1 payer.
+
+| | |
+| --- | --- |
+| **cache** | in-memory, per isolate, keyed `facilitator|version` |
+| **TTL** | 10 minutes on success, 1 minute on failure |
+| **concurrency** | single flight — a burst of 402s costs one upstream read |
+| **failure** | **fail closed.** No fee payer, no Solana entry: the envelope is Base-only, and no error is surfaced to the caller |
+
+Fail-closed is the whole safety argument. The alternative — publishing the entry
+with a stale or guessed fee payer — is a transaction nobody pays the fee for,
+which reads from the buyer's side as a seller that took a signature and did
+nothing.
+
+**Requirements are selected by (version, network).** Before the second rail the
+facilitator's `paymentRequirements` was chosen by protocol version alone. With
+two entries that is a live bug: a Solana payment checked against the Base terms
+goes to the facilitator with the wrong asset, the wrong `payTo` and the wrong
+network, and comes back invalid however good the payment was. The selection now
+reads the network out of the payload — `payload.network` in v1,
+`payload.accepted.network` in v2 — and matches it to the entry we offered. A
+payload that names no network at all keeps the pre-Solana behaviour and takes
+the first entry. A payload naming a network **not** in `accepts` is refused with
+`invalidReason: unsupported_network`: never a 500, never a settle against terms
+the buyer did not sign.
+
+**The ledger has no `network` column, on purpose.** `settlements` lives on a
+production D1 that this repo has no migration runner for, and adding a column to
+`worker/schema.sql` would apply to a fresh local database and be a no-op on the
+live one — after which every `INSERT` would fail in production while passing
+locally, losing the revenue record to gain a label. The rail is recoverable from
+the row as it stands (a Base `tx_hash` is `0x` hex, a Solana one is a base58
+signature), and the owner **alert** names the chain outright and links to
+`solscan.io` instead of `basescan.org`.
+
+**Still open before the var goes on in production:** the ATA question. The SVM
+`exact` scheme pins the transfer destination to the `payTo`'s canonical USDC
+associated token account, and whether the facilitator creates a missing one is
+unconfirmed. If it does not, each `payTo` needs its ATA created once (~0.002 SOL
+of rent, owner-funded). The sequence is: fund the house Solana buyer, set
+`PAYTO_SOLANA`, watch **one** settlement round-trip with the buyer kit, and only
+then leave it on.
+
 ### The caller key
 
 The counter itself did not go anywhere. `convert_quota` is what `PAID_DAILY` —
@@ -542,6 +629,7 @@ reached.
 | var | read? | effect |
 | --- | --- | --- |
 | `PAYTO` | yes | the receiving address (USDC on Base) named in the 402 envelope. **Unset = there is nowhere to pay**, so unpaid calls answer 429 instead of 402. |
+| `PAYTO_SOLANA` | yes | the base58 receiving address for USDC on Solana. **Unset = the Solana rail is off** and every envelope is Base-only, byte for byte as before. Set, and each envelope carries a second `accepts` entry at the same price. Needs the CDP credentials too — without them the fee-payer read fails and the rail stays off silently. Non-secret: it is a public receive address, and it lives in `wrangler.toml`. See [The Solana rail](#the-solana-rail). |
 | `FREE_TIER_DAILY` | yes | free conversions per caller per UTC day. **Unset = 0 = off**, which is the production default. This var is the **only runtime authority** — the Worker does not read the compiled constant — so setting it takes effect on the next request and `GET /check` reports it immediately, with no rebuild. Anything unparseable, negative or below 1 reads as 0: a misconfigured var must fail towards charging, never towards giving the service away. |
 | `FACILITATOR_URL` | yes | the x402 facilitator base URL. Defaults to `https://api.cdp.coinbase.com/platform/v2/x402`; overridden only by the test suite, which points it at a local mock. |
 | `CDP_API_KEY_ID` | yes | CDP API key id. A **Worker secret**, not a var. |
@@ -550,7 +638,7 @@ reached.
 | `TELEGRAM_CHAT_ID` | yes | owner alerts. A **Worker secret**. Unset = no Telegram channel. |
 | `TELEGRAM_API_BASE` | yes | optional override of the Telegram API root, default `https://api.telegram.org`. Only the test suite sets it, to reach a local mock. |
 | `ALERT_EMAIL_TO` | yes | owner alerts by email. A **Worker secret**, and it must be a **verified Email Routing destination** on the zone. Unset = no email channel. |
-| `HOUSE_PAYERS` | yes | comma-separated wallet addresses whose payments read as a 🧪 test rather than a 🍋💰 sale. Compared lowercased. Non-secret: these are public chain addresses, and it lives in `wrangler.toml`. |
+| `HOUSE_PAYERS` | yes | comma-separated wallet addresses whose payments read as a 🧪 test rather than a 🍋💰 sale. Compared lowercased, so a base58 Solana address matches in any case. Holds both house buyers — the EVM one and the Solana one. Non-secret: these are public chain addresses, and it lives in `wrangler.toml`. |
 
 **`FREE_TIER_DAILY` is only half the switch.** It is what the *Worker* enforces;
 the *static* copy — the page, `catalog.json`, `llms.txt`, `llms-full.txt`,
@@ -676,7 +764,8 @@ facilitator rather than as a header.
 The page publishes the same thing in plain language under **Pricing, and paying
 with USDC** — that there is no trial and nothing to sign up to, what the 402
 carries, that you are charged only for served conversions, the two things an
-agent needs (an x402-capable HTTP client and a wallet key holding USDC on Base),
+agent needs (an x402-capable HTTP client and a wallet key holding USDC on one of
+the rails the envelope names),
 a copy-able `x402-fetch` example, and an honest-status box. The MCP server's
 `toolshed_convert` explains both a 402 and a 429 rather than returning a bare
 error.
@@ -1076,7 +1165,8 @@ free-tier-off branch, that the free tier is **switched off** — every conversio
 is a paid call, priced per tool — and that payment is **live and verified**: a payment
 presented against the 402 envelope is checked with the Coinbase CDP facilitator
 before the conversion is served, a verified call comes back with
-`x-payment-verified: true`, and it settles on Base immediately afterwards. If the
+`x-payment-verified: true`, and it settles on the rail it was paid on
+immediately afterwards. If the
 facilitator cannot be reached, the call is served anyway and says so with
 `x-payment-error` — at these prices the price is a signal, and an outage on our side
 should not turn a paying caller away.
@@ -1482,6 +1572,7 @@ body (see § Worker dependencies).
 ```text
 test/harness.mjs                  boots wrangler dev, owns teardown and D1 access
 test/run.mjs                      the phase runner behind `npm test`
+test/mock-facilitator.mjs         the programmable CDP stand-in: verify, settle, /supported
 test/convert-md-html.test.mjs     per-tool fixture batteries
 test/convert-json-yaml.test.mjs   json -> yaml -> json round-trip properties
 test/convert-yaml-json.test.mjs   block scalars, anchors, comments, tabs
@@ -1493,6 +1584,7 @@ test/quota.test.mjs               the env-gated free tier and its spoof resistan
 test/tier-off.test.mjs            the PRODUCTION default — 402 first, and it writes nothing
 test/x402.test.mjs                the 402 envelope, and PAYTO set with no facilitator
 test/x402-settlement.test.mjs     verify/settle against a mock facilitator + a real client
+test/x402-solana.test.mjs         the dual-rail accepts, the fee-payer fetch, (version, network) selection
 test/beacon.test.mjs              rows, bot drops, salt rotation
 test/live.smoke.mjs               the production smoke (`npm run test:live`)
 ```
@@ -1537,7 +1629,7 @@ children, so killing the node process alone orphans them and leaks the port; the
 harness spawns it `detached` and tears it down with `process.kill(-pid, …)`,
 escalating to `SIGKILL`, plus a best-effort sweep on process exit.
 
-### Why there are four phases
+### Why there are five phases
 
 Two dev vars decide what the product answers, and a dev var is fixed for the life
 of a `wrangler dev` process, so each configuration needs its own worker:
@@ -1547,15 +1639,18 @@ of a `wrangler dev` process, so each configuration needs its own worker:
   tier of N calls per caller per UTC day.
 - **`PAYTO`** — unset means a 429 where a 402 would otherwise go, because there
   is nowhere to pay.
+- **`PAYTO_SOLANA`** — unset means one `accepts` entry, set means two. The
+  Solana suite boots it both ways in one file, which is why it is standalone.
 
-So `npm test` boots four workers and runs them in turn:
+So `npm test` boots five workers and runs them in turn:
 
 | phase | vars | files |
 | --- | --- | --- |
 | 1 — `free tier enabled` | `FREE_TIER_DAILY=3`, `PAYTO` unset | the five convert fixture suites, `protocol`, `quota`, `beacon` |
 | 2 — `production default` | `PAYTO` set, no tier | `tier-off.test.mjs`, `x402.test.mjs` |
 | 3 — `settlement` | `PAYTO` + `FACILITATOR_URL` + fake CDP keys | `x402-settlement.test.mjs` (standalone) |
-| 4 — `alerts` | phase 3's vars + `TELEGRAM_*` + `HOUSE_PAYERS` + `ALERT_EMAIL_TO` | `alerts.test.mjs` (standalone) |
+| 4 — `solana rail` | phase 3's vars, and workers with `PAYTO_SOLANA` set, unset, and a failing `/supported` | `x402-solana.test.mjs` (standalone) |
+| 5 — `alerts` | phase 3's vars + `TELEGRAM_*` + `HOUSE_PAYERS` + `ALERT_EMAIL_TO` | `alerts.test.mjs` (standalone) |
 
 **Phase 1 boots the tier on purpose, for two different reasons.** `quota.test.mjs`
 is there because the tier *is* what it asserts — countdown, UA-rotation

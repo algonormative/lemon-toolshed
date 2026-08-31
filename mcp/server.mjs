@@ -28,8 +28,9 @@ const BASE = (process.env.TOOLSHED_URL || 'https://toolshed.lemon-agent.dev').re
 const NAME = 'lemon-toolshed';
 const VERSION = '0.1.0';
 
-// USDC on Base is 6 decimals, so the atomic amount in an x402 envelope has to be
-// divided down before it is shown to anyone as a price.
+// USDC is 6 decimals on Base AND on Solana, so the atomic amount in an x402
+// envelope divides down the same way whichever rail an entry names, and one
+// price serves both.
 const USDC_DECIMALS = 6;
 
 // How many calls have to be left on a deployment-enabled free tier before a
@@ -71,7 +72,9 @@ const TOOLS = [
       '"md-html"); `input` is the file content, sent as the request body. The converted ' +
       'text comes back. Input is capped at 256 KB. The first call answers HTTP 402 with an ' +
       "x402 envelope — payment is the front door, and the envelope names THAT tool's price in " +
-      'USDC on Base. Prices differ per tool, so the envelope (or toolshed_check) is the only ' +
+      "USDC. The envelope's accepts array lists the rails that price is payable on — USDC on Base " +
+      'first, and USDC on Solana where that deployment has the rail configured, at the same price ' +
+      'on either. Prices differ per tool, so the envelope (or toolshed_check) is the only ' +
       'authority on what a call costs. A 402 is ' +
       'not an error: it is the price. You are only charged for conversions that are actually ' +
       'served — a 400 on malformed input costs nothing. A 429 means either that deployment ' +
@@ -162,7 +165,7 @@ async function convert(args) {
     if (Number.isFinite(left) && left <= LOW_TIER_WARN) {
       return text(
         `${body}\n\n[toolshed: free tier — ${left} conversions left today for this caller. ` +
-          "At zero, calls answer 402 and payment is live: that tool's price in USDC on Base via x402.]"
+          "At zero, calls answer 402 and payment is live: that tool's price in USDC on Base or Solana via x402.]"
       );
     }
   }
@@ -264,7 +267,12 @@ function explainPayment(id, body, res) {
   } catch {
     envelope = null;
   }
-  const offer = (envelope && Array.isArray(envelope.accepts) && envelope.accepts[0]) || null;
+  // EVERY RAIL, not just the first. `accepts` can name more than one chain —
+  // USDC on Base and USDC on Solana at the same price — and the agent reading
+  // this text is deciding which wallet to reach for. Quoting entry zero alone
+  // would tell a Solana-only caller it cannot pay when it can.
+  const offers = (envelope && Array.isArray(envelope.accepts) && envelope.accepts) || [];
+  const offer = offers[0] || null;
 
   const lines = [
     `POST /convert/${id} answered HTTP 402 — the ordinary answer to a call that carried no`,
@@ -273,13 +281,26 @@ function explainPayment(id, body, res) {
   if (offer) {
     lines.push(
       '',
-      'The x402 envelope asks for:',
-      `  price   ${formatAmount(offer.maxAmountRequired)} (${offer.maxAmountRequired} atomic units)`,
-      `  asset   USDC on ${offer.network || 'base'} — ${offer.asset || 'unknown asset'}`,
-      `  payTo   ${offer.payTo || 'unknown address'}`,
-      `  scheme  ${offer.scheme || 'exact'}`,
+      offers.length > 1
+        ? `The x402 envelope asks for ${formatAmount(offer.maxAmountRequired)} (${offer.maxAmountRequired} atomic units), payable on any`
+        : 'The x402 envelope asks for:',
+      ...(offers.length > 1
+        ? [`of ${offers.length} rails — the same price on each. Pay the first one you hold USDC on.`]
+        : [`  price   ${formatAmount(offer.maxAmountRequired)} (${offer.maxAmountRequired} atomic units)`]),
       `  for     ${offer.resource || `${BASE}/convert/${id}`}`
     );
+    for (const rail of offers) {
+      lines.push(
+        '',
+        `  asset   USDC on ${rail.network || 'base'} — ${rail.asset || 'unknown asset'}`,
+        `  payTo   ${rail.payTo || 'unknown address'}`,
+        `  scheme  ${rail.scheme || 'exact'}`,
+        // Solana's `exact` scheme names the account that pays the transaction
+        // fee, and a client builds the transfer around it. On Base `extra` is
+        // the EIP-712 domain instead and the client reads it for itself.
+        ...(rail.extra?.feePayer ? [`  feePayer ${rail.extra.feePayer}`] : [])
+      );
+    }
   } else {
     lines.push('', 'The 402 body could not be parsed as an x402 envelope:', body.trim());
   }
@@ -293,9 +314,11 @@ function explainPayment(id, body, res) {
       ...(envelope.invalidMessage ? [`  ${envelope.invalidMessage}`] : []),
       '',
       'Retrying the same payment payload will be rejected again. Common causes:',
-      '  insufficient_funds                     the paying wallet has too little USDC on Base',
+      '  insufficient_funds                     the paying wallet has too little USDC on that rail',
       '  invalid_exact_evm_payload_signature    the signature does not match the terms above',
       '  malformed_payment_header               X-PAYMENT was not base64-encoded JSON',
+      '  unsupported_network                    the payment names a chain this 402 did not offer;',
+      '                                         pay one of the accepts entries above',
       'Sign a fresh payment against the terms above and retry once.'
     );
   }
@@ -303,7 +326,8 @@ function explainPayment(id, body, res) {
   lines.push(
     '',
     'To pay, retry the request through an x402-capable HTTP client (x402-fetch, the',
-    'x402 SDK, or Coinbase AgentKit) holding a wallet key with USDC on Base. The client',
+    'x402 SDK, or Coinbase AgentKit) holding a wallet key with USDC on one of the rails',
+    'named above — Base, or Solana where the envelope lists it. The client',
     'reads this envelope, signs the payment and retries with an X-PAYMENT header. There',
     'is no login and no account — the payment is the auth. Never ask a person to paste a',
     'private key or seed phrase.',

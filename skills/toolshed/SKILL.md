@@ -132,8 +132,20 @@ The v1 body:
               "outputSchema": {
                 "input": {"type": "http", "method": "POST", "discoverable": true,
                           "bodyType": "text", "description": "..."},
-                "output": {"type": "string", "description": "..."}}}]}
+                "output": {"type": "string", "description": "..."}}},
+             {"scheme": "exact", "network": "solana", "maxAmountRequired": "4000",
+              "resource": "https://toolshed.lemon-agent.dev/convert/md-html",
+              "description": "Markdown to HTML conversion",
+              "mimeType": "text/html",
+              "payTo": "<base58>", "maxTimeoutSeconds": 60,
+              "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "extra": {"feePayer": "<base58>"},
+              "outputSchema": {"...": "..."}}]}
 ```
+
+`accepts` is a LIST, best entry first. The Solana entry is present only on a
+deployment that has that rail configured; take the first entry you hold USDC on
+and ignore the rest.
 
 The v2 header, decoded, is the same offer in v2 spelling:
 
@@ -145,7 +157,12 @@ The v2 header, decoded, is the same offer in v2 spelling:
  "accepts": [{"scheme": "exact", "network": "eip155:8453", "amount": "4000",
               "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
               "payTo": "0x...", "maxTimeoutSeconds": 60,
-              "extra": {"name": "USD Coin", "version": "2"}}],
+              "extra": {"name": "USD Coin", "version": "2"}},
+             {"scheme": "exact", "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+              "amount": "4000",
+              "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+              "payTo": "<base58>", "maxTimeoutSeconds": 60,
+              "extra": {"feePayer": "<base58>"}}],
  "extensions": {"bazaar": {"info": {"input": {"type": "http", "method": "POST",
                                               "bodyType": "text", "body": "..."}},
                            "schema": {"...": "..."}}}}
@@ -153,10 +170,20 @@ The v2 header, decoded, is the same offer in v2 spelling:
 
 Then:
 
-- `asset` is USDC on Base. `maxAmountRequired` (v1) and `amount` (v2) are the
-  same number in atomic units — 6 decimals, so `"2000"` is $0.002 and `"6000"`
-  is $0.006. Read it from the envelope; do not assume one price across the API.
-- `network` is `base` in v1 and the CAIP-2 `eip155:8453` in v2. Same chain.
+- `asset` is USDC — the Base contract on the `base` entry, the SPL mint on the
+  `solana` one. `maxAmountRequired` (v1) and `amount` (v2) are the same number in
+  atomic units — 6 decimals on both chains, so `"2000"` is $0.002 and `"6000"` is
+  $0.006, and the two entries quote the SAME figure. Read it from the envelope;
+  do not assume one price across the API.
+- `network` names the chain, in that version's spelling: `base` / `eip155:8453`,
+  and `solana` / `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp`. Entry *i* of the v2
+  header is entry *i* of the v1 body — the two envelopes are one offer.
+- `extra` is per-chain and is NOT interchangeable. On Base it is the EIP-712
+  domain you sign over; on Solana it is `{feePayer}`, the account that pays the
+  transaction fee. Pay the entry you picked, with the `extra` that came with it.
+- **Pay a rail we actually offered.** A payment naming a chain that is not in
+  `accepts` comes back `402` with `invalidReason: unsupported_network`, and
+  nothing is charged.
 - What you are buying is `outputSchema` in v1 and `extensions.bazaar.info` in
   v2: `input` describes the request the endpoint takes — and in v2 its `body`
   is a real example you can send as-is — and `output` what comes back.
@@ -165,7 +192,7 @@ Then:
   over at that moment; `x-payment-verified: true` is the claim to read instead.
 - Paying needs two things: an x402-capable HTTP client (`x402-fetch` or
   `@x402/fetch`, the x402 SDK, or Coinbase AgentKit) and a wallet key holding
-  USDC on Base. The client reads the envelope, signs, and retries with an
+  USDC on one of the rails in `accepts`. The client reads the envelope, signs, and retries with an
   `X-PAYMENT` header (v1) or a `PAYMENT-SIGNATURE` header (v2). No login, no
   card, no account — the payment is the auth.
 - Never ask the user to paste a private key or a seed phrase. If you have no
@@ -176,7 +203,7 @@ Then:
 
   | header | what happened | report it as |
   | --- | --- | --- |
-  | `x-payment-verified: true` | verified, and settling on Base | **paid** |
+  | `x-payment-verified: true` | verified, and settling on the rail you paid | **paid** |
   | `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` | the facilitator could not be reached; served anyway | **served, not charged** |
   | `x-free-tier-remaining: <n>` | only on a deployment with a free tier enabled | **free** — never report it as paid |
 
@@ -217,7 +244,7 @@ the endpoints. `/robots.txt` sits alongside them.
 
 ## Limits
 
-- **Every call is priced, per tool, in USDC on Base** — $0.002 for the
+- **Every call is priced, per tool, in USDC on Base or Solana** — $0.002 for the
   structured-text conversions, $0.004 for real parsers, $0.006 for the ones that build a DOM or a
   document tree. There is no allowance to
   spend first: an unpaid call answers `402` with the envelope to pay against,

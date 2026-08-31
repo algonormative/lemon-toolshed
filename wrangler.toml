@@ -67,6 +67,9 @@ routes = [
 #
 # [vars]
 # PAYTO = "0x..."            # receiving address for USDC on Base
+# PAYTO_SOLANA = "..."       # OPTIONAL. Base58 receiving address for USDC on
+#                            # Solana. UNSET = the Solana rail is off and every
+#                            # envelope is Base-only, byte for byte as before.
 # FACILITATOR_URL = "..."    # OPTIONAL override; defaults to the CDP facilitator
 #                            # (https://api.cdp.coinbase.com/platform/v2/x402).
 #                            # Only the test suite sets it, to reach a local mock.
@@ -105,6 +108,28 @@ routes = [
 # facilitator-unconfigured`, and every one is recorded in `settlements`. That is
 # a working state, and it is also a revenue-is-zero state — see README
 # § Settlement (live).
+#
+# ON PAYTO_SOLANA, and why it is not set here yet (2026-08-31).
+#
+# Setting it turns every 402 into a two-entry offer: USDC on Base first, USDC on
+# Solana second, same price, same atomic amount (both mints are 6 decimals). The
+# receiving address for this property is
+#
+#   7zXRc8sYkhjezbwXQw43beBrKDmhTMA7mkNfqRjdZ6gw
+#
+# a receive-only CDP server account created by scripts/solana-payto-setup.mjs.
+# Set in [vars] below since 2026-08-31 (buyer funded, smoke settlement run).
+# One caveat stays live until that settlement confirms: the SVM `exact` scheme
+# pins the transfer destination to the payTo's canonical USDC associated token
+# account, and whether the facilitator creates a missing ATA is unconfirmed —
+# if it does not, each payTo needs its ATA created once (~0.002 SOL of rent,
+# owner-funded), and until then the var comes back out.
+#
+# The rail also needs the CDP credentials below. Without them the Worker cannot
+# make the authenticated GET /supported read that tells it which account will
+# pay the Solana transaction fee, and it fails CLOSED — no Solana entry, a
+# Base-only envelope, no error. Setting PAYTO_SOLANA on a deployment with no CDP
+# keys therefore changes nothing at all.
 #
 # `settlements` is a NEW TABLE. Run the migration in README § Migration — the
 # settlements table before deploying a Worker that verifies payments.
@@ -146,9 +171,19 @@ routes = [
 # Comma-separated; compared lowercased, so the case written here does not
 # matter.
 #
-# This is the throwaway buyer from `npm run buyer:create` (README § The buyer
-# test kit) — the key behind the live settlements this rail has already proven.
-HOUSE_PAYERS = "0x632ff2f904cc6ab6d741a42014c4c483f328e92f"
+# Two entries, one per rail:
+#
+#   0x632f…  the throwaway EVM buyer from `npm run buyer:create` (README § The
+#            buyer test kit) — the key behind the live settlements the Base rail
+#            has already proven.
+#   D7f9…    the house SOLANA buyer, a CDP server account created 2026-08-31 by
+#            scripts/solana-payto-setup.mjs. Estate-wide: the same address goes
+#            into every property's HOUSE_PAYERS. It is a BUYER and never a payTo.
+#
+# Base58 is case-SENSITIVE where a hex address is not — but isHousePayer()
+# lowercases both sides before comparing, so the Solana address matches whatever
+# case the facilitator reports it in.
+HOUSE_PAYERS = "0x632ff2f904cc6ab6d741a42014c4c483f328e92f,D7f9EifwoMdfwozWDNLFhBGwecVhryc5fs2SxLK93M45"
 
 # The email channel's binding. UNRESTRICTED — deliberately no
 # `destination_address` field, because that would put the owner's personal inbox

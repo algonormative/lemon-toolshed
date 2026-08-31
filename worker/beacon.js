@@ -123,6 +123,33 @@ const X402_TIMEOUT_SECONDS = 60;
 const NETWORK_V1 = 'base';
 const NETWORK_V2 = 'eip155:8453';
 
+// ------------------------------------------------------------------ the second rail
+//
+// SOLANA, added 2026-08-31 and ENV-GATED ON `PAYTO_SOLANA`. With that var unset
+// this Worker behaves exactly as it did before — one accepts entry, Base — and
+// the suite pins that byte for byte, because a second rail that quietly changed
+// the first would be the expensive kind of regression.
+//
+// USDC on Solana is ALSO 6 decimals, so one price serves both rails and the
+// atomic amount is identical in both entries. That is not a coincidence worth
+// relying on silently: if a third rail ever has different decimals, the amount
+// has to be computed per rail rather than shared.
+//
+// Two spellings again, same rule as Base: `solana` in v1, the CAIP-2
+// `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` (mainnet-beta genesis hash,
+// truncated per CAIP-30) in v2. Confirmed first-party against CDP's
+// authenticated /supported, 2026-08-31.
+const USDC_SOLANA = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const NETWORK_SOLANA_V1 = 'solana';
+const NETWORK_SOLANA_V2 = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp';
+
+// v1 network name → v2 CAIP-2 name. requirementsV2() reads this rather than a
+// constant, which is what lets one projection serve both rails.
+const NETWORK_V2_OF = {
+  [NETWORK_V1]: NETWORK_V2,
+  [NETWORK_SOLANA_V1]: NETWORK_SOLANA_V2,
+};
+
 // The v2 `resource` block's service identity. `serviceName` is capped at 32
 // printable-ASCII characters and `tags` at 5 entries of 32 (ResourceInfoSchema
 // in @x402/core 2.23.0).
@@ -397,7 +424,7 @@ async function handleConvert(request, env, path, ctx) {
   // Rung 2 is deliberately NOT consulted here. It is a bound on D1 writes, and
   // this path performs none; making a doomsday day answer 503 instead of 402
   // would trade a free, correct answer for an expensive, wrong one.
-  if (tier === 0 && !presented) return overQuota(entry, conv, { payTo, tier });
+  if (tier === 0 && !presented) return overQuota(env, entry, conv, { payTo, tier });
 
   // --- the conversion budget ---------------------------------------------
   const db = env.DB;
@@ -458,19 +485,25 @@ async function handleConvert(request, env, path, ctx) {
       // NOTHING FREE LEFT — either the tier is spent or there is no tier.
       // Without somewhere to pay, or without a payment, there is nothing to
       // verify and the answer is the 402/429.
-      if (!payTo || !presented) return overQuota(entry, conv, { payTo, tier, now, dayStart });
+      if (!payTo || !presented) return overQuota(env, entry, conv, { payTo, tier, now, dayStart });
 
       const price = entry.hosted.price;
-      const requirements = paymentRequirements(entry, conv, price, payTo);
+      const offer = await paymentOffer(env, entry, conv, price, payTo);
+      // The PRIMARY rail's v1 requirements: Base. It is what the ledger amount,
+      // the `resource` a settle body is completed with and the 402 envelope's
+      // service identity all come from, none of which differ per rail.
+      const requirements = offer.v1[0];
 
-      // VERSION IS DECIDED HERE, ONCE, and everything downstream follows it:
-      // which shape the facilitator sees on verify and on settle, and which
-      // `resource` a settle body is completed with. It is read out of the
-      // PAYLOAD rather than out of the header it arrived in — see
-      // presentedPayment().
+      // VERSION AND RAIL ARE DECIDED HERE, ONCE, and everything downstream
+      // follows: which shape the facilitator sees on verify and on settle, and
+      // which of the entries we offered the payment is checked against. Both
+      // facts are read out of the PAYLOAD rather than out of the header it
+      // arrived in — see presentedPayment() and selectRequirements().
       const payment = presentedPayment(request);
-      const facRequirements = payment?.version === 2 ? requirementsV2(requirements) : requirements;
-      const verdict = await verifyPayment(env, payment, facRequirements);
+      const facRequirements = selectRequirements(offer, payment);
+      const verdict = facRequirements
+        ? await verifyPayment(env, payment, facRequirements)
+        : unofferedNetwork(offer, payment);
 
       // REJECTED. No conversion is served, so no quota is claimed and no event
       // is written — and the 402 names why, so the caller can fix it.
@@ -485,7 +518,7 @@ async function handleConvert(request, env, path, ctx) {
           txHash: null,
           error: verdict.reason,
         });
-        return paymentRequired(requirements, conv, {
+        return paymentRequired(offer, conv, {
           error: 'the payment presented was not accepted',
           invalidReason: verdict.reason,
           invalidMessage: verdict.message ?? null,
@@ -507,6 +540,10 @@ async function handleConvert(request, env, path, ctx) {
           requirements,
           facRequirements,
           version: payment.version,
+          // The rail this payment is on, for the alert's explorer link. It is
+          // taken from the requirements we SELECTED, never from the payload —
+          // the caller does not get to relabel which chain it paid on.
+          network: facRequirements.network,
           payload: verdict.payload,
           payer: verdict.payer,
           tool: id,
@@ -539,6 +576,7 @@ async function handleConvert(request, env, path, ctx) {
           tool: id,
           payer: verdict.payer,
           amount: requirements.maxAmountRequired,
+          network: facRequirements.network,
           error: publicReason(verdict.unavailable),
         };
       }
@@ -634,6 +672,11 @@ const tooLarge = () =>
 //   PAYTO unset            → HTTP 429. There is nowhere to pay, so the answer
 //                            says exactly that instead of sending a 402 nobody
 //                            can satisfy.
+//
+// DUAL-RAIL as of 2026-08-31, and gated on a second var: with PAYTO_SOLANA set,
+// every envelope offers USDC on Base AND USDC on Solana — same price, same
+// atomic amount (both mints are 6 decimals), Base first. With it unset nothing
+// about the envelope changes. See paymentOffer() and selectRequirements().
 //
 // DUAL-STACK, and the two versions do not share a transport (2026-08-19):
 //
@@ -738,10 +781,10 @@ function servedHeaders({ kind, presented, remaining, error }) {
  *              is deliberately no Retry-After — a header promising that midnight
  *              fixes this would be a lie a client would obey.
  */
-function overQuota(entry, conv, { payTo, tier, now, dayStart }) {
+async function overQuota(env, entry, conv, { payTo, tier, now, dayStart }) {
   const price = entry.hosted.price;
   if (payTo && price !== 'free') {
-    return paymentRequired(paymentRequirements(entry, conv, price, payTo), conv, {
+    return paymentRequired(await paymentOffer(env, entry, conv, price, payTo), conv, {
       error: 'X-PAYMENT header is required',
       // v2 renamed the header, so the v1 sentence would name the wrong thing.
       // "Payment required" is what x402's own resource server puts here for an
@@ -807,8 +850,10 @@ function paidCeilingReached({ now, dayStart }) {
 }
 
 /**
- * The x402 paymentRequirements for one tool — ONE definition, used by both the
- * 402 envelope and the facilitator calls.
+ * The x402 paymentRequirements for one tool ON BASE — ONE definition, used by
+ * both the 402 envelope and the facilitator calls. Every other rail is built
+ * from this object rather than assembled separately (see paymentOffer), which
+ * is what keeps the invariant below true across rails as well as versions.
  *
  * They have to be the same object down to the last field. The client signs a
  * payment against what the envelope advertised, and the facilitator recovers
@@ -857,6 +902,268 @@ function paymentRequirements(entry, conv, price, payTo) {
   };
 }
 
+// ------------------------------------------------------------------ the offer
+//
+// EVERY RAIL THIS DEPLOYMENT CAN BE PAID ON, in both protocol spellings, built
+// once per request and used for all three things that must agree: the 402
+// envelope, the facilitator's verify body and its settle body.
+//
+//   { v1: [ …v1 requirements objects… ], v2: [ …v2 accepts entries… ] }
+//
+// BASE IS ALWAYS FIRST, in both lists, and that ordering is a product decision
+// rather than a tidiness one: a buyer takes the first entry it can pay, and Base
+// is the rail with a settlement history. A Solana-only buyer walks the list and
+// finds its entry second; a Base buyer never notices the list grew.
+//
+// The two lists are indexed by protocol version rather than zipped into pairs
+// because a rail can be offerable in one version and not the other: the v1 and
+// v2 Solana feePayers come from different /supported rows and are fetched
+// independently, so one can be known while the other is not. Publishing an entry
+// whose feePayer we do not have would be worse than publishing no entry — the
+// buyer would sign a transaction nobody will pay the fee for.
+async function paymentOffer(env, entry, conv, price, payTo) {
+  const base = paymentRequirements(entry, conv, price, payTo);
+  const offer = { v1: [base], v2: [requirementsV2(base)] };
+
+  // THE WHOLE GATE. Unset means this function has done nothing new: no fetch,
+  // no second entry, no behaviour change anywhere downstream.
+  const solanaPayTo = env?.PAYTO_SOLANA || '';
+  if (!solanaPayTo) return offer;
+
+  // Spread rather than re-assembled, so the Solana entry is the same object
+  // shape in the same key order as the Base one — the two envelopes cannot
+  // disagree about anything except what a different chain requires.
+  const solana = {
+    ...base,
+    network: NETWORK_SOLANA_V1,
+    payTo: solanaPayTo,
+    asset: USDC_SOLANA,
+    extra: null, // replaced per version below; never published as null
+  };
+
+  // FAIL CLOSED, per version. A fetch that failed, timed out or answered
+  // without the row we need leaves `feePayer` null and the entry is simply not
+  // offered — Base-only, exactly as before the var was set. Never a stale
+  // guess, never an entry with no feePayer.
+  const [v1FeePayer, v2FeePayer] = await Promise.all([
+    solanaFeePayer(env, 1),
+    solanaFeePayer(env, 2),
+  ]);
+  if (v1FeePayer) offer.v1.push({ ...solana, extra: { feePayer: v1FeePayer } });
+  if (v2FeePayer) offer.v2.push(requirementsV2(solana, { feePayer: v2FeePayer }));
+
+  return offer;
+}
+
+/**
+ * Which entry of an offer a presented payment is to be checked against.
+ *
+ * THIS IS THE FUNCTION THE SECOND RAIL EXISTS TO GET RIGHT. Before Solana there
+ * was one entry and the only question was which protocol shape to send, so the
+ * selection was `version === 2 ? requirementsV2(r) : r`. With two entries that
+ * is not enough: a Solana payment checked against the Base requirements is
+ * handed to the facilitator with the wrong asset, the wrong payTo and the wrong
+ * network, and comes back invalid however good the payment was. So the choice is
+ * on BOTH axes — the protocol version picks the list, the network named by the
+ * payload picks the entry within it.
+ *
+ * A payload that names NO network keeps the pre-Solana behaviour and takes the
+ * first entry, which is Base. That is not a guess: it is what this Worker did
+ * for every payload before today, and a v1 payload with the field missing has
+ * always been treated as the one rail on offer.
+ *
+ * A payload that NAMES a network we did not offer returns null, and the caller
+ * turns that into the ordinary invalid-payment refusal. Never a 500, and never a
+ * settle against terms the buyer did not sign.
+ */
+function selectRequirements(offer, payment) {
+  if (!payment?.decoded) return offer.v1[0]; // undecodable: verifyPayment rejects it
+  const entries = payment.version === 2 ? offer.v2 : offer.v1;
+  if (!entries.length) return null;
+
+  const wanted = payment.version === 2 ? payment.decoded.accepted?.network : payment.decoded.network;
+  if (typeof wanted !== 'string' || !wanted) return entries[0];
+  const selected = entries.find((e) => e.network === wanted) || null;
+
+  // THE feePAYER THE BUYER SIGNED AGAINST WINS. The pool rotates (see the
+  // feePayer section below), and the 402 that quoted this payment may have
+  // carried a different pool address than this isolate's cache holds NOW —
+  // the buyer's transaction is built against the one in ITS 402, and checking
+  // it against a fresher one rejects a perfectly good payment. For v2 the
+  // payload echoes the accepted entry, so adopt its feePayer — but ONLY its
+  // feePayer, and only when every other term (asset, payTo, amount, scheme)
+  // matches what we offer: the buyer does not get to rename any term we
+  // charge on, and a forged feePayer fails at the facilitator, which will not
+  // sign as an account it does not control. v1 payloads carry no echo; a
+  // rotation there self-heals on retry against a fresh 402.
+  if (
+    selected &&
+    payment.version === 2 &&
+    selected.network === NETWORK_SOLANA_V2 &&
+    typeof payment.decoded.accepted?.extra?.feePayer === 'string' &&
+    payment.decoded.accepted.extra.feePayer &&
+    payment.decoded.accepted.asset === selected.asset &&
+    payment.decoded.accepted.payTo === selected.payTo &&
+    payment.decoded.accepted.amount === selected.amount &&
+    payment.decoded.accepted.scheme === selected.scheme
+  ) {
+    return { ...selected, extra: { feePayer: payment.decoded.accepted.extra.feePayer } };
+  }
+  return selected;
+}
+
+/** The refusal for a payment naming a network this response did not offer. */
+function unofferedNetwork(offer, payment) {
+  const offered = (payment?.version === 2 ? offer.v2 : offer.v1).map((e) => e.network).join(', ');
+  const named = payment?.version === 2 ? payment.decoded?.accepted?.network : payment.decoded?.network;
+  return {
+    rejected: true,
+    reason: 'unsupported_network',
+    message: `this resource is offered on ${offered || 'no network'}; the payment names ${JSON.stringify(named)}`,
+    payer: payerOf(payment?.decoded),
+  };
+}
+
+// ------------------------------------------------------------------ feePayer
+//
+// The Solana `exact` scheme has the facilitator pay the transaction fee, so the
+// accepts entry has to name the account that will: `extra.feePayer`. It is not a
+// constant and it must never be treated as one — CDP draws them from a POOL, and
+// two consecutive reads of /supported returned DIFFERENT addresses for the same
+// version+network row (observed 2026-08-31, see scripts/solana-payto-setup.mjs).
+// A pinned address is therefore a slow-motion outage: correct the day it is
+// written, wrong at some unannounced later date, and the failure shows up as
+// buyers' payments not verifying.
+//
+// So it is FETCHED, from the same facilitator and with the same CDP JWT
+// machinery the verify and settle calls use, and cached briefly in the isolate.
+// Three properties, and each is there for a specific failure:
+//
+//   PER VERSION. The v1 `solana` row and the v2 `solana:…` row are separate
+//   rows and have been seen carrying different feePayers, so they are cached
+//   under separate keys and an entry is published with its OWN version's value.
+//
+//   SINGLE FLIGHT. One /supported call satisfies every waiter in the isolate.
+//   The 402 is the hot path here — it is what Bazaar health-probes — and a
+//   burst of unpaid calls must not become a burst of upstream requests.
+//
+//   NEGATIVELY CACHED, briefly. A failure is remembered for a minute rather
+//   than retried per request, so a /supported outage costs Base-only envelopes
+//   and not one upstream call per 402.
+const SUPPORTED_TTL_MS = 10 * 60 * 1000;
+const SUPPORTED_FAILURE_TTL_MS = 60 * 1000;
+// The 402 is on the critical path, so this gets the same hard cap verify does.
+const SUPPORTED_TIMEOUT_MS = 2_000;
+
+// key `${facilitator base}|v${version}` → { feePayer: string|null, expiresAt }.
+// Per-isolate and deliberately unbounded-in-name-only: the key space is two
+// entries per facilitator, and a Worker has one.
+const feePayerCache = new Map();
+let supportedInFlight = null;
+
+const facilitatorBase = (env) =>
+  (env.FACILITATOR_URL || DEFAULT_FACILITATOR_URL).replace(/\/+$/, '');
+
+const feePayerKey = (base, version) => `${base}|v${version}`;
+
+/** The cached feePayer for one protocol version, refreshing it if it is stale. */
+async function solanaFeePayer(env, version) {
+  const key = feePayerKey(facilitatorBase(env), version);
+  const hit = feePayerCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.feePayer;
+
+  await refreshSupported(env);
+
+  const fresh = feePayerCache.get(key);
+  return fresh && fresh.expiresAt > Date.now() ? fresh.feePayer : null;
+}
+
+/** One /supported read at a time per isolate, whatever asks for it. */
+function refreshSupported(env) {
+  if (supportedInFlight) return supportedInFlight;
+  supportedInFlight = fetchSupported(env).then(
+    () => {
+      supportedInFlight = null;
+    },
+    () => {
+      supportedInFlight = null;
+    }
+  );
+  return supportedInFlight;
+}
+
+/**
+ * GET /supported, authenticated, and write both versions' feePayers to the
+ * cache. NEVER THROWS: every failure writes a negative entry, which is what
+ * makes "no Solana entry" the answer rather than a 500 on the 402 path.
+ */
+async function fetchSupported(env) {
+  const base = facilitatorBase(env);
+  const url = `${base}/supported`;
+  let entries = null;
+
+  try {
+    const authorization = await cdpAuthHeader(env, 'GET', url);
+    // No credentials means no authenticated read, and an unauthenticated one
+    // does not answer. Same fail-closed path as a network error.
+    if (authorization) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), SUPPORTED_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, { method: 'GET', headers: { authorization }, signal: controller.signal });
+        if (res.status === 200) entries = supportedEntries(await res.json());
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  } catch {
+    /* abort, DNS, TLS, unparseable JSON — all one bucket: we could not ask */
+  }
+
+  const now = Date.now();
+  for (const version of [1, 2]) {
+    const feePayer = entries ? solanaFeePayerIn(entries, version) : null;
+    feePayerCache.set(feePayerKey(base, version), {
+      feePayer,
+      expiresAt: now + (feePayer ? SUPPORTED_TTL_MS : SUPPORTED_FAILURE_TTL_MS),
+    });
+  }
+}
+
+/**
+ * The list of supported kinds, whatever CDP calls it today.
+ *
+ * Read defensively on purpose: this is one field name in one upstream document,
+ * and getting it wrong costs a rail rather than raising an error. The same four
+ * spellings scripts/solana-payto-setup.mjs probes for.
+ */
+function supportedEntries(data) {
+  const list = data?.kinds ?? data?.accepts ?? data?.supported ?? data;
+  return Array.isArray(list) ? list : [];
+}
+
+/**
+ * The Solana `exact` feePayer for one protocol version, or null.
+ *
+ * Matched on x402Version + network + scheme. The network SPELLING already
+ * implies the version, so a row that omits `x402Version` is still accepted —
+ * but a row that states a different one is not, because the two rows are
+ * exactly what carry different feePayers.
+ */
+function solanaFeePayerIn(entries, version) {
+  const network = version === 2 ? NETWORK_SOLANA_V2 : NETWORK_SOLANA_V1;
+  const row = entries.find(
+    (e) =>
+      e &&
+      typeof e === 'object' &&
+      e.network === network &&
+      e.scheme === 'exact' &&
+      (e.x402Version === undefined || e.x402Version === version)
+  );
+  const feePayer = row?.extra?.feePayer;
+  return typeof feePayer === 'string' && feePayer ? feePayer : null;
+}
+
 // ------------------------------------------------------------------ x402 v2
 //
 // The v2 view of the SAME facts. Everything below is derived from the v1
@@ -880,18 +1187,28 @@ function paymentRequirements(entry, conv, price, payTo) {
 // facilitator validates the shape it is handed.
 
 /**
- * The v2 `accepts[0]` entry. Exactly the fields PaymentRequirementsV2Schema
+ * One v2 `accepts` entry. Exactly the fields PaymentRequirementsV2Schema
  * defines — scheme, network, amount, asset, payTo, maxTimeoutSeconds, extra.
+ *
+ * The network is looked up from the v1 spelling rather than hard-coded, so the
+ * same projection serves both rails: `base` → `eip155:8453`, `solana` →
+ * `solana:5eykt4…`.
+ *
+ * `extra` is overridable for ONE reason, and it is the Solana feePayer: the v1
+ * and v2 rows of CDP's /supported have been seen naming different fee-paying
+ * accounts, so the v2 entry must be able to carry its own. Base passes nothing
+ * and keeps the v1 EIP-712 domain unchanged, which is what makes this edit
+ * invisible to the rail that already has settlements on it.
  */
-function requirementsV2(requirements) {
+function requirementsV2(requirements, extra = requirements.extra) {
   return {
     scheme: requirements.scheme,
-    network: NETWORK_V2,
+    network: NETWORK_V2_OF[requirements.network],
     amount: requirements.maxAmountRequired,
     asset: requirements.asset,
     payTo: requirements.payTo,
     maxTimeoutSeconds: requirements.maxTimeoutSeconds,
-    extra: requirements.extra,
+    extra,
   };
 }
 
@@ -1005,14 +1322,20 @@ function sampleOutput(conv) {
   return out;
 }
 
-/** The whole v2 PaymentRequired envelope, ready to base64 into the header. */
-function paymentRequiredV2(requirements, conv, error) {
+/**
+ * The whole v2 PaymentRequired envelope, ready to base64 into the header.
+ *
+ * `resource` and `extensions` describe WHAT is being sold and are the same
+ * whichever chain pays for it, so they are built from the primary rail's v1
+ * requirements. Only `accepts` is per-rail.
+ */
+function paymentRequiredV2(offer, conv, error) {
   return {
     x402Version: 2,
     ...(error ? { error } : {}),
-    resource: resourceInfoV2(requirements),
-    accepts: [requirementsV2(requirements)],
-    extensions: bazaarExtension(requirements, conv),
+    resource: resourceInfoV2(offer.v1[0]),
+    accepts: offer.v2,
+    extensions: bazaarExtension(offer.v1[0], conv),
   };
 }
 
@@ -1025,9 +1348,9 @@ function paymentRequiredV2(requirements, conv, error) {
  * client never looks at all. `no-store` because an envelope is per-request:
  * a cached 402 hands the next caller someone else's terms.
  */
-function paymentRequired(requirements, conv, { v2Error, ...body }) {
-  return json({ x402Version: 1, ...body, accepts: [requirements] }, 402, {
-    [PAYMENT_REQUIRED_HEADER]: base64Json(paymentRequiredV2(requirements, conv, v2Error)),
+function paymentRequired(offer, conv, { v2Error, ...body }) {
+  return json({ x402Version: 1, ...body, accepts: offer.v1 }, 402, {
+    [PAYMENT_REQUIRED_HEADER]: base64Json(paymentRequiredV2(offer, conv, v2Error)),
     'cache-control': 'no-store',
   });
 }
@@ -1137,7 +1460,7 @@ async function verifyPayment(env, payment, requirements) {
  * Never throws, for the same reason as above and one more: it runs inside
  * ctx.waitUntil, where an exception is invisible.
  */
-async function settleAndRecord(env, db, { requirements, facRequirements, version, payload, payer, tool }) {
+async function settleAndRecord(env, db, { requirements, facRequirements, version, network, payload, payer, tool }) {
   let settleOk = 0;
   let txHash = null;
   let error = null;
@@ -1207,6 +1530,11 @@ async function settleAndRecord(env, db, { requirements, facRequirements, version
     tool,
     payer,
     amount: requirements.maxAmountRequired,
+    // Which rail settled, so the explorer link points at a chain that has heard
+    // of this transaction. `tx_hash` alone no longer says: a Base hash is 0x
+    // hex and a Solana signature is base58, and guessing from the shape of a
+    // string is not something a money alert should do.
+    network,
     settleOk,
     txHash,
     error,
@@ -1354,6 +1682,13 @@ async function recordSettlementSafely(db, row) {
   }
 }
 
+// THE RAIL IS NOT A COLUMN, and that is deliberate rather than an oversight.
+// `settlements` exists on a live D1 that this repo has no migration runner for,
+// and adding a column here without one would make every INSERT fail in
+// production while passing locally — losing the revenue record to gain a label.
+// The rail is recoverable from the row as it stands: a Base `tx_hash` is 0x hex
+// and a Solana one is a base58 signature. The owner ALERT names the chain
+// outright (see alertMessage), which is where a human actually reads it.
 async function recordSettlement(db, { now, tool, payer, amount, verifyOk, settleOk, txHash, error }) {
   await db
     .prepare(
@@ -1423,6 +1758,25 @@ function formatUsdc(atomic) {
 }
 
 /**
+ * The rail a settlement happened on, from either spelling of its network.
+ *
+ * Both protocol versions are handled because the value arrives from whichever
+ * requirements object was selected: `solana` (v1) and `solana:5eykt4…` (v2) are
+ * one chain. Anything unrecognised reads as Base, which is the rail that has
+ * always been here and the one an alert with a 0x hash belongs to.
+ */
+const railOf = (network) => (String(network || '').startsWith('solana') ? 'solana' : 'base');
+
+/** Where a human goes to look at this transaction. One per rail. */
+const EXPLORER = {
+  base: (tx) => `https://basescan.org/tx/${tx}`,
+  solana: (tx) => `https://solscan.io/tx/${tx}`,
+};
+
+/** "USDC on Base" / "USDC on Solana", for the alert body's amount line. */
+const RAIL_LABEL = { base: 'Base', solana: 'Solana' };
+
+/**
  * Is this payer one of the house's own wallets?
  *
  * HOUSE_PAYERS is a non-secret var of public chain addresses (wrangler.toml),
@@ -1477,8 +1831,9 @@ function alertHeadline(env, alert) {
 /** The headline plus the detail a human needs before deciding to care. */
 function alertMessage(env, alert) {
   const subject = alertHeadline(env, alert);
+  const rail = railOf(alert.network);
   const lines = [subject, '', `tool     ${alert.tool}`];
-  lines.push(`amount   ${formatUsdc(alert.amount)}  (${alert.amount} atomic USDC on Base)`);
+  lines.push(`amount   ${formatUsdc(alert.amount)}  (${alert.amount} atomic USDC on ${RAIL_LABEL[rail]})`);
   lines.push(`payer    ${alert.payer || 'unknown'}`);
 
   if (alert.kind === 'unverified') {
@@ -1495,7 +1850,7 @@ function alertMessage(env, alert) {
         : `settled  NO — ${alert.error || 'unknown'} (verified, so the caller was served)`
     );
     if (alert.settleOk === 1 && alert.txHash) {
-      lines.push(`explorer https://basescan.org/tx/${alert.txHash}`);
+      lines.push(`explorer ${EXPLORER[rail](alert.txHash)}`);
     }
   }
 

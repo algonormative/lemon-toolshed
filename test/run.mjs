@@ -85,6 +85,15 @@ const PHASES = [
     files: ['test/x402-settlement.test.mjs'],
   },
   {
+    // STANDALONE for the same reason as settlement, and one more: the rails a
+    // worker offers are fixed by PAYTO_SOLANA for the life of its process, and
+    // this suite needs workers with it set, with it unset, and with a
+    // /supported that fails — three configurations it boots for itself.
+    name: 'solana rail (dual-rail accepts + mock facilitator)',
+    standalone: true,
+    files: ['test/x402-solana.test.mjs'],
+  },
+  {
     // STANDALONE for the same reason as settlement, twice over: this suite runs
     // a mock facilitator AND a mock Telegram, both on ports it only learns at
     // startup, so FACILITATOR_URL and TELEGRAM_API_BASE cannot be known out

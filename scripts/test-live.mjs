@@ -379,7 +379,8 @@ function assertEnvelopeV2(res, offer, tool) {
   }
 
   assert(env.x402Version === 2, `the v2 envelope says x402Version ${JSON.stringify(env.x402Version)}`);
-  assert(Array.isArray(env.accepts) && env.accepts.length === 1, 'the v2 envelope has no single accepts entry');
+  // Same rails in the same order as the v1 body: entry i here is entry i there.
+  assert(Array.isArray(env.accepts) && env.accepts.length >= 1, 'the v2 envelope offers no accepts entry');
   const v2 = env.accepts[0];
 
   // CAIP-2. "base" is the v1 spelling and makes a v2 envelope invalid — a
@@ -439,10 +440,23 @@ async function probeGate(res, tool) {
     const body = parseJson(text, 'the 402 body');
     assert(body.x402Version === 1, `x402Version is ${JSON.stringify(body.x402Version)}, expected 1`);
     assert(Array.isArray(body.accepts), 'accepts is not an array');
-    assert(
-      body.accepts.length === 1,
-      `accepts has ${body.accepts.length} entries, expected exactly 1`
-    );
+    // ONE OR MORE, BASE FIRST. This used to demand exactly one entry, which was
+    // right while there was one rail. With the Solana rail configured the
+    // envelope carries two, and what still has to hold is the ORDER — a buyer
+    // takes the first entry it can pay, and Base is the rail with a settlement
+    // history — plus the rule that every entry quotes the same price, since a
+    // second rail must never be a second price.
+    assert(body.accepts.length >= 1, 'accepts is empty — there is nothing to pay');
+    for (const rail of body.accepts.slice(1)) {
+      assert(
+        rail.maxAmountRequired === body.accepts[0].maxAmountRequired,
+        `rail ${rail.network} quotes ${rail.maxAmountRequired}, not the ${body.accepts[0].maxAmountRequired} the first entry does`
+      );
+      assert(
+        rail.resource === body.accepts[0].resource,
+        `rail ${rail.network} names a different resource from the first entry`
+      );
+    }
     const v1 = assertEnvelope(body.accepts[0], tool);
     // Dual-stack: the same 402 has to satisfy a v2 buyer too, and that half
     // travels in a header this function is the only live reader of.

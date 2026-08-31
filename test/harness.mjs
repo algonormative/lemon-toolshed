@@ -30,7 +30,7 @@
 
 import { spawn, execFile } from 'node:child_process';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,6 +77,16 @@ const varsKey = (vars = {}) =>
 // 402 envelope has a `payTo` to assert on.
 export const PAYTO_TEST = '0xTEST0000000000000000000000000000000000';
 
+// The Solana half of the same idea (2026-08-31, the second rail). Nothing
+// settles against it either; it exists so the dual-rail envelope has a base58
+// `payTo` to assert on. Deliberately NOT the production address — a suite that
+// hard-codes the real receiving account is one grep away from looking like a
+// leak, and asserting on a fake proves the same thing.
+//
+// It IS valid base58: no 0, O, I or l, which are the four characters the
+// alphabet drops precisely because they are the ones humans transcribe wrong.
+export const PAYTO_SOLANA_TEST = 'So1anaTESTpayTo1111111111111111111111111111';
+
 // Mirrors PAID_DAILY in worker/beacon.js. Deliberately not exported by the
 // catalog (it is a runaway bound, not an advertised quota), so it is typed here.
 export const PAID_DAILY = 5000;
@@ -120,6 +130,9 @@ const SUITE_OCTET = {
   'xml-json': 34,
   'html-text': 35,
   'html-json': 36,
+  // The second rail (2026-08-31). Boots its own workers, but takes an octet on
+  // the same rule so nothing it does can collide with a shared-worker suite.
+  solana: 37,
 };
 
 /**
@@ -235,6 +248,21 @@ export async function bootWorker({ vars = {} } = {}) {
   const port = await freePort();
   const inspectorPort = await freePort();
 
+  // NO OWNER SECRETS IN THE TEST WORKER. `wrangler dev` loads a repo-root
+  // `.env` into the Worker's vars by default, and this repo has one: the CDP
+  // API key pair the owner-run Solana setup script reads (gitignored, real).
+  // Inherited, it makes the suite behave differently on the owner's machine
+  // than in a clean checkout — the phase that asserts
+  // `x-payment-error: facilitator-unconfigured` finds itself CONFIGURED, calls
+  // the LIVE CDP facilitator with a real key, and fails with
+  // `facilitator-unreachable`. That is two problems, and the second is the
+  // serious one: a local suite must never spend, authenticate, or reach a
+  // billed service. `--env-file` replaces the default discovery with this empty
+  // file, so every var the Worker sees comes from `--var` below and from
+  // wrangler.toml — which is the only configuration a test asserts about.
+  const emptyEnvFile = join(persistDir, 'empty.env');
+  await writeFile(emptyEnvFile, '');
+
   const args = [
     WRANGLER,
     'dev',
@@ -245,6 +273,8 @@ export async function bootWorker({ vars = {} } = {}) {
     String(inspectorPort),
     '--persist-to',
     persistDir,
+    '--env-file',
+    emptyEnvFile,
   ];
   for (const [key, value] of Object.entries(vars)) args.push('--var', `${key}:${value}`);
 

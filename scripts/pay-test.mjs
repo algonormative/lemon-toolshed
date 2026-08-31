@@ -227,7 +227,10 @@ const need = (cond, message) => {
 };
 
 need(envelope.x402Version === 1, `x402Version is ${JSON.stringify(envelope.x402Version)}, expected 1`);
-need(Array.isArray(envelope.accepts) && envelope.accepts.length === 1, 'accepts is not a one-element array');
+// The BUYER KIT PAYS ON BASE, so it checks accepts[0] — which is the Base
+// entry by construction, and is what wrapFetchWithPayment reads. A second
+// entry (the Solana rail) is expected and fine; an empty array is not.
+need(Array.isArray(envelope.accepts) && envelope.accepts.length >= 1, 'accepts is empty — there is nothing to pay');
 need(!!offer, 'the envelope offers nothing to pay');
 
 if (offer) {

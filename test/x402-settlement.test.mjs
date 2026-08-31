@@ -31,10 +31,12 @@
 //    what it is handed. So every hit is shape-checked against its own declared
 //    version and a mismatch answers 400, which surfaces as an unverified serve
 //    and fails whatever test made the call. Drift is meant to be loud.
+//
+//    The mock itself moved to test/mock-facilitator.mjs on 2026-08-31, unchanged,
+//    so the Solana suite can drive the same upstream with the same strictness.
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
 import { createHash } from 'node:crypto';
 import {
   bootWorker,
@@ -46,15 +48,14 @@ import {
   PAID_DAILY,
   SITE_BASE,
 } from './harness.mjs';
+import { startMockFacilitator, shapeProblem, VERIFIED_PAYER, TX_HASH } from './mock-facilitator.mjs';
 
 const ips = callers('settlement');
 
-// A payer address and a settlement hash the mock hands back, so the ledger
-// assertions can prove the values came from the FACILITATOR rather than from
-// the payload the caller sent.
-const VERIFIED_PAYER = '0x00000000000000000000000000000000000Fa11e5';
+// The payer a caller CLAIMS in its payload, as opposed to the one the
+// facilitator reports back. Keeping them different is what lets the ledger
+// assertions prove which of the two was recorded.
 const CLAIMED_PAYER = '0x000000000000000000000000000000000000Bad1';
-const TX_HASH = '0xfeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface';
 
 let worker;
 let api;
@@ -62,166 +63,6 @@ let mock;
 
 // USDC on Base — the asset both envelopes name, in the one spelling it has.
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
-
-// ------------------------------------------------------------------ the mock
-
-/**
- * Is this facilitator call self-consistent? Returns a sentence, or null.
- *
- * The two versions are checked against each other rather than each on its own:
- * it is not enough that a v1 body has `maxAmountRequired`, it must ALSO not
- * have `amount`, because the failure this guards against is a half-migrated
- * envelope carrying both and being accepted by a lenient reader. Every field
- * named below is one the real facilitator reads.
- */
-function shapeProblem(body) {
-  if (!body || typeof body !== 'object') return 'the body is not a JSON object';
-  const { x402Version: version, paymentPayload: payload, paymentRequirements: req } = body;
-
-  if (version !== 1 && version !== 2) return `x402Version ${JSON.stringify(version)} is neither 1 nor 2`;
-  if (!payload || typeof payload !== 'object') return 'no paymentPayload';
-  if (!req || typeof req !== 'object') return 'no paymentRequirements';
-  if (payload.x402Version !== version) {
-    return `paymentPayload.x402Version ${payload.x402Version} disagrees with the body's ${version}`;
-  }
-
-  const missing = (obj, fields, what) => {
-    for (const f of fields) if (obj[f] === undefined) return `${what} is missing ${f}`;
-    return null;
-  };
-  const foreign = (obj, fields, what, other) => {
-    for (const f of fields) if (obj[f] !== undefined) return `${what} carries the v${other} field ${f}`;
-    return null;
-  };
-
-  if (version === 1) {
-    return (
-      missing(req, ['scheme', 'network', 'maxAmountRequired', 'resource', 'description', 'payTo', 'asset'], 'v1 paymentRequirements') ||
-      foreign(req, ['amount'], 'v1 paymentRequirements', 2) ||
-      (typeof req.resource !== 'string' ? 'v1 paymentRequirements.resource must be the URL string' : null) ||
-      (req.network.includes(':') ? `v1 network must be a plain name, got the CAIP-2 ${req.network}` : null) ||
-      missing(payload, ['scheme', 'network', 'payload'], 'v1 paymentPayload') ||
-      foreign(payload, ['accepted'], 'v1 paymentPayload', 2)
-    );
-  }
-
-  return (
-    missing(req, ['scheme', 'network', 'amount', 'asset', 'payTo', 'maxTimeoutSeconds'], 'v2 paymentRequirements') ||
-    foreign(req, ['maxAmountRequired', 'resource', 'description', 'mimeType', 'outputSchema'], 'v2 paymentRequirements', 1) ||
-    (!/^[a-z0-9-]+:[a-zA-Z0-9-]+$/.test(req.network) ? `v2 network must be CAIP-2, got ${req.network}` : null) ||
-    missing(payload, ['accepted', 'payload'], 'v2 paymentPayload') ||
-    foreign(payload, ['scheme', 'network'], 'v2 paymentPayload', 1) ||
-    // The signature was made over `accepted`, so a requirements object that
-    // does not match it is a payment the facilitator cannot recover. Compared
-    // key-order-independently, the way x402's own server does it — a client
-    // that re-serialises our entry has not changed the offer.
-    (canonical(payload.accepted) !== canonical(req)
-      ? 'v2 paymentRequirements is not the accepts entry the payload signed against'
-      : null)
-  );
-}
-
-/** JSON with object keys sorted, so a comparison is about values not order. */
-const canonical = (value) =>
-  JSON.stringify(value, (_key, v) =>
-    v && typeof v === 'object' && !Array.isArray(v)
-      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b)))
-      : v
-  );
-
-/** A programmable stand-in for https://api.cdp.coinbase.com/platform/v2/x402. */
-async function startMockFacilitator() {
-  const state = {
-    hits: [],
-    // Defaults: everything works. Individual tests overwrite these.
-    verify: { status: 200, body: { isValid: true, payer: VERIFIED_PAYER } },
-    settle: {
-      status: 200,
-      body: { success: true, transaction: TX_HASH, network: 'base', payer: VERIFIED_PAYER },
-    },
-    delayMs: { verify: 0, settle: 0 },
-    // Enforcement, on by default. One test turns it off to prove the check
-    // itself has teeth — a strictness that nothing ever trips is indistinguishable
-    // from no strictness at all.
-    strict: true,
-  };
-
-  const server = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', (chunk) => (raw += chunk));
-    req.on('end', async () => {
-      const endpoint = new URL(req.url, 'http://mock').pathname.split('/').pop();
-      let body = null;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        /* recorded as null — a malformed body is itself a finding */
-      }
-      // The version-shape verdict is recorded on the hit whether or not it is
-      // enforced, so a test can assert on it directly as well as through the
-      // 400 below.
-      const problem = shapeProblem(body);
-      state.hits.push({
-        endpoint,
-        method: req.method,
-        url: req.url,
-        authorization: req.headers.authorization || null,
-        contentType: req.headers['content-type'] || null,
-        version: body?.x402Version ?? null,
-        problem,
-        body,
-      });
-
-      const delay = state.delayMs[endpoint] || 0;
-      if (delay) await new Promise((r) => setTimeout(r, delay));
-
-      const canned = state[endpoint];
-      if (!canned) {
-        res.writeHead(404, { 'content-type': 'application/json' });
-        return res.end('{"error":"no such endpoint"}');
-      }
-
-      // A malformed call answers 400 rather than the canned success, which is
-      // what the real facilitator would do and what makes drift fail loudly
-      // instead of passing green against a mock that never looks.
-      if (problem && state.strict) {
-        res.writeHead(400, { 'content-type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'x402_shape', detail: problem }));
-      }
-      res.writeHead(canned.status, { 'content-type': 'application/json' });
-      res.end(typeof canned.body === 'string' ? canned.body : JSON.stringify(canned.body));
-    });
-  });
-
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
-
-  return {
-    state,
-    url: `http://127.0.0.1:${port}/platform/v2/x402`,
-    get hits() {
-      return state.hits;
-    },
-    hitsOn: (endpoint) => state.hits.filter((h) => h.endpoint === endpoint),
-    /** Every shape complaint this mock has recorded, as one readable string. */
-    problems: () =>
-      state.hits
-        .filter((h) => h.problem)
-        .map((h) => `${h.endpoint} (v${h.version}): ${h.problem}`)
-        .join('; '),
-    reset: () => {
-      state.hits.length = 0;
-      state.verify = { status: 200, body: { isValid: true, payer: VERIFIED_PAYER } };
-      state.settle = {
-        status: 200,
-        body: { success: true, transaction: TX_HASH, network: 'base', payer: VERIFIED_PAYER },
-      };
-      state.delayMs = { verify: 0, settle: 0 };
-      state.strict = true;
-    },
-    stop: () => new Promise((resolve) => server.close(resolve)),
-  };
-}
 
 // ------------------------------------------------------------------ helpers
 

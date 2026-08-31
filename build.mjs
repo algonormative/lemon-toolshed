@@ -1327,13 +1327,14 @@ ${
     ? `    <p>The free tier needs no account, no key and no wallet — just call the endpoint. Every free-tier answer carries an <code>x-free-tier-remaining</code> header saying how many of the day's ${FREE_TIER_DAILY} are left, and the count resets at midnight UTC. It is counted per caller, where a caller is an IP address: rotating your user-agent does not get you a second ${FREE_TIER_DAILY}.</p>
     <p>Past the free tier, a call answers <strong>HTTP 402</strong>, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation.</p>`
     : `    <p>There is no trial and no sign-up, because there is nothing to sign up to. A call with no payment answers <strong>HTTP 402</strong> straight away, and the body of that 402 is an <a href="https://www.x402.org" rel="noopener">x402</a> envelope: it names the price, the asset — USDC on Base — and the <code>payTo</code> address the money should go to. That envelope is the whole negotiation, and it is the front door rather than a rejection.</p>
+    <p><strong>USDC on Base or on Solana.</strong> The envelope's <code>accepts</code> array is the authority on which rails are live, and it can carry more than one entry — Base first, then Solana at the same price, since USDC is six decimals on both chains. Read the array and take the first entry you can pay rather than assuming there is exactly one.</p>
     <p>You are charged only for conversions that are actually served. A payment is verified before the conversion runs and settled after it is delivered, so input we cannot convert — a <code>400</code> — costs you nothing, and a body over the 256 KB cap is refused with a <code>413</code> before an envelope is even built.</p>`
 }
 
     <p>Your agent needs two things to answer it:</p>
     <ol>
       <li>An <strong>x402-capable HTTP client</strong> — <code>x402-fetch</code>, the x402 SDK, or <a href="https://docs.cdp.coinbase.com/x402/welcome" rel="noopener">Coinbase AgentKit</a>.</li>
-      <li>A <strong>wallet key holding USDC on Base</strong>, which the client signs with.</li>
+      <li>A <strong>wallet key holding USDC</strong> on one of the rails the envelope names — Base, or Solana where that entry is listed — which the client signs with.</li>
     </ol>
 
     <p>The client reads the envelope, signs a payment for the named amount, and retries the same request with an <code>X-PAYMENT</code> header. No login, no card, no account — the payment <em>is</em> the auth.</p>
@@ -1380,8 +1381,8 @@ ${
       Payment is <strong>live and verified</strong> — a payment presented
       against the <code>402</code> envelope above is checked with the Coinbase
       CDP facilitator before the conversion is served, a verified call comes
-      back with <code>x-payment-verified: true</code>, and it settles on Base
-      immediately afterwards. If the facilitator cannot be reached, the call is
+      back with <code>x-payment-verified: true</code>, and it settles on the rail
+      it was paid on immediately afterwards. If the facilitator cannot be reached, the call is
       served anyway and says so with <code>x-payment-error</code>: at these
       prices the price is a signal, and an outage on our side should not turn a
       paying caller away.</p>`
@@ -1477,8 +1478,10 @@ const catalog = {
         'PAYMENT-REQUIRED response header. Entries without a hosted block are local-only references.'
       : 'Entries with a hosted block run on our server, and every one is a paid call — there is no free tier. An ' +
         'unauthenticated POST answers HTTP 402 immediately, carrying an x402 envelope that names a live USDC ' +
-        'address on Base and the per-call price. A payment presented against that envelope is verified with the ' +
-        'Coinbase CDP facilitator before the conversion is served, and settles on Base immediately afterwards. You ' +
+        'address and the per-call price. Payment is in USDC on Base or on Solana: the envelope\'s accepts array ' +
+        'lists the rails that are live, Base first, at the same price on either — read it rather than assuming a ' +
+        'single entry. A payment presented against that envelope is verified with the Coinbase CDP facilitator ' +
+        'before the conversion is served, and settles on the rail it was paid on immediately afterwards. You ' +
         'are charged only for conversions that are actually served: a 400 on input we cannot convert settles ' +
         'nothing. x402 v1 and v2 are both served from that one 402 — v1 in the body, v2 base64 in a ' +
         'PAYMENT-REQUIRED response header. Entries without a hosted block are local-only references.',
@@ -1519,13 +1522,16 @@ const PAYMENT_LINES = FREE_TIER_ON
       `  base64 in a PAYMENT-REQUIRED response header; pay with X-PAYMENT (v1) or PAYMENT-SIGNATURE (v2).`,
     ]
   : [
-      `Payment: an unpaid call answers HTTP 402 with an x402 envelope — exact scheme, USDC on Base —`,
-      `  naming the price, the payTo address and an outputSchema describing the request body and the`,
-      `  response. No accounts, no keys, per-call pricing. Pay with an x402-capable client (x402-fetch,`,
-      `  the x402 SDK, Coinbase AgentKit) holding a wallet key with USDC on Base; it signs and retries`,
-      `  with an X-PAYMENT header. The payment is verified with the Coinbase CDP facilitator before the`,
-      `  conversion is served: a verified call comes back with x-payment-verified: true and settles on`,
-      `  Base immediately afterwards; a payment the facilitator rejects gets the 402 again with an`,
+      `Payment: an unpaid call answers HTTP 402 with an x402 envelope — exact scheme, USDC on Base or`,
+      `  on Solana — naming the price, the payTo address and an outputSchema describing the request`,
+      `  body and the response. The accepts array lists the rails that are live, Base first, at the`,
+      `  same price on either (USDC is 6 decimals on both chains); take the first entry you can pay`,
+      `  rather than assuming there is exactly one. No accounts, no keys, per-call pricing. Pay with`,
+      `  an x402-capable client (x402-fetch, the x402 SDK, Coinbase AgentKit) holding a wallet key`,
+      `  with USDC on one of those rails; it signs and retries with an X-PAYMENT header. The payment`,
+      `  is verified with the Coinbase CDP facilitator before the conversion is served: a verified`,
+      `  call comes back with x-payment-verified: true and settles on the rail it was paid on`,
+      `  immediately afterwards; a payment the facilitator rejects gets the 402 again with an`,
       `  invalidReason and no conversion; and if the facilitator cannot be reached the call is served`,
       `  anyway, saying so with x-payment-verified: false and x-payment-error. Settlement is queued only`,
       `  for a conversion that was actually served, so a 400 on input we cannot convert is never charged,`,
@@ -1641,7 +1647,13 @@ const X402_ENVELOPE_SCHEMA = {
   required: ['scheme', 'network', 'maxAmountRequired', 'resource', 'payTo', 'asset'],
   properties: {
     scheme: { type: 'string', enum: ['exact'] },
-    network: { type: 'string', enum: ['base'] },
+    network: {
+      type: 'string',
+      enum: ['base', 'solana'],
+      description:
+        'The chain this entry is payable on, in x402 v1 spelling. Read it rather than assuming: ' +
+        '`accepts` can carry more than one entry, and `asset`, `payTo` and `extra` all change with it.',
+    },
     maxAmountRequired: {
       type: 'string',
       description:
@@ -1656,16 +1668,24 @@ const X402_ENVELOPE_SCHEMA = {
     maxTimeoutSeconds: { type: 'integer', examples: [60] },
     asset: {
       type: 'string',
-      description: 'USDC on Base.',
-      examples: ['0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'],
+      description:
+        'USDC, on the network this entry names — the Base contract on `base`, the SPL mint on ' +
+        '`solana`. Six decimals on both, so one price serves either rail.',
+      examples: ['0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'],
     },
     extra: {
       type: 'object',
       description:
-        "The EIP-712 domain the client signs over. USDC's on-chain name() is \"USD Coin\", which is " +
-        'not its ticker; a client that signs over the wrong domain produces a payment the ' +
-        'facilitator cannot recover.',
-      properties: { name: { type: 'string' }, version: { type: 'string' } },
+        'Per-network signing detail, and its contents depend on `network`. On `base` it is the ' +
+        "EIP-712 domain the client signs over — USDC's on-chain name() is \"USD Coin\", which is " +
+        'not its ticker, and a client that signs over the wrong domain produces a payment the ' +
+        'facilitator cannot recover. On `solana` it is instead { feePayer }, the account that pays ' +
+        'the transaction fee; there is no EIP-712 domain to sign on that rail.',
+      properties: {
+        name: { type: 'string' },
+        version: { type: 'string' },
+        feePayer: { type: 'string', description: 'Solana only. The fee-paying account.' },
+      },
     },
     outputSchema: {
       type: 'object',
@@ -1708,9 +1728,10 @@ const paymentRequiredResponse = {
     'PAYMENT-REQUIRED': {
       description:
         'The x402 v2 PaymentRequired envelope, base64-encoded JSON: { x402Version: 2, resource, ' +
-        'accepts, extensions.bazaar }. The same price, payTo and asset as the v1 body, in v2 ' +
-        'spelling — `amount` instead of `maxAmountRequired`, the CAIP-2 network `eip155:8453` ' +
-        'instead of `base`, and the outputSchema moved into extensions.bazaar.',
+        'accepts, extensions.bazaar }. The same rails at the same prices as the v1 body, in v2 ' +
+        'spelling — `amount` instead of `maxAmountRequired`, CAIP-2 networks (`eip155:8453` for ' +
+        '`base`, `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` for `solana`), and the outputSchema ' +
+        'moved into extensions.bazaar. Entry i here is entry i of the v1 body.',
       schema: { type: 'string' },
     },
   },
@@ -1724,7 +1745,15 @@ const paymentRequiredResponse = {
           error: { type: 'string' },
           invalidReason: { type: 'string' },
           invalidMessage: { type: ['string', 'null'] },
-          accepts: { type: 'array', minItems: 1, items: X402_ENVELOPE_SCHEMA },
+          accepts: {
+            type: 'array',
+            minItems: 1,
+            description:
+              'The rails this call can be paid on, best first. Usually USDC on Base; a deployment ' +
+              'with the Solana rail configured offers USDC on Solana as a second entry at the same ' +
+              'price. Take the first entry you can pay — do not assume there is exactly one.',
+            items: X402_ENVELOPE_SCHEMA,
+          },
         },
       },
     },
