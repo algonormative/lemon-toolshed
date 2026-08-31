@@ -99,8 +99,9 @@ if (solanaEntries.length) {
 const feePayers = [...new Set([...flat.matchAll(/"feePayer"\s*:\s*"([1-9A-HJ-NP-Za-km-z]{32,44})"/g)].map((m) => m[1]))];
 if (feePayers.length) {
   console.log(`\nDistinct feePayers seen: ${feePayers.join(', ')}`);
-  console.log('CAUTION: CDP uses DIFFERENT feePayers per protocol version/network —');
-  console.log('pin each accepts entry to the feePayer of ITS version+network row above.');
+  console.log('CAUTION: CDP draws feePayers from a POOL — the same version+network row');
+  console.log('returned different addresses on different runs (observed 2026-08-31).');
+  console.log('Never pin a feePayer constant: fetch /supported and cache briefly.');
 } else {
   console.log('\n⚠ No feePayer field found in /supported — capture it from a live');
   console.log('  402 once the chassis is up, or ask CDP support which address to pin.');
@@ -115,14 +116,26 @@ for (const prop of PROPERTIES) {
   console.log(`${prop.padEnd(16)} ${account.address}`);
 }
 
+// ── 3. The house BUYER account — the estate-wide Solana test wallet
+//       (the Base analog is .buyer.env). Owner funds it with USDC on
+//       Solana; it goes into every property's HOUSE_PAYERS so its
+//       settlements never count as revenue. It is NEVER a payTo.
+const buyer = await cdp.solana.getOrCreateAccount({ name: 'house-solana-buyer' });
+console.log('\n── house Solana BUYER (test kit) ──────────────────────');
+console.log(`house-buyer      ${buyer.address}`);
+console.log(`fund: withdraw USDC from Coinbase choosing the SOLANA network
+      (~$1–2 is plenty; the withdrawal creates the USDC ATA). No SOL
+      needed for x402 payments — the facilitator is feePayer.
+      Add this address to every property's HOUSE_PAYERS.`);
+
 console.log(`
 ── next steps ─────────────────────────────────────────
 1. Hand each address to the corresponding repo (wrangler var, e.g.
    PAYTO_SOLANA) — the Worker stores the ADDRESS only; the wallet
    secret never becomes a Worker secret.
-2. HOUSE_PAYERS stays unchanged — that list is for BUYER wallets, and
-   these are receive-only payTo addresses. (If a house Solana BUYER
-   wallet is created later for the test kit, THAT one goes in.)
+2. The BUYER address above goes into every property's HOUSE_PAYERS
+   (self-test settlements never count as revenue). The payTo addresses
+   never do — they are receive-only.
 3. ATA check (open question from the spike): the SVM exact scheme pins
    the transfer destination to the payTo's canonical USDC ATA. Confirm
    during the buyer-kit smoke test whether the facilitator handles a
