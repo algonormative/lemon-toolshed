@@ -403,7 +403,13 @@ async function main(argv) {
   const YES = flag(argv, 'yes');
   const url = value(argv, 'url', TARGET_URL);
   const rpcUrl = value(argv, 'rpc', process.env.SOLANA_RPC_URL || DEFAULT_RPC_URL);
+  const EXPECT_FLAG_PASSED = value(argv, 'expect-atomic', null) !== null;
   const EXPECTED_ATOMIC = BigInt(value(argv, 'expect-atomic', String(PUBLISHED_ATOMIC)));
+  // An explicit --expect-atomic is the operator saying "this exact amount and
+  // no other" — the PUBLISHED_ATOMIC fallback must not survive it, or a stray
+  // quote of exactly the default entry's price on a DIFFERENT --url target
+  // would be silently accepted (sol review 2026-09-01, finding 5).
+  const AMOUNT_OK = (n) => n === EXPECTED_ATOMIC || (!EXPECT_FLAG_PASSED && n === PUBLISHED_ATOMIC);
 
   if (!DRY_RUN && !YES) {
     console.error(`
@@ -522,20 +528,21 @@ async function main(argv) {
 `);
       return 1;
     }
-    if (BigInt(amount) !== PUBLISHED_ATOMIC) {
-      // The banner promises "~$0.002 and nothing else" — a differing quote is
-      // a refusal, not a note, even under the ceiling. Override deliberately
-      // with --expect-atomic <n> after reading the envelope yourself.
-      if (BigInt(amount) === EXPECTED_ATOMIC) {
-        console.log(`  note     entry asks ${amount} atomic (accepted via --expect-atomic).`);
-      } else {
-        console.error(`
-  PRICE MISMATCH. The entry asks ${amount} atomic; entries.yaml publishes
-  ${PUBLISHED_ATOMIC}. Nothing spent. If the quote is legitimate (mid-reprice),
+    if (!AMOUNT_OK(BigInt(amount))) {
+      // The banner promises "this exact amount and nothing else" — a differing
+      // quote is a refusal, not a note, even under the ceiling. Override
+      // deliberately with --expect-atomic <n> after reading the envelope
+      // yourself. With --expect-atomic passed, ONLY that amount passes — the
+      // default entry's price is no longer an alternative.
+      console.error(`
+  PRICE MISMATCH. The entry asks ${amount} atomic; this run expects
+  ${EXPECTED_ATOMIC}. Nothing spent. If the quote is legitimate (mid-reprice),
   rerun with --expect-atomic ${amount}.
 `);
-        return 1;
-      }
+      return 1;
+    }
+    if (BigInt(amount) !== PUBLISHED_ATOMIC) {
+      console.log(`  note     entry asks ${amount} atomic (accepted via --expect-atomic).`);
     }
     if (entry.asset !== USDC_MINT) {
       console.error(`  Solana entry names asset ${entry.asset}, not USDC (${USDC_MINT}). Refusing. Nothing spent.`);
@@ -705,7 +712,7 @@ async function main(argv) {
           if (e.asset !== USDC_MINT) throw new Error(`re-probe 402 names asset ${e.asset}, not USDC`);
           if (e.network !== SOLANA_MAINNET_CAIP2) throw new Error(`re-probe 402 names ${e.network}, not mainnet`);
           if (!e.extra?.feePayer) throw new Error('re-probe 402 lost its feePayer');
-          if (BigInt(entryAmount(e)) !== EXPECTED_ATOMIC && BigInt(entryAmount(e)) !== PUBLISHED_ATOMIC) {
+          if (!AMOUNT_OK(BigInt(entryAmount(e)))) {
             throw new Error(`re-probe 402 asks ${entryAmount(e)} atomic, expected ${EXPECTED_ATOMIC}`);
           }
         }
