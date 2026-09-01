@@ -276,7 +276,12 @@ export async function bootWorker({ vars = {} } = {}) {
     '--env-file',
     emptyEnvFile,
   ];
-  for (const [key, value] of Object.entries(vars)) args.push('--var', `${key}:${value}`);
+  // wrangler.toml ships PAYTO_SOLANA for production (enabled 2026-08-31), so
+  // the toml value would leak into every test worker. Tests default the rail
+  // OFF — the single-rail suites assert the ungated shape — and a suite that
+  // wants it on passes its own value (PAYTO_SOLANA_TEST) which wins below.
+  const bootVars = { PAYTO_SOLANA: '', ...vars };
+  for (const [key, value] of Object.entries(bootVars)) args.push('--var', `${key}:${value}`);
 
   const child = spawn(process.execPath, args, {
     cwd: ROOT,

@@ -1585,10 +1585,23 @@ async function facilitatorCall(env, endpoint, payload, requirements, timeoutMs) 
       }),
       signal: controller.signal,
     });
-    // Anything but a 200 is the facilitator's problem, including a 4xx that
-    // says OUR request was wrong — which is why these are recorded rather than
-    // silently swallowed. A run of them in `settlements` is the alarm.
-    if (res.status !== 200) return { ok: false, reason: `facilitator-http-${res.status}` };
+    // A VERDICT CAN ARRIVE ON A 4xx. CDP answers some invalid payments with
+    // HTTP 400 AND a well-formed `{ isValid: false, invalidReason }` body
+    // (observed 2026-08-31: a Solana payment failing preflight). That is a
+    // facilitator that WORKED and said no — treating it as "unavailable"
+    // hands out the conversion free under the availability-first rule, which
+    // is exactly the leak the alert flagged. So a non-200 with a readable
+    // verdict body is a verdict; only a non-200 WITHOUT one is an outage.
+    if (res.status !== 200) {
+      let body = null;
+      try {
+        body = await res.json();
+      } catch {
+        /* not JSON — a gateway error page, not a verdict */
+      }
+      if (body && (body.isValid === false || body.success === false)) return { ok: true, data: body };
+      return { ok: false, reason: `facilitator-http-${res.status}` };
+    }
     return { ok: true, data: await res.json() };
   } catch (err) {
     // Abort, DNS, TLS, connection refused, unparseable JSON — one bucket, and

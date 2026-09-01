@@ -625,6 +625,32 @@ describe('requirements are selected by (version, network)', () => {
     );
   });
 
+  test('a verdict on an HTTP 400 is a refusal, never a free conversion', async () => {
+    // CDP answers some invalid payments with HTTP 400 AND a well-formed
+    // { isValid: false, invalidReason } body (observed live 2026-08-31:
+    // preflight_validation_failed on the first Solana smoke payment).
+    // Availability-first must not eat that: a readable verdict on a 4xx is a
+    // verdict, and the payment is refused — not served unverified for free.
+    mock.reset();
+    mock.state.verify = {
+      status: 400,
+      body: { isValid: false, invalidReason: 'preflight_validation_failed' },
+    };
+    const ip = ips.next();
+    const header = await paymentV2(api, 'csv-json', ip, 1);
+
+    const res = await api.convert('csv-json', 'a\n1\n', {
+      ip,
+      ua: 'solana-suite/1',
+      headers: { 'payment-signature': header },
+    });
+
+    assert.equal(res.status, 402, `a 400-verdict must refuse, not serve: got ${res.status}`);
+    const refusal = JSON.parse(res.text);
+    assert.equal(refusal.invalidReason, 'preflight_validation_failed', 'the refusal must carry the facilitator\'s reason');
+    assert.equal(mock.hitsOn('settle').length, 0, 'a refused payment must never settle');
+  });
+
   test('a Base payment still selects the Base entry, both versions', async () => {
     // THE POSITIVE CONTROL FOR THE RAIL THAT ALREADY HAS MONEY ON IT. Without
     // it, "the Solana payment picked the Solana entry" would also pass against a
