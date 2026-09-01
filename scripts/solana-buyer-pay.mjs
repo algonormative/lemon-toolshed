@@ -113,7 +113,7 @@ const MAX_ATOMIC = 10000n; // $0.01 — the client's own hard ceiling
 
 /** A URL safe to print: origin + path, no query string, no userinfo —
  *  a custom SOLANA_RPC_URL often carries a provider API key in either. */
-function redactUrl(raw) {
+export function redactUrl(raw) {
   try {
     const u = new URL(raw);
     const creds = u.username ? '<redacted>@' : '';
@@ -291,7 +291,7 @@ const value = (argv, name, fallback) => {
  * from scripts/solana-payto-setup.mjs so the two scripts cannot disagree
  * about where credentials come from.
  */
-function loadRepoEnv() {
+export function loadRepoEnv() {
   try {
     const envPath = join(ROOT, '.env');
     for (const line of readFileSync(envPath, 'utf8').split('\n')) {
@@ -679,8 +679,13 @@ async function main(argv) {
   // ── 7. The payment. One request, with a body the endpoint actually
   //       converts — taken from the envelope's own bazaar sample, so this is
   //       a real servable call and never a 400 (which settles nothing).
-  const sampleBody =
+  // Two estate conventions: toolshed/10x402 publish `bodyType: 'text'` with a
+  // JSON *string*; kino402 publishes `bodyType: 'json'` with a JSON *object*.
+  // Passing an object to fetch() serializes as "[object Object]" and buys a
+  // 400 — stringify it, use a string as-is.
+  const rawSample =
     probeHeader?.extensions?.bazaar?.info?.input?.body ?? '{"name":"toolshed","tags":["x402"]}';
+  const sampleBody = typeof rawSample === 'string' ? rawSample : JSON.stringify(rawSample);
   console.log(`  body     ${JSON.stringify(sampleBody)}  (from the envelope's bazaar sample)`);
 
   // TOCTOU guard: wrapFetchWithPayment issues its OWN unpaid probe and signs
