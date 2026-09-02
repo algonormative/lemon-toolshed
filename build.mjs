@@ -1304,13 +1304,13 @@ ${sections.map(renderShelf).join('\n')}
 
     <h4>3. Install the skill</h4>
     <div class="agent-row">
-      ${cmdRow('npx skills add chronick/lemon-toolshed', 'Copy the skill install command')}
+      ${cmdRow('npx skills add algonormative/lemon-toolshed', 'Copy the skill install command')}
       <p class="note">Teaches an agent the check-then-convert habit, the 256 KB cap and the paid flow. Always-works fallback: copy <code>skills/toolshed/</code> from the repo into your agent's skills directory.</p>
     </div>
 
     <h4>4. MCP</h4>
     <div class="agent-row">
-      ${cmdRow('claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed', 'Copy the MCP install command')}
+      ${cmdRow('claude mcp add toolshed -- npx -y github:algonormative/lemon-toolshed', 'Copy the MCP install command')}
       <p class="note">Three tools over stdio: <code>toolshed_check</code>, <code>toolshed_convert</code>, <code>toolshed_catalog</code>. From a local clone instead:</p>
       ${cmdRow('claude mcp add toolshed -- node /path/to/lemon-toolshed/mcp/server.mjs', 'Copy the local-clone MCP install command', 'cmd-sm')}
       <p class="note">Point it somewhere else with <code>TOOLSHED_URL</code>.</p>
@@ -1553,8 +1553,8 @@ const API_HEADER = [
   ...TIER_LINES,
   ...PAYMENT_LINES,
   `OpenAPI: ${BASE}/openapi.json`,
-  `Skill: npx skills add chronick/lemon-toolshed`,
-  `MCP: claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed`,
+  `Skill: npx skills add algonormative/lemon-toolshed`,
+  `MCP: claude mcp add toolshed -- npx -y github:algonormative/lemon-toolshed`,
   `  Tools: toolshed_check, toolshed_convert, toolshed_catalog. Base URL via TOOLSHED_URL.`,
 ];
 

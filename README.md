@@ -40,15 +40,15 @@ The unit is the **pair** — what you have, what you need. There are four ways i
 
 - **HTTP, first and always**: `GET /check` to see what exists,
   `POST /convert/<id>` to run it. This is the whole API.
-- **Agents** install the skill (`npx skills add chronick/lemon-toolshed`) or add
-  the MCP server (`claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed`).
+- **Agents** install the skill (`npx skills add algonormative/lemon-toolshed`) or add
+  the MCP server (`claude mcp add toolshed -- npx -y github:algonormative/lemon-toolshed`).
   Both are conveniences over the same HTTP surface.
 - **Machines without an agent** fetch `catalog.json`, `llms.txt` or
   `llms-full.txt` — the whole catalog in one request.
 - **People** get a page: pick what you have and what you need from two
   dropdowns, and read the cards.
 
-Repo: `~/git/lemon-toolshed` (`chronick/lemon-toolshed`). It ships under the
+Repo: `~/git/lemon-toolshed` (`algonormative/lemon-toolshed`). It ships under the
 **Lemon** house brand; the site name is **Toolshed**, and it lives at
 `toolshed.lemon-agent.dev` on the measured zone.
 
@@ -348,7 +348,7 @@ HTTP surface lacks.
 ### The skill
 
 ```bash
-npx skills add chronick/lemon-toolshed
+npx skills add algonormative/lemon-toolshed
 ```
 
 `skills/toolshed/SKILL.md` follows the `skills/<name>/` convention, so the repo
@@ -361,7 +361,7 @@ cp -r skills/toolshed ~/.claude/skills/
 ### The MCP server
 
 ```bash
-claude mcp add toolshed -- npx -y github:chronick/lemon-toolshed
+claude mcp add toolshed -- npx -y github:algonormative/lemon-toolshed
 
 # or from a local clone, no network fetch:
 claude mcp add toolshed -- node /path/to/lemon-toolshed/mcp/server.mjs
@@ -402,7 +402,7 @@ their own one-liner too.
 
 Dependencies: `@modelcontextprotocol/sdk` (exact-pinned) and Node 18+ for global
 `fetch`. The `bin` entry plus the shebang are what make
-`npx -y github:chronick/lemon-toolshed` run the server directly.
+`npx -y github:algonormative/lemon-toolshed` run the server directly.
 
 Smoke-test it with no network — initialize, then list the tools:
 

@@ -22,9 +22,9 @@ conversions that are actually served.
 
 Base URL: `https://toolshed.lemon-agent.dev`
 
-Install this skill: `npx skills add chronick/lemon-toolshed`. There is also an
+Install this skill: `npx skills add algonormative/lemon-toolshed`. There is also an
 MCP server in the same repo (`claude mcp add toolshed -- npx -y
-github:chronick/lemon-toolshed`) exposing `toolshed_check`, `toolshed_convert`
+github:algonormative/lemon-toolshed`) exposing `toolshed_check`, `toolshed_convert`
 and `toolshed_catalog` — use whichever surface your harness already has.
 
 ## 1. Check availability first

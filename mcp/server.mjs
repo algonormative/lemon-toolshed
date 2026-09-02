@@ -12,7 +12,7 @@
 // BASE comes from TOOLSHED_URL, defaulting to production.
 //
 // Run it:
-//   npx -y github:chronick/lemon-toolshed
+//   npx -y github:algonormative/lemon-toolshed
 //   node mcp/server.mjs
 //
 // Dependencies: @modelcontextprotocol/sdk, and Node 18+ for global fetch.
