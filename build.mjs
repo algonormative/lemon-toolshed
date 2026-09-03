@@ -15,7 +15,7 @@
 //
 // Dependency: js-yaml. Nothing else.
 
-import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
@@ -2102,6 +2102,45 @@ writeFileSync(join(DIST, 'llms.txt'), llms);
 writeFileSync(join(DIST, 'llms-full.txt'), llmsFull);
 writeFileSync(join(ROOT, 'worker', 'catalog.generated.js'), workerCatalog);
 
+// dist/_routes.json — the paths that invoke functions/[[path]].js.
+//
+// The Pages ASSET layer 403s Python-stdlib user agents (`error code: 1010`)
+// while code paths do not, so the machine surfaces have to be served from code.
+// `_routes.json` is the documented way to keep that bounded: ONLY an `include`
+// path invokes a Function, everything else is static at zero invocations — so
+// index.html, the browser surface and the volume, stays off the metered path
+// and the runbook's "a Function re-opens the twin's metered path" concern is
+// capped at the machine files.
+// The list is DERIVED from what this build just wrote, so a surface added later
+// (sitemap.xml, skill.md) is covered without editing anything here.
+const WELL_KNOWN = '.well-known/';
+const distFiles = [];
+(function walk(dir, prefix) {
+  const entriesHere = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
+  for (const dirent of entriesHere) {
+    if (dirent.isDirectory()) walk(join(dir, dirent.name), `${prefix}${dirent.name}/`);
+    else distFiles.push(`${prefix}${dirent.name}`);
+  }
+})(DIST, '');
+
+const routes = {
+  version: 1,
+  include: [
+    // index.html is the browser surface: static, free, and it passes the
+    // integrity check. _routes.json is config. Anything under .well-known/ is
+    // covered by the glob instead — which is listed whether the tree exists yet
+    // or not, for the discovery and registry-verification files landing there.
+    ...distFiles
+      .filter((f) => f !== 'index.html' && f !== '_routes.json' && !f.startsWith(WELL_KNOWN))
+      .map((f) => `/${f}`),
+    `/${WELL_KNOWN}*`,
+  ].sort(),
+  exclude: [],
+};
+writeFileSync(join(DIST, '_routes.json'), `${JSON.stringify(routes, null, 2)}\n`);
+
 console.log(`build: ${entries.length} entries on ${sections.length} shelves`);
 for (const [category, list] of sections) console.log(`  ${category}: ${list.length}`);
 console.log(`build: ${SUMMARY} ${hostedLive.length} hosted live`);
@@ -2126,5 +2165,6 @@ console.log(
 );
 console.log(
   'build: wrote dist/index.html dist/catalog.json dist/openapi.json dist/robots.txt dist/llms.txt ' +
-    'dist/llms-full.txt worker/catalog.generated.js'
+    'dist/llms-full.txt dist/_routes.json worker/catalog.generated.js'
 );
+console.log(`build: Pages Function routes ${routes.include.join(' ')}`);
