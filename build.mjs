@@ -548,6 +548,30 @@ const META_DESCRIPTION = FREE_TIER_ON
   : `Conversion tools an agent can call over HTTP with nothing installed. No login, no account, no ` +
     `card — every call is priced per call in USDC with x402 (${PRICE_RANGE}), and the payment is the auth.`;
 
+// The briefing an agent reads before deciding to call: what is sold, how a call
+// is shaped, what a probe costs, and what the money does. Published as
+// info["x-guidance"] in openapi.json (AgentCash discovery). Same derived figures
+// as the rest of the copy — nothing here is typed twice, and nothing here says
+// anything about who is buying.
+const GUIDANCE = [
+  `${SITE_NAME} sells ${hostedLive.length} hosted file conversions over plain HTTP: POST the raw input as the ` +
+    'request body of /convert/{id} — no JSON wrapper, no multipart, 256 KB cap — and the converted file comes ' +
+    'back as the response body of the same request. Nothing is queued: there is no job id, nothing to poll and ' +
+    'no expiring link.',
+  'GET /check is free, touches no store and lists every conversion with its id, price and tier, so you can find ' +
+    'the id you need and what it costs without spending anything.',
+  FREE_TIER_ON
+    ? `The first ${FREE_TIER_DAILY} conversions per caller per UTC day are free; past that a call is a paid call ` +
+      'at the price its operation states, and an unpaid one answers HTTP 402 carrying the full x402 quote.'
+    : 'There is no account, no API key, no signup and no minimum. Every paid route answers an unpaid call with ' +
+      'HTTP 402 carrying the full x402 quote — the v1 envelope in the body, the v2 envelope base64 in the ' +
+      'PAYMENT-REQUIRED header — before the body is read or converted, so probing a price costs nothing and ' +
+      'settles nothing.',
+  `Prices are ${PRICE_PHRASE}, stated per tool in this document, in catalog.json and in the 402 itself; the quote ` +
+    'you were handed is the amount that settles, because both come from one catalog.',
+  'You are charged only for a conversion that is actually served — a 400, 413, 429 or 503 settles nothing.',
+].join(' ');
+
 const PRICING_LINE = FREE_TIER_ON
   ? `Every tool is free to try: ${FREE_TIER_DAILY} conversions a day, no login. ` +
     `Past that it's a paid call — ${PRICE_PHRASE}, with much higher limits.`
@@ -1760,6 +1784,37 @@ const paymentRequiredResponse = {
   },
 };
 
+// ---------------------------------------------------------------- x-payment-info
+//
+// AgentCash/Poncho routes a paid tool call from a desktop agent to an x402
+// seller whose GET /openapi.json carries `info["x-guidance"]` and, on every paid
+// operation, `x-payment-info` (their discovery spec, read 2026-09-02). Both are
+// rendered from the SAME catalog the 402 envelope is built from — a price typed
+// into a discovery document a second time is a rate card that goes stale
+// silently, which is the exact failure PRICE_RANGE exists to prevent.
+
+// USDC's 6 decimals — the same base the Worker's atomicAmount() rounds to, so
+// the decimal published here and the atomic amount that settles cannot disagree.
+const USD_DECIMALS = 6;
+
+// Decimal USD as a plain string, rendered THROUGH the atomic amount rather than
+// by stringifying the float: String(0.0000012) is "1.2e-6", and a price in
+// exponent notation is one no discovery parser will read.
+const usdDecimal = (usd) => {
+  const digits = String(Math.round(usd * 10 ** USD_DECIMALS)).padStart(USD_DECIMALS + 1, '0');
+  const frac = digits.slice(-USD_DECIMALS).replace(/0+$/, '');
+  return frac ? `${digits.slice(0, -USD_DECIMALS)}.${frac}` : digits.slice(0, -USD_DECIMALS);
+};
+
+// Every hosted tool here is flat-priced, so the mode is `fixed`. No `mpp`
+// protocol object (there is no MPP runtime on this Worker) and no
+// x-discovery.ownershipProofs (the format is undocumented — inventing one would
+// be a claim we cannot back).
+const paymentInfo = (hosted) => ({
+  protocols: [{ x402: {} }],
+  price: { mode: 'fixed', currency: 'USD', amount: usdDecimal(hosted.price.amount_usd) },
+});
+
 const convertPaths = Object.fromEntries(
   hostedLive.map((e) => [
     e._hosted.path,
@@ -1776,6 +1831,10 @@ const convertPaths = Object.fromEntries(
               : `Every call is priced at ${priceLabel(e._hosted.price)}; a call with no X-PAYMENT header answers 402 with the envelope to pay against.`
           }`,
         tags: ['convert'],
+        // The AgentCash discovery block, on the paid operations only — a free
+        // tool has nothing to quote, and a route that advertises a price it does
+        // not charge is the same lie as one that hides the price it does.
+        ...(isFree(e._hosted) ? {} : { 'x-payment-info': paymentInfo(e._hosted) }),
         parameters: [
           {
             name: 'X-PAYMENT',
@@ -1856,6 +1915,11 @@ const openapi = {
           'answers HTTP 402 with an x402 envelope, and paying it is the whole authentication story. ' +
           'You are charged only for conversions that are actually served.') +
       `\n\nThe same catalog is published as ${BASE}/catalog.json, ${BASE}/llms.txt and ${BASE}/llms-full.txt.`,
+    // Free prose for an agent deciding whether and how to call — AgentCash reads
+    // this key, and a human reading the document gets the same briefing. Every
+    // figure in it is DERIVED (tool count, price span) rather than typed, so a
+    // repricing moves it. It describes the mechanism and nothing about demand.
+    'x-guidance': GUIDANCE,
     // The registries key ownership verification on this address (x402scan told
     // us so verbatim when we registered). Owner-chosen 2026-08-19.
     contact: { name: HOUSE, email: 'support@lemon-agent.dev', url: 'https://lemon-agent.dev' },
