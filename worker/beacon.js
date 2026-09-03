@@ -69,6 +69,14 @@ import { EmailMessage } from 'cloudflare:email';
 // imported: the build constant is what the STATIC surfaces advertise, and the
 // only runtime authority is env.FREE_TIER_DAILY — see freeTierDaily() below.
 import { CATALOG, SITE_BASE } from './catalog.generated.js';
+// The non-HTML machine surfaces (llms.txt, llms-full.txt, openapi.json,
+// catalog.json, robots.txt), byte-identical to their dist/ copies. Served
+// straight out of this bundle because Cloudflare Pages' Browser Integrity
+// Check 403s Python-stdlib user agents on the Pages project — static assets
+// AND Pages Functions alike (measured 2026-09-03) — so a Pages-side fix does
+// not exist; see wrangler.toml `routes` for how these paths reach this Worker
+// at all. See handleSurface() below.
+import SURFACES from './surfaces.generated.js';
 
 const MAX_BODY = 1024; // bytes; a legitimate beacon body is ~40
 const MAX_ENTRY_ID = 64;
@@ -213,14 +221,45 @@ const json = (body, status = 200, headers = {}) =>
     headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
   });
 
+// ------------------------------------------------------------------ machine surfaces
+//
+// GET/HEAD of a path compiled into SURFACES (worker/surfaces.generated.js)
+// answers the body straight out of the bundle — a pure in-memory lookup, no
+// fetch, no KV, no D1, same shape as /check. Any other method is a 405, in the
+// same style as the other routes in this file. `cache-control` is
+// `max-age=0, must-revalidate` rather than immutable: the bundle is
+// redeployed on every `entries.yaml` change, and a stale llms.txt served from
+// a CDN cache is exactly the failure this route exists to avoid.
+function handleSurface(request, surface) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return new Response(null, { status: 405, headers: { ...CORS, allow: 'GET, HEAD' } });
+  }
+  return new Response(request.method === 'HEAD' ? null : surface.body, {
+    status: 200,
+    headers: {
+      ...CORS,
+      'content-type': surface.contentType,
+      'cache-control': 'public, max-age=0, must-revalidate',
+      'x-content-type-options': 'nosniff',
+    },
+  });
+}
+
 export default {
   // `ctx` is threaded through for exactly one thing: ctx.waitUntil, which lets
   // /convert answer the caller and settle the payment afterwards. Nothing on
   // the /b path uses it.
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
+    const surface = SURFACES[path];
+    if (surface) return handleSurface(request, surface);
     if (path === '/check') return handleCheck(request, env);
     if (path.startsWith('/convert/')) return handleConvert(request, env, path, ctx);
+    // wrangler.toml also routes /.well-known/* here, forward-looking for
+    // discovery/registry-verification files that do not exist yet (tracked:
+    // vault-1x3u5) — a plain 404 (a file genuinely is not there), not the 405
+    // handleBeacon()'s catch-all gives every other GET on an unrecognised path.
+    if (path.startsWith('/.well-known/')) return new Response(null, { status: 404, headers: CORS });
     return handleBeacon(request, env, path);
   },
 };

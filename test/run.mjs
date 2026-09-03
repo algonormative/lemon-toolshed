@@ -31,13 +31,15 @@ import { bootWorker, PAYTO_TEST, TIER_ON_VARS } from './harness.mjs';
 
 const PHASES = [
   {
-    // NO WORKER AT ALL, and first because it is the cheapest thing in the run:
-    // it runs the production build and calls the Pages Function as a plain
-    // function against a fake ASSETS binding. `standalone` here means only what
-    // the runner means by it — do not export a worker in — not that it boots one.
-    name: 'static surfaces (build + Pages Function, no worker)',
+    // First because it is the cheapest thing in the run: it runs the
+    // production build, then boots its own worker (same shape as
+    // settlement/solana/alerts below) to exercise the machine surfaces the
+    // zone Worker now serves — no D1 fixtures or dev vars needed, so the
+    // default boot is enough. `standalone` here means only what the runner
+    // means by it — do not join it into the shared phase-boot worker below.
+    name: 'machine surfaces (build + Worker, own boot)',
     standalone: true,
-    note: 'no worker: the suite runs the build and calls the Function directly',
+    note: 'boots its own worker: the suite runs the build, then serves the machine surfaces off it',
     files: ['test/surfaces.test.mjs'],
   },
   {
