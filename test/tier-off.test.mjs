@@ -46,6 +46,15 @@ const ips = callers('tier-off');
 
 const HOSTED_IDS = CATALOG.filter((e) => e.hosted && e.hosted.status === 'live').map((e) => e.id);
 
+// A catalog price as a plain decimal USD string. Written out here rather than
+// imported from build.mjs on purpose: a test that reuses the generator's own
+// renderer cannot tell whether the generator is right.
+const usdDecimal = (usd) => {
+  const digits = String(Math.round(usd * 1e6)).padStart(7, '0');
+  const frac = digits.slice(-6).replace(/0+$/, '');
+  return frac ? `${digits.slice(0, -6)}.${frac}` : digits.slice(0, -6);
+};
+
 const INPUTS = {
   'md-html': '# hi\n',
   'json-yaml': '{"a":1}',
@@ -282,6 +291,67 @@ describe('the published OpenAPI agrees with the envelope', () => {
         [mimeType],
         `${id}: openapi.json documents ${documented} but the envelope advertises ${mimeType}`
       );
+    }
+  });
+
+  // --- AgentCash discovery ------------------------------------------------
+  //
+  // AgentCash/Poncho routes a desktop agent's paid tool call to an x402 seller
+  // only when GET /openapi.json carries info["x-guidance"] and an x-payment-info
+  // block on every paid operation. Both are rendered by build.mjs from the same
+  // catalog the Worker quotes from, so the failure mode is not "missing" — it is
+  // a price in the discovery document that no longer matches the one that
+  // settles. That drift is invisible to a human and fatal to a router, which is
+  // what these two tests are for.
+
+  test('info["x-guidance"] briefs a caller in real prose', () => {
+    const guidance = openapi.info['x-guidance'];
+    assert.equal(typeof guidance, 'string', 'openapi.json has no info["x-guidance"]');
+    assert.ok(guidance.length >= 200, `x-guidance is ${guidance.length} chars — too short to brief anything`);
+    assert.match(guidance, /402/, 'x-guidance never mentions the 402, which is the whole front door');
+  });
+
+  test('every operation with a 402 carries x-payment-info at the price that settles', async () => {
+    // Walk the WHOLE document, not just HOSTED_IDS: an operation that documents
+    // a 402 is by definition a paid one, and a paid one AgentCash cannot price
+    // is one it will not route to.
+    const paid = [];
+    for (const [path, ops] of Object.entries(openapi.paths)) {
+      for (const [method, op] of Object.entries(ops)) {
+        if (!op.responses?.[402]) continue;
+        paid.push([path, method, op]);
+        assert.ok(op['x-payment-info'], `${method.toUpperCase()} ${path} answers 402 but carries no x-payment-info`);
+        assert.deepEqual(op['x-payment-info'].protocols, [{ x402: {} }], `${path}: wrong protocols block`);
+        assert.equal(op['x-payment-info'].price.currency, 'USD', `${path}: price is not quoted in USD`);
+      }
+    }
+    assert.equal(paid.length, HOSTED_IDS.length, 'the paid-operation count drifted from the live catalog');
+    assert.ok(!openapi.paths['/check'].get['x-payment-info'], '/check is free and must not advertise a price');
+
+    for (const id of HOSTED_IDS) {
+      const { price } = openapi.paths[`/convert/${id}`].post['x-payment-info'];
+      const catalogUsd = CATALOG.find((e) => e.id === id).hosted.price.amount_usd;
+
+      // Ground truth is the envelope: maxAmountRequired is the atomic USDC the
+      // facilitator will actually move. A decimal that does not round-trip to it
+      // is a published price the service does not charge.
+      const res = await api.convert(id, INPUTS[id], { ip: ips.next(), ua: 'tier-off-suite/1' });
+      assert.equal(res.status, 402);
+      const atomic = Number(res.json().accepts[0].maxAmountRequired);
+      assert.equal(atomic, Math.round(catalogUsd * 1e6), `${id}: the envelope disagrees with the catalog`);
+
+      if (price.mode === 'fixed') {
+        assert.equal(price.amount, usdDecimal(catalogUsd), `${id}: x-payment-info quotes ${price.amount}`);
+        assert.equal(Math.round(Number(price.amount) * 1e6), atomic, `${id}: ${price.amount} is not what settles`);
+        assert.doesNotMatch(price.amount, /e/i, `${id}: ${price.amount} is exponent notation, not a price`);
+      } else {
+        // A parametric route quotes a span instead of a number. None exist in
+        // this catalog today; the branch is here so adding one cannot slip
+        // through unpriced.
+        assert.equal(price.mode, 'dynamic', `${id}: unknown price mode ${price.mode}`);
+        assert.ok(price.min && price.max, `${id}: a dynamic price must carry min and max`);
+        assert.ok(Number(price.min) <= atomic / 1e6 && atomic / 1e6 <= Number(price.max), `${id}: quote out of band`);
+      }
     }
   });
 });
