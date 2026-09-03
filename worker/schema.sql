@@ -68,6 +68,40 @@ CREATE TABLE IF NOT EXISTS convert_quota (
   PRIMARY KEY (day, ip_hash)
 );
 
+-- One row per payment that has already bought a conversion. The claim is what
+-- makes an authorization single-use HERE, before the work is served.
+--
+-- Verify is a READ: the facilitator says the signature is good and the funds
+-- are there, and says it again every time it is asked. Nothing is spent until
+-- settle, and settle runs after the response. So the same paid header presented
+-- concurrently verified every time and bought a conversion every time — the
+-- per-caller ceiling was the only thing bounding it, and that is per IP.
+--
+-- The row is claimed BETWEEN verify and the conversion, so the first request
+-- through owns the payment and every later one is answered 402 'payment already
+-- used' — and it is RELEASED on every exit that does not serve a conversion,
+-- because a claim with no compensating delete would spend the buyer's
+-- authorization on a 400. Same rule as the ordering around settle: YOU ARE ONLY
+-- CHARGED FOR CONVERSIONS THAT ARE SERVED.
+--
+-- WHAT THIS IS NOT: an authoritative double-spend guard. The hash is of the
+-- payment header as presented, so the same authorization re-encoded with its
+-- keys in another order hashes differently. The authoritative backstop is on
+-- chain — an EIP-3009 nonce is single-use, and a second settle comes back
+-- `nonce_already_used`, which `settlements` records. This table exists to stop
+-- the amplification BEFORE the conversion is served, which the chain cannot do.
+--
+-- `created_at` is for the operator: prune on the same 90-day chore as the raw
+-- events, past any authorization's maxTimeoutSeconds. `route` is for the
+-- operator too — which tool a replay was aimed at — and is deliberately NOT part
+-- of the key: one authorization buys one call anywhere on this service, not one
+-- per tool.
+CREATE TABLE IF NOT EXISTS payment_seen (
+  hash       TEXT PRIMARY KEY,  -- SHA-256 of the presented payment header, hex
+  created_at INTEGER,           -- unix seconds, UTC
+  route      TEXT               -- entry id the claim was taken for, e.g. 'md-html'
+);
+
 -- Settlement ledger. One row per payment ATTEMPT that reached the facilitator,
 -- so this table is the answer to "did anyone actually pay, and did the money
 -- land". It is written on three paths, and the three stay distinguishable:

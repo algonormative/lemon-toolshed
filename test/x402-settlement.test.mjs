@@ -37,7 +37,7 @@
 
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   bootWorker,
   client,
@@ -66,17 +66,27 @@ const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 
 // ------------------------------------------------------------------ helpers
 
+/** A 32-byte hex nonce, single-use like the real thing. */
+const freshNonce = () => `0x${randomBytes(32).toString('hex')}`;
+
 /**
  * A well-formed x402 v1 `exact` payment payload, base64-encoded as X-PAYMENT.
  *
  * The signature is nonsense — the mock decides valid from invalid, so a real one
  * would prove nothing and would need a funded key. The SHAPE is real, because
  * the Worker reads `payload.authorization.from` out of it.
+ *
+ * THE NONCE IS FRESH PER CALL, as it is for a real client: an EIP-3009 nonce is
+ * single-use, and the Worker now enforces that up front — one authorization buys
+ * one conversion. A fixed nonce here would make two fixtures built in the same
+ * second byte-identical, and the second call would be answered
+ * `payment_already_used` for reasons that have nothing to do with the test that
+ * made it. Pass `nonce` to replay one deliberately.
  */
 // The default `value` is md-html's $0.004; the mocked facilitator never cross-checks it
 // carries. It is typed rather than read off the envelope because these payloads
 // are deliberately hand-built — see paymentHeaderV2 for the version that is not.
-function paymentHeader({ from = CLAIMED_PAYER, value = '4000' } = {}) { // default matches md-html; $0.002 tools under a mock facilitator are not cross-checked
+function paymentHeader({ from = CLAIMED_PAYER, value = '4000', nonce = freshNonce() } = {}) { // default matches md-html; $0.002 tools under a mock facilitator are not cross-checked
   const now = Math.floor(Date.now() / 1000);
   return Buffer.from(
     JSON.stringify({
@@ -91,7 +101,7 @@ function paymentHeader({ from = CLAIMED_PAYER, value = '4000' } = {}) { // defau
           value,
           validAfter: String(now - 600),
           validBefore: String(now + 60),
-          nonce: `0x${'cd'.repeat(32)}`,
+          nonce,
         },
       },
     })
@@ -116,7 +126,7 @@ async function v2EnvelopeFor(apiClient, tool, ip) {
  * over something else. The signature itself is nonsense — the mock decides
  * valid from invalid — but the shape around it is the client's.
  */
-async function paymentHeaderV2(apiClient, tool, { ip, from = CLAIMED_PAYER } = {}) {
+async function paymentHeaderV2(apiClient, tool, { ip, from = CLAIMED_PAYER, nonce = freshNonce() } = {}) {
   const env = await v2EnvelopeFor(apiClient, tool, ip);
   const accepted = env.accepts[0];
   const now = Math.floor(Date.now() / 1000);
@@ -133,7 +143,7 @@ async function paymentHeaderV2(apiClient, tool, { ip, from = CLAIMED_PAYER } = {
           value: accepted.amount,
           validAfter: String(now - 600),
           validBefore: String(now + accepted.maxTimeoutSeconds),
-          nonce: `0x${'cd'.repeat(32)}`,
+          nonce,
         },
       },
       // A v2 client echoes the server's extensions back, and the bazaar spec
@@ -415,6 +425,185 @@ describe('the buyer is charged only for a conversion that was served', () => {
       size = await ledgerSize();
     }
     assert.equal(size, before + 1, 'the served conversion wrote no settlements row');
+  });
+});
+
+describe('one authorization buys one conversion', () => {
+  // THE REPLAY. Verify is a READ — the facilitator says the payment is good and
+  // keeps saying so — and settle runs after the response, so for the seconds in
+  // between, one verified header bought as many conversions as it was presented
+  // for. The fix is a claim on sha256(the raw header) taken between verify and
+  // the conversion, and RELEASED on every exit that serves nothing.
+  const ledgerSize = async () => (await settlements()).length;
+  const claimRows = () => worker.d1('SELECT hash, route FROM payment_seen;');
+  const claims = async () => (await claimRows()).length;
+
+  test('the same X-PAYMENT twice: the first is served, the second is 402', async () => {
+    mock.reset();
+    const ip = ips.pinned(23);
+    const header = paymentHeader();
+    const before = await ledgerSize();
+    const call = () =>
+      api.convert('md-html', '# hi\n', { ip, ua: 'settlement-suite/1', headers: { 'x-payment': header } });
+
+    const first = await call();
+    assert.equal(first.status, 200, `the first presentation was not served: ${first.status} ${first.text}`);
+    assert.ok(first.text.includes('<h1>hi</h1>'), 'the conversion did not run');
+
+    const second = await call();
+    assert.equal(second.status, 402, `a replayed payment answered ${second.status}: ${second.text}`);
+    assert.ok(!second.text.includes('<h1>'), 'A REPLAYED PAYMENT WAS SERVED A SECOND CONVERSION');
+
+    const body = second.json();
+    assert.equal(body.invalidReason, 'payment_already_used');
+    assert.match(body.invalidMessage, /fresh nonce/, 'the refusal does not say what the client must change');
+    // The terms are still attached, so paying again is one step.
+    assert.equal(body.accepts.length, 1);
+    assert.equal(body.accepts[0].payTo, PAYTO_TEST);
+    // …and in both versions, like every other 402 this Worker sends.
+    const v2 = JSON.parse(Buffer.from(second.headers.get('payment-required'), 'base64').toString('utf8'));
+    assert.equal(v2.error, 'payment_already_used');
+
+    // EXACTLY ONE SETTLEMENT. The replay was verified — the claim is taken
+    // after verify, so that an unverified payload cannot burn a real payment's
+    // hash — and then refused, so it settled nothing and wrote no ledger row.
+    assert.equal(mock.hitsOn('verify').length, 2, 'the replay skipped verification');
+    await awaitSettlement((r) => r.settle_ok === 1 && r.tool === 'md-html', 'the first settlement');
+    await new Promise((r) => setTimeout(r, 1_000)); // give a second settle time to be wrong
+    assert.equal(mock.hitsOn('settle').length, 1, 'one authorization settled twice');
+    assert.equal(await ledgerSize(), before + 1, 'the replay wrote its own settlements row');
+  });
+
+  test('the same PAYMENT-SIGNATURE twice: the second is 402 too', async () => {
+    // Both spellings, because the claim is keyed on the header as presented and
+    // a v2 client presents it under the other name.
+    mock.reset();
+    const ip = ips.pinned(24);
+    const header = await paymentHeaderV2(api, 'csv-json', { ip });
+    const call = () =>
+      api.convert('csv-json', 'a\n1\n', { ip, ua: 'settlement-suite/1', headers: { 'payment-signature': header } });
+
+    const first = await call();
+    assert.equal(first.status, 200, `the first v2 presentation was not served: ${first.status} ${first.text}`);
+
+    const second = await call();
+    assert.equal(second.status, 402, `a replayed v2 payment answered ${second.status}: ${second.text}`);
+    assert.equal(second.json().invalidReason, 'payment_already_used');
+    assert.equal(mock.hitsOn('settle').length, 1, 'the v2 replay settled a second time');
+  });
+
+  test('two distinct payments are both served', async () => {
+    // The positive control. Without it, "the second call was refused" would also
+    // pass against a Worker that had started refusing every second paid call.
+    mock.reset();
+    const ip = ips.pinned(25);
+    const before = await ledgerSize();
+
+    for (const header of [paymentHeader(), paymentHeader()]) {
+      const res = await api.convert('md-html', '# hi\n', {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': header },
+      });
+      assert.equal(res.status, 200, `a distinct payment was refused: ${res.status} ${res.text}`);
+      assert.equal(res.headers.get('x-payment-verified'), 'true');
+    }
+
+    const deadline = Date.now() + 15_000;
+    let size = await ledgerSize();
+    while (size < before + 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      size = await ledgerSize();
+    }
+    assert.equal(size, before + 2, 'two served conversions did not write two settlements rows');
+  });
+
+  test('a payment the facilitator rejects is never claimed', async () => {
+    // The claim goes AFTER verify on purpose: an unverified payload must not be
+    // able to burn the hash of a payment that is about to be presented for real.
+    mock.reset();
+    mock.state.verify = { status: 200, body: { isValid: false, invalidReason: 'insufficient_funds' } };
+    const ip = ips.pinned(26);
+    const header = paymentHeader();
+    const before = await claims();
+
+    const refused = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': header },
+    });
+    assert.equal(refused.status, 402, refused.text);
+    assert.equal(refused.json().invalidReason, 'insufficient_funds', 'a rejected payment was called a used one');
+    assert.equal(await claims(), before, 'A REJECTED PAYMENT WAS CLAIMED AS SPENT');
+
+    // …and the proof it costs the buyer nothing: the very same header, once the
+    // facilitator changes its mind, still buys a conversion.
+    mock.state.verify = { status: 200, body: { isValid: true, payer: VERIFIED_PAYER } };
+    const served = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': header },
+    });
+    assert.equal(served.status, 200, `a payment burnt by an earlier rejection: ${served.status} ${served.text}`);
+  });
+
+  test('a claim released by a 400 can be presented again', async () => {
+    // The compensating half. A claim taken before the request body is even read
+    // would otherwise leave a caller whose input was malformed permanently
+    // unable to use the authorization they signed — charged, by any honest
+    // reading, for a conversion that was never served.
+    mock.reset();
+    const ip = ips.pinned(27);
+    const header = paymentHeader();
+    const before = await claims();
+
+    const bad = await api.convert('csv-json', 'a,b\n"unterminated', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': header },
+    });
+    assert.equal(bad.status, 400, `expected 400 for malformed input, got ${bad.status}: ${bad.text}`);
+    assert.equal(await claims(), before, 'A PAYMENT WAS SPENT ON A 400');
+
+    const good = await api.convert('csv-json', 'a\n1\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': header },
+    });
+    assert.equal(good.status, 200, `a payment released by a 400 was refused on retry: ${good.status} ${good.text}`);
+    const rows = await claimRows();
+    assert.equal(rows.length, before + 1, 'the served conversion did not claim the payment');
+    // Keyed on the header EXACTLY as presented, so the test can rebuild the key
+    // — and naming the tool it bought, which is the operator's read on a replay.
+    const claimed = rows.find((r) => r.hash === createHash('sha256').update(header).digest('hex'));
+    assert.ok(claimed, 'the claim is not keyed on the raw header as presented');
+    assert.equal(claimed.route, 'csv-json', 'the claim does not name the route it bought');
+    // One conversion served, so one settlement — the 400 queued none.
+    assert.equal(mock.hitsOn('settle').length, 1, 'the 400 settled the payment it released');
+  });
+
+  test('an empty body releases the claim too', async () => {
+    // The other exit between the claim and the conversion, and the one a caller
+    // hits by accident: a body that is present and blank.
+    mock.reset();
+    const ip = ips.pinned(28);
+    const header = paymentHeader();
+    const before = await claims();
+
+    const empty = await api.convert('md-html', '   ', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': header },
+    });
+    assert.equal(empty.status, 400, `expected 400 for an empty body, got ${empty.status}: ${empty.text}`);
+    assert.equal(await claims(), before, 'an empty body spent the payment');
+
+    const served = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': header },
+    });
+    assert.equal(served.status, 200, `a payment released by an empty body was refused: ${served.text}`);
   });
 });
 

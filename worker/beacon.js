@@ -443,6 +443,34 @@ async function handleConvert(request, env, path, ctx) {
   let settle = null;
   let alert = null;
 
+  // The single-use claim this request holds, if it took one. Null once it has
+  // been handed back — and null on the replay path, which never owned it.
+  let paymentHash = null;
+
+  /**
+   * Hand the payment claim back, then answer.
+   *
+   * Wraps every exit between the claim and the served conversion: a request
+   * that gets no conversion must leave the caller exactly as able to get one as
+   * they were before they asked. Best-effort by construction — if the
+   * compensating DELETE fails the caller has to re-sign, where the alternative
+   * (refusing to answer a request we already declined for another reason)
+   * helps nobody. Nothing is charged either way: settle is queued only after a
+   * conversion exists.
+   *
+   * The paid-ceiling counter is deliberately NOT refunded here. It bounds what
+   * a request costs US — a facilitator round trip — and that cost was paid
+   * whether or not a conversion came back.
+   */
+  const abandon = async (response) => {
+    if (paymentHash) {
+      const hash = paymentHash;
+      paymentHash = null;
+      await releasePaymentSafely(db, hash);
+    }
+    return response;
+  };
+
   try {
     const salt = await currentSalt(db, day);
     const ip = request.headers.get('cf-connecting-ip') || '';
@@ -535,6 +563,38 @@ async function handleConvert(request, env, path, ctx) {
       if (paidUsed === null) return paidCeilingReached({ now, dayStart });
 
       if (verdict.verified) {
+        // ONE AUTHORIZATION BUYS ONE CONVERSION, and this insert is what makes
+        // that true. Verify is a READ — the facilitator says the signature is
+        // good and the funds are there, and says it again every time it is
+        // asked — and nothing is spent until settle, which runs after the
+        // response. So the same paid header replayed concurrently verified
+        // every time and bought a conversion every time; the only thing
+        // bounding it was the paid ceiling, which is per IP and therefore not a
+        // bound at all for anyone with more than one.
+        //
+        // The claim goes HERE: after verify, so an unverified payload cannot
+        // burn a real payment's hash, and before the conversion, so the first
+        // request through owns the payment and the rest are turned away having
+        // cost nothing. The loser writes no settlements row and releases
+        // nothing — the request that claimed the row owns both.
+        //
+        // AND IT IS RELEASED IF NO CONVERSION IS SERVED — see `abandon` above.
+        // Every 4xx below this point (an empty body, oversize input, a
+        // ConvertError, anything unexpected) would otherwise leave the caller's
+        // authorization permanently spent on nothing, and answer their retry
+        // with "this payment has already bought a conversion", which would be
+        // false. That is the same rule the settle ordering implements: YOU ARE
+        // ONLY CHARGED FOR CONVERSIONS THAT ARE SERVED, and a payment consumed
+        // is a charge whether or not a settlement followed it.
+        paymentHash = await sha256Hex(payment.raw);
+        if (!(await claimPaymentOnce(db, paymentHash, now, id))) {
+          // Not ours to release: the request that owns it is the one that
+          // claimed it, and releasing here would hand a live payment back to
+          // whoever replayed it.
+          paymentHash = null;
+          return paymentAlreadyUsed(offer, conv);
+        }
+
         outcome = { kind: 'paid', presented };
         settle = {
           requirements,
@@ -596,7 +656,7 @@ async function handleConvert(request, env, path, ctx) {
     });
   } catch {
     // Fail closed: an unreachable limiter means no conversions, not unlimited ones.
-    return json({ error: 'conversion is unavailable' }, 503);
+    return abandon(json({ error: 'conversion is unavailable' }, 503));
   }
 
   // --- read, convert -----------------------------------------------------
@@ -611,24 +671,28 @@ async function handleConvert(request, env, path, ctx) {
   //
   // This mattered less when the free tier absorbed most malformed input. With
   // every call paid, a 400 that billed would be the service's worst behaviour.
+  //
+  // The SINGLE-USE CLAIM is compensated on the same exits and for the same
+  // reason: a payment that bought nothing must still be presentable, so every
+  // return below goes through `abandon`.
   let input;
   try {
     const buf = await request.arrayBuffer();
-    if (buf.byteLength > MAX_CONVERT_BODY) return tooLarge();
+    if (buf.byteLength > MAX_CONVERT_BODY) return abandon(tooLarge());
     input = new TextDecoder().decode(buf);
   } catch {
-    return json({ error: 'could not read the request body' }, 400);
+    return abandon(json({ error: 'could not read the request body' }, 400));
   }
-  if (!input.trim()) return json({ error: 'the request body is empty' }, 400);
+  if (!input.trim()) return abandon(json({ error: 'the request body is empty' }, 400));
 
   let output;
   try {
     output = conv.run(input);
   } catch (err) {
-    if (err instanceof ConvertError) return json({ error: err.message }, 400);
+    if (err instanceof ConvertError) return abandon(json({ error: err.message }, 400));
     // Never surface a stack trace. Anything unexpected is still the input's
     // most likely cause, so it is reported as a bad request, not as a crash.
-    return json({ error: `could not convert the input: ${oneLineMessage(err)}` }, 400);
+    return abandon(json({ error: `could not convert the input: ${oneLineMessage(err)}` }, 400));
   }
 
   // SETTLE AFTER RESPONDING, never before. The caller has paid for a
@@ -1355,6 +1419,24 @@ function paymentRequired(offer, conv, { v2Error, ...body }) {
   });
 }
 
+/**
+ * A payment that verified, and has already bought a conversion.
+ *
+ * A 402 rather than a 429, and that is the right shape: this IS a payment
+ * problem, and the answer carries the terms to sign a fresh one against. The
+ * message says what a client actually has to change, which is the nonce.
+ */
+function paymentAlreadyUsed(offer, conv) {
+  return paymentRequired(offer, conv, {
+    error: 'this payment has already been used',
+    invalidReason: 'payment_already_used',
+    invalidMessage:
+      'this exact payment payload has already bought a conversion. One authorization buys one call — ' +
+      'sign a new one, with a fresh nonce, against the terms in this 402.',
+    v2Error: 'payment_already_used',
+  });
+}
+
 const atomicAmount = (usd) => String(Math.round(usd * 10 ** USDC_DECIMALS));
 
 // ------------------------------------------------------------------ facilitator
@@ -1390,12 +1472,18 @@ const atomicAmount = (usd) => String(Math.round(usd * 10 ** USDC_DECIMALS));
  *
  * Returns null when no payment was presented at all; `decoded` is null when one
  * was presented and could not be decoded, which is a rejection, not an absence.
+ *
+ * `raw` is carried through UNPARSED because it is what the single-use claim is
+ * keyed on: the header exactly as this caller presented it, in whichever
+ * spelling it arrived in. Hashing the decoded payload instead would re-serialise
+ * it, and two encodings of one authorization would hash apart or together
+ * depending on our own JSON writer rather than on what was sent.
  */
 function presentedPayment(request) {
   const raw = request.headers.get(PAYMENT_HEADER_V2) || request.headers.get(PAYMENT_HEADER_V1);
   if (!raw) return null;
   const decoded = decodePaymentHeader(raw);
-  return { decoded, version: decoded?.x402Version === 2 ? 2 : 1 };
+  return { raw, decoded, version: decoded?.x402Version === 2 ? 2 : 1 };
 }
 
 /**
@@ -3101,6 +3189,41 @@ async function claimConvertQuota(db, day, ipHash, ceiling) {
   return typeof row?.used === 'number' ? row.used : null;
 }
 
+/**
+ * Claim a payment as spent, atomically. True means this request owns it.
+ *
+ * The insert IS the claim: two isolates racing the same header both attempt the
+ * INSERT, the primary key admits exactly one, and `RETURNING` comes back empty
+ * for the loser. A read-then-write would be a race with a window the size of a
+ * D1 round trip, which is the window the replay was using.
+ */
+async function claimPaymentOnce(db, hash, now, route) {
+  const row = await db
+    .prepare(
+      'INSERT INTO payment_seen (hash, created_at, route) VALUES (?1, ?2, ?3) ' +
+        'ON CONFLICT(hash) DO NOTHING RETURNING hash'
+    )
+    .bind(hash, now, route)
+    .first();
+  return row?.hash === hash;
+}
+
+/**
+ * Give a claimed payment back, because the conversion it bought never existed.
+ *
+ * Best-effort on purpose: this runs on a path that is already answering 4xx for
+ * some other reason, and turning a failed DELETE into a different failure would
+ * replace an inconvenience (the caller re-signs) with an outage. Nothing is
+ * charged either way — settle is queued only after a conversion exists.
+ */
+async function releasePaymentSafely(db, hash) {
+  try {
+    await db.prepare('DELETE FROM payment_seen WHERE hash = ?1').bind(hash).run();
+  } catch {
+    /* see above */
+  }
+}
+
 async function recordEvent(db, { now, day, type, idHash, entry, refClass }) {
   await db.batch([
     db
@@ -3138,8 +3261,16 @@ async function currentSalt(db, day) {
 }
 
 async function truncatedHash(input) {
+  return (await sha256Hex(input)).slice(0, 16);
+}
+
+// The FULL digest, for the single-use payment claim. Truncation is right for the
+// day-scoped identity hashes — a short hash there is a smaller thing to keep —
+// but a collision here would answer a stranger's payment with "already used",
+// so this one keeps all 256 bits.
+async function sha256Hex(input) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
-  return hex(new Uint8Array(digest)).slice(0, 16);
+  return hex(new Uint8Array(digest));
 }
 
 function randomHex(bytes) {
