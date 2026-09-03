@@ -34,6 +34,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
   bootWorker,
@@ -166,8 +167,16 @@ async function startMockFacilitator() {
 
 // ------------------------------------------------------------------ helpers
 
-/** A well-formed x402 v1 payment payload. The signature is nonsense by design. */
-function paymentHeader({ from = THIRD_PARTY_PAYER } = {}) {
+/**
+ * A well-formed x402 v1 payment payload. The signature is nonsense by design.
+ *
+ * THE NONCE IS FRESH PER CALL, as it is for a real client: an EIP-3009 nonce is
+ * single-use and the Worker enforces that up front — one authorization buys one
+ * conversion, and a replay is answered `payment_already_used`. A fixed nonce
+ * made two fixtures built in the same second byte-identical, so whichever test
+ * ran second was refused for reasons that had nothing to do with it.
+ */
+function paymentHeader({ from = THIRD_PARTY_PAYER, nonce = `0x${randomBytes(32).toString('hex')}` } = {}) {
   const now = Math.floor(Date.now() / 1000);
   return Buffer.from(
     JSON.stringify({
@@ -182,7 +191,7 @@ function paymentHeader({ from = THIRD_PARTY_PAYER } = {}) {
           value: '4000', // header authorization; the mocked facilitator does not cross-check it against the tool's price
           validAfter: String(now - 600),
           validBefore: String(now + 60),
-          nonce: `0x${'cd'.repeat(32)}`,
+          nonce,
         },
       },
     })
