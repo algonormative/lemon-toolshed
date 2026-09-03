@@ -58,9 +58,9 @@ probe() { # probe <ua> <path> <expected...> -- <extra curl args...>
   while [ "$#" -gt 0 ] && [ "$1" != '--' ]; do expected+=("$1"); shift; done
   [ "${1:-}" = '--' ] && shift
   if [ -z "$ua" ]; then
-    code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H 'User-Agent:' "$@" "${BASE}${path}" || echo 000)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H 'User-Agent:' "$@" "${BASE}${path}")"; code="${code:-000}"
   else
-    code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 -A "$ua" "$@" "${BASE}${path}" || echo 000)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 -A "$ua" "$@" "${BASE}${path}")"; code="${code:-000}"
   fi
   printf '%-22s | %-24s | %s\n' "${ua:-(none)}" "$path" "$code"
   for want in "${expected[@]}"; do [ "$code" = "$want" ] && return 0; done
