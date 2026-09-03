@@ -98,8 +98,12 @@ scripts/pay-test.mjs        OWNER ONLY — SPENDS REAL USDC; one paid call end t
 wrangler.toml               Worker config; routes are live, database_id filled in at deploy
 ```
 
-The read surface is still **static assets only, zero Functions**. The Worker is
-the only metered path, and it now carries conversions as well as the beacon.
+The read surface is **one catch-all Pages Function** (`functions/[[path]].js`,
+which just returns `env.ASSETS.fetch(request)`), invoked only for the paths
+`dist/_routes.json` lists — the machine surfaces plus `/.well-known/*`. Everything
+else, `index.html` included, is still static at zero invocations. It exists
+because the Pages static layer 403s Python-stdlib user agents (`error code:
+1010`) while code paths do not; see the runbook deviation below.
 
 ### Entry shape
 
@@ -252,6 +256,16 @@ DEPLOY, in order:
  9. Link the directory from the measured umbrella surface.
 10. Launch = beacon live. KC-CUR's 60-day clocks start that day.
 ```
+
+**Step 2, "ZERO FUNCTIONS" — superseded 2026-09-03.** The Pages *static* layer
+enforces its own Browser Integrity Check and 403s (`error code: 1010`) any
+request whose User-Agent is a Python stdlib default, so a Python buyer agent
+could reach the 402 but not read `/llms.txt` or `/openapi.json`; zone BIC off and
+a zone WAF Skip rule were both verified ineffective. The fix is one catch-all
+Function, `functions/[[path]].js`, forwarding to `env.ASSETS`. The metered-path
+concern is bounded by `dist/_routes.json`, which the build emits: only the
+machine surfaces (and `/.well-known/*`) invoke it — `index.html` and the root
+stay static. Prove it against production with `scripts/probe-ua.sh`.
 
 **Step 6, the rung-0 expression.** The original rule matched `/b` alone. It has
 to be widened, because `/convert/*` executes rungs 1 and 2 *inside* the Worker —

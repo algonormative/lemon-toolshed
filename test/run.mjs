@@ -31,6 +31,16 @@ import { bootWorker, PAYTO_TEST, TIER_ON_VARS } from './harness.mjs';
 
 const PHASES = [
   {
+    // NO WORKER AT ALL, and first because it is the cheapest thing in the run:
+    // it runs the production build and calls the Pages Function as a plain
+    // function against a fake ASSETS binding. `standalone` here means only what
+    // the runner means by it — do not export a worker in — not that it boots one.
+    name: 'static surfaces (build + Pages Function, no worker)',
+    standalone: true,
+    note: 'no worker: the suite runs the build and calls the Function directly',
+    files: ['test/surfaces.test.mjs'],
+  },
+  {
     // The env-gated free tier. These suites need conversions actually SERVED —
     // the converter fixtures because that is what they assert on, the quota and
     // spoof suites because the tier IS what they assert on — and with no
@@ -116,7 +126,7 @@ for (const phase of PHASES) {
   process.stdout.write(`\n── phase: ${phase.name} ── ${files.length} file(s)\n`);
 
   if (phase.standalone) {
-    process.stdout.write('   the suite boots its own worker\n\n');
+    process.stdout.write(`   ${phase.note ?? 'the suite boots its own worker'}\n\n`);
     // Nothing is exported into the child, so a bootWorker() inside the file
     // cannot accidentally join a worker left over from an earlier phase.
     if ((await runNodeTest(files, {})) !== 0) failed = true;
