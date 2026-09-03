@@ -84,26 +84,33 @@ dossier wins.
 ## Layout
 
 ```text
-entries.yaml                content tier — 33 draft entries, in git; review is a diff
-build.mjs                   build step — emits dist/ and worker/catalog.generated.js
-worker/beacon.js            the API Worker — /b, /check, /convert/*
-worker/catalog.generated.js GENERATED from entries.yaml; committed, because deploy reads it
-worker/schema.sql           D1 schema — events / daily_aggregates / blocklist / salt / counters / convert_quota / settlements
-mcp/server.mjs              the MCP server — thin stdio wrapper over the HTTP API
-skills/toolshed/SKILL.md    the agent skill — check availability, convert, x402
-test/                       the e2e suite — `npm test`, local only; see § Testing
-scripts/test-live.mjs       the wide live probe + cost estimate; serves no conversions, spends nothing
+entries.yaml                 content tier — 33 draft entries, in git; review is a diff
+build.mjs                    build step — emits dist/, worker/catalog.generated.js, worker/surfaces.generated.js
+worker/beacon.js             the API Worker — /b, /check, /convert/*, plus the machine surfaces
+worker/catalog.generated.js  GENERATED from entries.yaml; committed, because deploy reads it
+worker/surfaces.generated.js GENERATED from entries.yaml; committed, because deploy reads it — see § Layout below
+worker/schema.sql            D1 schema — events / daily_aggregates / blocklist / salt / counters / convert_quota / settlements
+mcp/server.mjs               the MCP server — thin stdio wrapper over the HTTP API
+skills/toolshed/SKILL.md     the agent skill — check availability, convert, x402
+test/                        the e2e suite — `npm test`, local only; see § Testing
+scripts/test-live.mjs        the wide live probe + cost estimate; serves no conversions, spends nothing
+scripts/probe-ua.sh          probes the DEPLOYED surfaces across UAs, incl. Python stdlib; see the runbook deviation below
 scripts/create-test-buyer.mjs  OWNER ONLY — makes a throwaway buyer key (.buyer.env)
-scripts/pay-test.mjs        OWNER ONLY — SPENDS REAL USDC; one paid call end to end
-wrangler.toml               Worker config; routes are live, database_id filled in at deploy
+scripts/pay-test.mjs         OWNER ONLY — SPENDS REAL USDC; one paid call end to end
+wrangler.toml                Worker config; routes are live, database_id filled in at deploy
 ```
 
-The read surface is **one catch-all Pages Function** (`functions/[[path]].js`,
-which just returns `env.ASSETS.fetch(request)`), invoked only for the paths
-`dist/_routes.json` lists — the machine surfaces plus `/.well-known/*`. Everything
-else, `index.html` included, is still static at zero invocations. It exists
-because the Pages static layer 403s Python-stdlib user agents (`error code:
-1010`) while code paths do not; see the runbook deviation below.
+The read surface is split across two Cloudflare products. `index.html` (the
+browser page) is static on the **Pages** project, at zero invocations — Pages
+ships static assets and ZERO Functions. The **machine surfaces** — `llms.txt`,
+`llms-full.txt`, `openapi.json`, `catalog.json`, `robots.txt`, and
+`/.well-known/*` once something lands there — are served by the **zone
+Worker** (`worker/beacon.js`, compiled from `worker/surfaces.generated.js`),
+routed to it directly in `wrangler.toml`. That split exists because the Pages
+static layer 403s Python-stdlib user agents (`error code: 1010`) — and,
+measured 2026-09-03, so does a Pages *Function*, because Pages' Browser
+Integrity Check runs in front of both; see the runbook deviation below for the
+full account of why a Function was tried first and did not work.
 
 ### Entry shape
 
@@ -257,15 +264,27 @@ DEPLOY, in order:
 10. Launch = beacon live. KC-CUR's 60-day clocks start that day.
 ```
 
-**Step 2, "ZERO FUNCTIONS" — superseded 2026-09-03.** The Pages *static* layer
-enforces its own Browser Integrity Check and 403s (`error code: 1010`) any
-request whose User-Agent is a Python stdlib default, so a Python buyer agent
-could reach the 402 but not read `/llms.txt` or `/openapi.json`; zone BIC off and
-a zone WAF Skip rule were both verified ineffective. The fix is one catch-all
-Function, `functions/[[path]].js`, forwarding to `env.ASSETS`. The metered-path
-concern is bounded by `dist/_routes.json`, which the build emits: only the
-machine surfaces (and `/.well-known/*`) invoke it — `index.html` and the root
-stay static. Prove it against production with `scripts/probe-ua.sh`.
+**Step 2, "ZERO FUNCTIONS" — superseded 2026-09-03, and again the same day.**
+First finding: the Pages *static* layer enforces its own Browser Integrity
+Check and 403s (`error code: 1010`) any request whose User-Agent is a Python
+stdlib default, so a Python buyer agent could reach the 402 but not read
+`/llms.txt` or `/openapi.json`; zone BIC off and a zone WAF Skip rule were both
+verified ineffective. The first fix tried was one catch-all Pages Function,
+`functions/[[path]].js`, forwarding to `env.ASSETS`, bounded to the machine
+surfaces by `dist/_routes.json`.
+
+**That Function did not work.** Measured the same day: Cloudflare Pages' BIC
+runs in front of the *entire* Pages project, Functions included — a Function
+gets 403'd by the same check before its own code ever runs. There is no
+Pages-side fix. The actual fix is to keep those paths off the Pages project
+entirely: the machine surfaces are compiled into `worker/surfaces.generated.js`
+and served by the **zone Worker** instead, routed directly in `wrangler.toml`
+(exact patterns for the five files, a `/.well-known/*` glob for what lands
+there later). `functions/[[path]].js` and `dist/_routes.json` are removed —
+they were never live in a way that mattered, since BIC gated them too.
+`index.html` and `/` are untouched: still static on Pages, zero invocations,
+same as the runbook originally specified. Prove the fix against production
+with `scripts/probe-ua.sh`.
 
 **Step 6, the rung-0 expression.** The original rule matched `/b` alone. It has
 to be widened, because `/convert/*` executes rungs 1 and 2 *inside* the Worker —

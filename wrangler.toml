@@ -10,9 +10,23 @@ compatibility_date = "2026-08-01"
 # entries.yaml. Run the build and commit that file before deploying; wrangler
 # reads it from disk.
 
-# The read surface is NOT here. It is a separate Cloudflare Pages project
-# serving dist/ as static assets with ZERO Functions — adding a Function
-# re-opens the pages.dev twin's metered path (dossier § Limits, "The twin").
+# The BROWSER read surface is NOT here. index.html is served by a separate
+# Cloudflare Pages project serving dist/ as static assets with ZERO Functions —
+# adding a Function re-opens the pages.dev twin's metered path (dossier §
+# Limits, "The twin"), and browsers pass Pages' Browser Integrity Check, so
+# there is no reason to move that path off Pages.
+#
+# The MACHINE read surface (llms.txt, llms-full.txt, openapi.json,
+# catalog.json, robots.txt) IS here, as of 2026-09-03 — see the `routes` block
+# below and worker/surfaces.generated.js. Measured that date: Cloudflare
+# Pages' Browser Integrity Check 403s (`error code: 1010`) any request whose
+# User-Agent is a Python stdlib default — Python-urllib, python-requests — on
+# EVERY request that reaches the Pages project, static assets AND Pages
+# Functions alike. A Function (`functions/[[path]].js`, tried first) does not
+# fix it, because BIC runs in front of Functions too. Only a path that never
+# touches the Pages project survives, which is why these surfaces are compiled
+# into this Worker and routed here instead. See README § "Step 2, ZERO
+# FUNCTIONS — superseded 2026-09-03" for the full account.
 
 # The routes. The page addresses the beacon by RELATIVE URL, so a page served
 # from the pages.dev twin resolves /b against the twin, where no Worker route and
@@ -52,7 +66,31 @@ compatibility_date = "2026-08-01"
 routes = [
   { pattern = "toolshed.lemon-agent.dev/b", zone_name = "lemon-agent.dev" },
   { pattern = "toolshed.lemon-agent.dev/check*", zone_name = "lemon-agent.dev" },
-  { pattern = "toolshed.lemon-agent.dev/convert/*", zone_name = "lemon-agent.dev" }
+  { pattern = "toolshed.lemon-agent.dev/convert/*", zone_name = "lemon-agent.dev" },
+
+  # The machine surfaces — added 2026-09-03. Measured that date: Cloudflare
+  # Pages' Browser Integrity Check 403s (`error code: 1010`) any request whose
+  # User-Agent is a Python stdlib default, on EVERY request that reaches the
+  # Pages project — static assets AND Pages Functions alike, so a Function
+  # (tried first, `functions/[[path]].js`, now removed) does not fix it. These
+  # five paths are therefore routed to THIS Worker instead, which serves them
+  # from worker/surfaces.generated.js, byte-identical to their dist/ copies —
+  # see build.mjs and README § "Step 2, ZERO FUNCTIONS — superseded
+  # 2026-09-03". Exact patterns, not wildcards: index.html and / stay on
+  # Pages, where browsers pass the integrity check.
+  { pattern = "toolshed.lemon-agent.dev/llms.txt", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/llms-full.txt", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/openapi.json", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/catalog.json", zone_name = "lemon-agent.dev" },
+  { pattern = "toolshed.lemon-agent.dev/robots.txt", zone_name = "lemon-agent.dev" },
+
+  # Forward-looking, same 2026-09-03 finding: no file is emitted under
+  # .well-known/ yet (tracked: vault-1x3u5), but whatever lands there — a
+  # discovery doc, a registry-verification file — needs to survive the same
+  # Pages BIC 403 the other five do. Routing the glob now means the Worker
+  # owns the whole namespace before the first file exists, so the surface
+  # ships already-fixed instead of needing a second fire drill later.
+  { pattern = "toolshed.lemon-agent.dev/.well-known/*", zone_name = "lemon-agent.dev" }
 ]
 
 # Payment configuration. All three are UNSET by default, and unset is a working

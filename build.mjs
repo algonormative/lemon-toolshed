@@ -2,20 +2,32 @@
 // Toolshed build step.
 //
 // Reads entries.yaml and emits:
-//   dist/index.html            — the page (picker, shelves, for-agents, notes)
-//   dist/catalog.json          — every field, including the hosted/local blocks
-//   dist/llms.txt              — one line per pair
-//   dist/llms-full.txt         — full verdicts
-//   worker/catalog.generated.js — the same catalog compiled into the API Worker,
-//                                 so GET /check needs no fetch, no KV and no D1
+//   dist/index.html               — the page (picker, shelves, for-agents, notes)
+//   dist/catalog.json             — every field, including the hosted/local blocks
+//   dist/llms.txt                 — one line per pair
+//   dist/llms-full.txt            — full verdicts
+//   worker/catalog.generated.js   — the same catalog compiled into the API Worker,
+//                                    so GET /check needs no fetch, no KV and no D1
+//   worker/surfaces.generated.js  — the non-HTML machine surfaces above (catalog,
+//                                    openapi, robots, llms, llms-full), compiled
+//                                    into the API Worker so it can serve them
+//                                    directly — see the note below
 //
-// The read surface is static. The Pages project ships static assets and ZERO
-// Functions (dossier § Limits): a Function re-opens the pages.dev twin's metered
-// path. The conversion endpoints live in the Worker, not in Pages.
+// The read surface is static: the Pages project ships static assets and ZERO
+// Functions (dossier § Limits) — a Function re-opens the pages.dev twin's
+// metered path, AND (measured 2026-09-03) Cloudflare Pages' Browser Integrity
+// Check 403s Python-stdlib user agents (`error code: 1010`) on EVERY request
+// that reaches the Pages project, static assets and Functions alike — so a
+// Function cannot fix it either. The non-HTML machine surfaces are therefore
+// ALSO compiled into worker/surfaces.generated.js and served by the zone
+// Worker via wrangler.toml `routes`, byte-identical to their dist/ copies.
+// index.html stays Pages-only: browsers pass the integrity check, and that is
+// the volume worth keeping off the metered Worker path. The conversion
+// endpoints live in the Worker too, not in Pages.
 //
 // Dependency: js-yaml. Nothing else.
 
-import { readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
@@ -2092,54 +2104,58 @@ export const CATALOG = ${JSON.stringify(
 // misconfigured site to anything that checks.
 const robots = ['User-agent: *', 'Allow: /', '', `Sitemap: ${BASE}/`, ''].join('\n');
 
+const catalogJson = `${JSON.stringify(catalog, null, 2)}\n`;
+const openapiJson = `${JSON.stringify(openapi, null, 2)}\n`;
+
+// The non-HTML machine surfaces. ONE list drives both dist/ and the Worker
+// bundle, so the copy the zone Worker serves can never drift from the static
+// one — see the header comment above for WHY the Worker serves these at all
+// (Pages' Browser Integrity Check 403s Python-stdlib agents on the Pages
+// project, Functions included). index.html is deliberately not in this list:
+// it stays Pages-only, and so does '/' — browsers pass the integrity check,
+// and that is the volume worth keeping off the metered Worker path.
+const MACHINE_SURFACES = [
+  { file: 'catalog.json', body: catalogJson, contentType: 'application/json; charset=utf-8' },
+  { file: 'openapi.json', body: openapiJson, contentType: 'application/json; charset=utf-8' },
+  { file: 'robots.txt', body: robots, contentType: 'text/plain; charset=utf-8' },
+  { file: 'llms.txt', body: llms, contentType: 'text/plain; charset=utf-8' },
+  { file: 'llms-full.txt', body: llmsFull, contentType: 'text/plain; charset=utf-8' },
+];
+
 rmSync(DIST, { recursive: true, force: true });
 mkdirSync(DIST, { recursive: true });
 writeFileSync(join(DIST, 'index.html'), html);
-writeFileSync(join(DIST, 'catalog.json'), `${JSON.stringify(catalog, null, 2)}\n`);
-writeFileSync(join(DIST, 'openapi.json'), `${JSON.stringify(openapi, null, 2)}\n`);
-writeFileSync(join(DIST, 'robots.txt'), robots);
-writeFileSync(join(DIST, 'llms.txt'), llms);
-writeFileSync(join(DIST, 'llms-full.txt'), llmsFull);
+for (const s of MACHINE_SURFACES) writeFileSync(join(DIST, s.file), s.body);
 writeFileSync(join(ROOT, 'worker', 'catalog.generated.js'), workerCatalog);
 
-// dist/_routes.json — the paths that invoke functions/[[path]].js.
+// worker/surfaces.generated.js — the MACHINE_SURFACES bodies, compiled into
+// the Worker bundle so it can serve them directly (worker/beacon.js imports
+// this). `JSON.stringify(s.body)` here round-trips to exactly the string that
+// was just written to dist/<s.file> above — same in-memory value, not a
+// re-derivation — so the two copies are byte-identical by construction
+// (test/surfaces.test.mjs asserts it against a fresh build).
+const surfacesGenerated = `// GENERATED by build.mjs from entries.yaml. Do not edit — run \`npm run build\`.
 //
-// The Pages ASSET layer 403s Python-stdlib user agents (`error code: 1010`)
-// while code paths do not, so the machine surfaces have to be served from code.
-// `_routes.json` is the documented way to keep that bounded: ONLY an `include`
-// path invokes a Function, everything else is static at zero invocations — so
-// index.html, the browser surface and the volume, stays off the metered path
-// and the runbook's "a Function re-opens the twin's metered path" concern is
-// capped at the machine files.
-// The list is DERIVED from what this build just wrote, so a surface added later
-// (sitemap.xml, skill.md) is covered without editing anything here.
-const WELL_KNOWN = '.well-known/';
-const distFiles = [];
-(function walk(dir, prefix) {
-  const entriesHere = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
-    a.name.localeCompare(b.name)
-  );
-  for (const dirent of entriesHere) {
-    if (dirent.isDirectory()) walk(join(dir, dirent.name), `${prefix}${dirent.name}/`);
-    else distFiles.push(`${prefix}${dirent.name}`);
-  }
-})(DIST, '');
+// The non-HTML machine surfaces, compiled into the Worker bundle so it can
+// serve them directly. Measured 2026-09-03: Cloudflare Pages' Browser
+// Integrity Check 403s Python-stdlib user agents (\`error code: 1010\`) on
+// EVERY request that reaches the Pages project — static assets AND Pages
+// Functions alike — so these paths are routed to the zone Worker instead. See
+// wrangler.toml \`routes\` and README § "Step 2, ZERO FUNCTIONS — superseded
+// 2026-09-03". Bodies are byte-identical to their dist/ copies: both are
+// written from the same in-memory strings build.mjs computes once.
+//
+// index.html and / are deliberately NOT here — they stay on Pages, where
+// browsers pass the integrity check and that is the volume worth keeping off
+// the metered Worker path.
 
-const routes = {
-  version: 1,
-  include: [
-    // index.html is the browser surface: static, free, and it passes the
-    // integrity check. _routes.json is config. Anything under .well-known/ is
-    // covered by the glob instead — which is listed whether the tree exists yet
-    // or not, for the discovery and registry-verification files landing there.
-    ...distFiles
-      .filter((f) => f !== 'index.html' && f !== '_routes.json' && !f.startsWith(WELL_KNOWN))
-      .map((f) => `/${f}`),
-    `/${WELL_KNOWN}*`,
-  ].sort(),
-  exclude: [],
+export default {
+${MACHINE_SURFACES.map(
+  (s) => `  ${JSON.stringify(`/${s.file}`)}: { body: ${JSON.stringify(s.body)}, contentType: ${JSON.stringify(s.contentType)} },`
+).join('\n')}
 };
-writeFileSync(join(DIST, '_routes.json'), `${JSON.stringify(routes, null, 2)}\n`);
+`;
+writeFileSync(join(ROOT, 'worker', 'surfaces.generated.js'), surfacesGenerated);
 
 console.log(`build: ${entries.length} entries on ${sections.length} shelves`);
 for (const [category, list] of sections) console.log(`  ${category}: ${list.length}`);
@@ -2165,6 +2181,8 @@ console.log(
 );
 console.log(
   'build: wrote dist/index.html dist/catalog.json dist/openapi.json dist/robots.txt dist/llms.txt ' +
-    'dist/llms-full.txt dist/_routes.json worker/catalog.generated.js'
+    'dist/llms-full.txt worker/catalog.generated.js worker/surfaces.generated.js'
 );
-console.log(`build: Pages Function routes ${routes.include.join(' ')}`);
+console.log(
+  `build: Worker-served machine surfaces ${MACHINE_SURFACES.map((s) => `/${s.file}`).join(' ')}`
+);

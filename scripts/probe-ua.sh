@@ -3,8 +3,15 @@
 #
 # Measured 2026-09-03: the Pages ASSET layer 403s (`error code: 1010`) any
 # request whose User-Agent is a Python stdlib default, while paths handled by
-# CODE answer normally — the whole reason functions/[[path]].js exists. This is
-# how the fix is proven against production, and how a regression is caught.
+# CODE answer normally. The first fix tried was a Pages Function
+# (`functions/[[path]].js`) — that did NOT work, because Cloudflare Pages'
+# Browser Integrity Check runs in front of the whole Pages project, Functions
+# included, and 403s them just the same. The actual fix routes these paths to
+# the zone Worker instead (`worker/beacon.js`, compiled from
+# `worker/surfaces.generated.js`, routed in wrangler.toml `routes`) — a Worker
+# route never touches the Pages project or its integrity check at all. This
+# script is how the fix is proven against production, and how a regression
+# (Pages-side OR Worker-side) is caught.
 #
 # Usage:  scripts/probe-ua.sh [host]   # default toolshed.lemon-agent.dev
 #
@@ -73,8 +80,9 @@ done
 echo
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: a surface did not answer 200 (404 tolerated for PENDING), or the paid"
-  echo "      route did not answer 402. A 403 on a surface is the Pages static layer"
-  echo "      (error 1010) — check dist/_routes.json shipped and lists that path."
+  echo "      route did not answer 402. A 403 on a surface is the Pages Browser"
+  echo "      Integrity Check (error 1010) — check wrangler.toml \`routes\` covers"
+  echo "      that path and worker/surfaces.generated.js was rebuilt and deployed."
   exit 1
 fi
 echo "OK: every surface reachable and the paid route 402, for every agent probed."
