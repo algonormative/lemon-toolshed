@@ -448,6 +448,87 @@ describe('a call served without verification is its own alarm', () => {
   });
 });
 
+// ------------------------------------------------------------------ lost conversions
+
+describe('a sale that did not happen is its own alarm', () => {
+  // THE DISCRIMINATOR IS THE PAYER, NOT THE VERDICT. A refused payment fires
+  // only when an address was recovered from the payload and it is not one of
+  // ours; the two silent branches are asserted in the quiet block below, which
+  // is where the probe-noise class is proved to still be silent.
+  test('a non-house payer the facilitator refuses is announced as a lost conversion', async () => {
+    facilitator.reset();
+    telegram.reset();
+    facilitator.state.verify = {
+      status: 200,
+      body: {
+        isValid: false,
+        invalidReason: 'insufficient_funds',
+        invalidMessage: 'the payer wallet holds less than the amount required',
+      },
+    };
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip: ips.pinned(16),
+      ua: 'alerts-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+
+    // THE RESPONSE IS UNCHANGED — the alert rides behind it and cannot shape
+    // it. Same status, same envelope, same refusal fields as before the ping
+    // existed.
+    assert.equal(res.status, 402, res.text);
+    const body = res.json();
+    assert.equal(body.x402Version, 1);
+    assert.equal(body.error, 'the payment presented was not accepted');
+    assert.equal(body.invalidReason, 'insufficient_funds');
+    assert.ok(Array.isArray(body.accepts) && body.accepts.length, 'the 402 lost its accepts array');
+    assert.ok(res.headers.get('payment-required'), 'the v2 envelope header is missing');
+
+    const hit = await awaitTelegram(telegram, () => true, 'the lost-conversion alert');
+    assert.match(hit.text, /LOST CONVERSION/, 'a refused stranger did not read as a lost sale');
+    assert.match(hit.text, new RegExp(THIRD_PARTY_PAYER, 'i'), 'the alert does not name the payer');
+    assert.match(hit.text, /md-html/, 'the alert does not name the tool');
+    assert.match(hit.text, /\$0\.004/, 'the alert does not carry the amount');
+    assert.match(hit.text, /insufficient_funds/, 'the alert does not carry the facilitator reason');
+    assert.match(hit.text, /holds less than the amount required/, 'the alert drops the detail message');
+    assert.match(hit.text, /Base/, 'the alert does not name the rail');
+    assert.match(hit.text, /Toolshed/, 'the alert does not name the property');
+    // Distinct from every other shape: this is not a sale, not a drill, not a leak.
+    assert.ok(!/THIRD PARTY PAID/.test(hit.text), 'a refusal was announced as a sale');
+    assert.ok(!/test settlement/.test(hit.text), 'a refusal was announced as a drill');
+    assert.ok(!/SERVED WITHOUT VERIFICATION/.test(hit.text), 'a refusal was announced as a leak');
+
+    // EXACTLY ONE, for the same reason a settlement gets exactly one.
+    await settleFor();
+    assert.equal(telegram.sends().length, 1, `expected one alert, saw ${telegram.sends().length}`);
+  });
+
+  test('a non-house payer lost at settle reads as a lost conversion too', async () => {
+    // Verified, served, and the transfer never happened: the money is just as
+    // absent as in a refusal, so it wears the same lead.
+    facilitator.reset();
+    telegram.reset();
+    facilitator.state.settle = {
+      status: 200,
+      body: { success: false, errorReason: 'insufficient_gas' },
+    };
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip: ips.pinned(17),
+      ua: 'alerts-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.headers.get('x-payment-verified'), 'true');
+
+    const hit = await awaitTelegram(telegram, () => true, 'the lost-conversion alert');
+    assert.match(hit.text, /LOST CONVERSION/, 'a stranger whose money never landed read as a sale');
+    assert.match(hit.text, /SETTLE FAILED/, 'the alert does not say the settlement failed');
+    assert.match(hit.text, /insufficient_gas/, 'the alert does not say why it failed');
+    assert.ok(!/THIRD PARTY PAID/.test(hit.text), 'money that never arrived was announced as a sale');
+  });
+});
+
 // ------------------------------------------------------------------ it stays quiet
 
 describe('nothing that is not money disturbs the owner', () => {
@@ -462,7 +543,10 @@ describe('nothing that is not money disturbs the owner', () => {
     assert.equal(telegram.hits.length, 0, 'the 402 front door pinged the owner');
   });
 
-  test('a malformed payment header is silent — it is scanner noise', async () => {
+  test('a malformed payment header is silent — a rejection with nobody behind it', async () => {
+    // THE PAYER-LESS REJECTION. An undecodable header is refused before the
+    // facilitator is asked and yields no address at all, so there is no wallet
+    // to say lost a conversion — exactly the class that must stay quiet.
     facilitator.reset();
     telegram.reset();
 
@@ -477,27 +561,47 @@ describe('nothing that is not money disturbs the owner', () => {
 
     await settleFor();
     assert.equal(telegram.hits.length, 0, 'a garbage payment header pinged the owner');
+
+    // …and the refusal really did run the rejected branch, with no payer on it.
+    // Without this the silence above would also pass against a Worker that
+    // never reached the branch at all.
+    // The NULL test is done in SQL: wrangler's --json renders a SQL NULL as the
+    // string "null", so comparing in JavaScript would assert on the encoding.
+    const [counts] = await worker.d1(
+      "SELECT COUNT(*) AS rows, SUM(payer IS NULL AND verify_ok = 0) AS payerless " +
+        "FROM settlements WHERE error = 'malformed_payment_header';"
+    );
+    assert.ok(counts.rows >= 3, `expected a ledger row per malformed header, saw ${counts.rows}`);
+    assert.equal(counts.payerless, counts.rows, 'a malformed header produced a payer');
   });
 
-  test('a facilitator-rejected payment is silent', async () => {
-    // A rejection is someone failing to pay, not someone paying. The shed is on
-    // a public index; alerting here would page on every scan.
+  test('a rejected payment from a HOUSE wallet is silent — it is a drill failing', async () => {
+    // The owner's own probe failing to pay is a configuration story, and the
+    // shed is scanned continuously by wallets that are ours. Only a stranger's
+    // refused payment is a lost sale.
     facilitator.reset();
     telegram.reset();
     facilitator.state.verify = {
       status: 200,
-      body: { isValid: false, invalidReason: 'insufficient_funds' },
+      body: { isValid: false, invalidReason: 'insufficient_funds', payer: HOUSE_PAYER },
     };
 
     const res = await api.convert('md-html', '# hi\n', {
       ip: ips.pinned(9),
       ua: 'alerts-suite/1',
-      headers: { 'x-payment': paymentHeader() },
+      headers: { 'x-payment': paymentHeader({ from: HOUSE_PAYER }) },
     });
     assert.equal(res.status, 402, res.text);
 
+    // The facilitator was asked, so the rejected branch is the one that stayed
+    // quiet — not some earlier exit.
+    assert.ok(
+      facilitator.state.hits.some((h) => h.endpoint === 'verify'),
+      'the payment was never verified, so this proves nothing about the rejection'
+    );
+
     await settleFor();
-    assert.equal(telegram.hits.length, 0, 'a rejected payment pinged the owner');
+    assert.equal(telegram.hits.length, 0, 'the house failing its own drill pinged the owner');
   });
 
   test('a free-tier serve is silent even with the channel fully configured', async () => {

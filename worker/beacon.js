@@ -546,6 +546,27 @@ async function handleConvert(request, env, path, ctx) {
           txHash: null,
           error: verdict.reason,
         });
+        // A LOST CONVERSION, and the only rejection worth waking anyone for: an
+        // outside wallet tried to buy and the facilitator said no. The gate is
+        // the PAYER — a recovered address that is not one of ours — because a
+        // rejection with nobody behind it is the scanner noise rule four names.
+        // Queued through deferWork, exactly as the settle/alert block below is,
+        // so the 402 never waits on a notification.
+        if (verdict.payer && !isHousePayer(env, verdict.payer)) {
+          await deferWork(
+            ctx,
+            sendPaymentAlert(env, {
+              kind: 'failed',
+              tool: id,
+              payer: verdict.payer,
+              amount: requirements.maxAmountRequired,
+              network: facRequirements?.network,
+              resource: requirements.resource,
+              error: verdict.reason,
+              message: verdict.message ?? null,
+            })
+          );
+        }
         return paymentRequired(offer, conv, {
           error: 'the payment presented was not accepted',
           invalidReason: verdict.reason,
@@ -710,16 +731,24 @@ async function handleConvert(request, env, path, ctx) {
   const deferred = [];
   if (settle) deferred.push(settleAndRecord(env, db, settle));
   if (alert) deferred.push(sendPaymentAlert(env, alert));
-  if (deferred.length) {
-    const work = Promise.all(deferred);
-    if (ctx?.waitUntil) ctx.waitUntil(work);
-    else await work; // no ctx (direct invocation): correctness over latency
-  }
+  if (deferred.length) await deferWork(ctx, Promise.all(deferred));
 
   return new Response(output, {
     status: 200,
     headers: { 'content-type': conv.contentType, ...servedHeaders(outcome) },
   });
+}
+
+/**
+ * Run `work` after the response, wherever a response is about to be returned.
+ *
+ * The one mechanism, in one place, so every deferred job — the settle block, the
+ * unverified-serve alert, the lost-conversion alert on the 402 path — is queued
+ * the same way and none of them can slow or fail the response they trail.
+ */
+async function deferWork(ctx, work) {
+  if (ctx?.waitUntil) ctx.waitUntil(work);
+  else await work; // no ctx (direct invocation): correctness over latency
 }
 
 const tooLarge = () =>
@@ -1825,12 +1854,18 @@ async function recordSettlement(db, { now, tool, payer, amount, verifyOk, settle
 //   now, and a deployment that never sets the secrets must behave exactly as it
 //   did — no fetch, no binding access, no cost.
 //
-//   ONLY VERIFIED MONEY IS WORTH A PING. Malformed headers and
-//   facilitator-rejected payments are probe noise — the shed is on a public
-//   index and gets scanned continuously — and paging on them would train the
-//   owner to ignore the channel, which is the only way this feature can truly
-//   fail. The two things that DO fire are a payment the facilitator accepted
-//   (settled or not), and a call served with nothing checked at all.
+//   A PING NEEDS A NAMED PAYER. The shed is on a public index and is scanned
+//   continuously, so paging on that traffic would train the owner to ignore the
+//   channel — the only way this feature can truly fail. The discriminator is
+//   the PAYER rather than the verdict: a payment the facilitator REJECTED does
+//   fire when an address was recovered from the payload and it is not one of
+//   ours, because that is an outside wallet that tried to buy and could not — a
+//   LOST CONVERSION, the failure that actually costs money. A rejection with no
+//   recoverable payer (a malformed or absent header) and a rejection from a
+//   house wallet are the probe-noise class and stay silent. So three things
+//   fire: a payment the facilitator accepted (settled or not), a call served
+//   with nothing checked at all, and a non-house payer lost at verify or at
+//   settle.
 
 // The email channel's identity. `alerts@lemon-agent.dev` need not be a real
 // mailbox — Email Routing sends FROM the zone — but it must be ON the zone.
@@ -1878,6 +1913,13 @@ const EXPLORER = {
 const RAIL_LABEL = { base: 'Base', solana: 'Solana' };
 
 /**
+ * The lead for a sale that did not happen, shared by both ways of losing one:
+ * refused at verify, and verified-then-unsettled. One string so the two read as
+ * the same event on a lock screen, which is what they are.
+ */
+const LOST_CONVERSION = '🚨 LOST CONVERSION';
+
+/**
  * Is this payer one of the house's own wallets?
  *
  * HOUSE_PAYERS is a non-secret var of public chain addresses (wrangler.toml),
@@ -1902,17 +1944,27 @@ function isHousePayer(env, payer) {
  * deliberately the same string so a phone notification and an inbox preview say
  * the identical thing.
  *
- * Three shapes, visually distinct at a glance because that is all a lock screen
+ * Four shapes, visually distinct at a glance because that is all a lock screen
  * gives you:
  *
  *   🍋💰 THIRD PARTY PAID …   a stranger paid. The event.
  *   🧪 test settlement …      the house paying itself. A drill.
  *   ⚠️ SERVED WITHOUT VERIFICATION …   revenue leaked. Different problem.
+ *   🚨 LOST CONVERSION …      a stranger tried to pay and did not: the
+ *                             facilitator refused the payment, or it verified
+ *                             and then failed to settle. Money that did not
+ *                             arrive, which is why it is not a 💰.
  */
 function alertHeadline(env, alert) {
   const amount = formatUsdc(alert.amount);
   const house = isHousePayer(env, alert.payer);
   const payer = alert.payer || 'unknown';
+
+  if (alert.kind === 'failed') {
+    // Only ever reached for a non-house payer with a recovered address — the
+    // caller gates on exactly that, so there is no house variant of this line.
+    return `${LOST_CONVERSION} — ${amount} ${alert.tool} — payer ${payer} — rejected: ${alert.error}`;
+  }
 
   if (alert.kind === 'unverified') {
     // The house marker still goes on, because the owner's own probe hitting a
@@ -1925,7 +1977,15 @@ function alertHeadline(env, alert) {
   }
 
   const settled = alert.settleOk === 1 ? 'settled' : `SETTLE FAILED (${alert.error || 'unknown'})`;
-  const lead = house ? '🧪 test settlement' : '🍋💰 THIRD PARTY PAID';
+  // A stranger's payment that verified and then did not settle is the same
+  // event as one the facilitator refused — a sale that did not happen — so it
+  // reads as a lost conversion rather than as a sale. The house keeps 🧪: its
+  // failed drill is a configuration story, not a revenue one.
+  const lead = house
+    ? '🧪 test settlement'
+    : alert.settleOk === 1
+      ? '🍋💰 THIRD PARTY PAID'
+      : LOST_CONVERSION;
   return `${lead} — ${amount} ${alert.tool} — payer ${payer} — tx ${alert.txHash || 'none'} — ${settled}`;
 }
 
@@ -1937,7 +1997,18 @@ function alertMessage(env, alert) {
   lines.push(`amount   ${formatUsdc(alert.amount)}  (${alert.amount} atomic USDC on ${RAIL_LABEL[rail]})`);
   lines.push(`payer    ${alert.payer || 'unknown'}`);
 
-  if (alert.kind === 'unverified') {
+  if (alert.kind === 'failed') {
+    lines.push(`property ${ALERT_FROM_NAME}`);
+    if (alert.resource) lines.push(`route    ${alert.resource}`);
+    lines.push(`checked  yes — the facilitator REFUSED this payment: ${alert.error}`);
+    if (alert.message) lines.push(`detail   ${alert.message}`);
+    lines.push('');
+    lines.push('An outside wallet tried to pay and the facilitator turned the payment');
+    lines.push('down, so no conversion was served and nothing was billed — a sale that');
+    lines.push('did not happen. This is not scanner noise: a payer address was recovered');
+    lines.push('from the payload and it is not one of ours. A run of these on one reason');
+    lines.push('is a buyer who cannot pay us for a reason worth fixing.');
+  } else if (alert.kind === 'unverified') {
     lines.push(`checked  NO — ${alert.error}`);
     lines.push('');
     lines.push('This conversion was SERVED and the payment was never checked, so');
