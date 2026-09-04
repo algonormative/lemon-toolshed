@@ -77,6 +77,11 @@ import { CATALOG, SITE_BASE } from './catalog.generated.js';
 // not exist; see wrangler.toml `routes` for how these paths reach this Worker
 // at all. See handleSurface() below.
 import SURFACES from './surfaces.generated.js';
+// The traffic funnel. Every export below is fire-and-forget and returns
+// undefined on a deployment with no POSTHOG_PROJECT_TOKEN — which is the
+// default, and a working state that makes no network call at all. Nothing in
+// this file may await one of them on the response path. See worker/analytics.js.
+import { callRefused, paymentSettled, quoteIssued, toolServed, usdOf } from './analytics.js';
 
 const MAX_BODY = 1024; // bytes; a legitimate beacon body is ~40
 const MAX_ENTRY_ID = 64;
@@ -425,19 +430,40 @@ function handleCheck(request, env) {
 // call that is not going to be served.
 
 async function handleConvert(request, env, path, ctx) {
+  // The id is read before the method check purely so the 405 can say WHICH tool
+  // was addressed with the wrong verb. It is a string slice; it costs nothing
+  // and it changes no behaviour.
+  const id = path.slice('/convert/'.length);
+
+  // The properties every analytics event on this route carries. `entry` is not
+  // known yet, so the price is filled in below once it is; a refusal that
+  // happens before then genuinely has no price to report.
+  const shed = { endpoint: '/convert/:id', path, tool: id, price_usd: null };
+  const refuse = (reason, response) => {
+    callRefused(env, ctx, request, { ...shed, reason, status: response.status });
+    return response;
+  };
+
   if (request.method !== 'POST') {
-    return json({ error: 'POST the input as the request body' }, 405, { allow: 'POST' });
+    return refuse(
+      'method-not-allowed',
+      json({ error: 'POST the input as the request body' }, 405, { allow: 'POST' })
+    );
   }
 
-  const id = path.slice('/convert/'.length);
   const entry = HOSTED.get(id);
-  if (!entry) return json({ error: `no hosted conversion with id "${id}" — see GET /check` }, 404);
+  if (!entry) {
+    return refuse('unknown-tool', json({ error: `no hosted conversion with id "${id}" — see GET /check` }, 404));
+  }
+  shed.price_usd = entryPriceUsd(entry);
 
   const conv = CONVERTERS[id];
-  if (!conv) return json({ error: `conversion "${id}" is listed but not implemented` }, 501);
+  if (!conv) {
+    return refuse('not-implemented', json({ error: `conversion "${id}" is listed but not implemented` }, 501));
+  }
 
   const declared = Number(request.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > MAX_CONVERT_BODY) return tooLarge();
+  if (Number.isFinite(declared) && declared > MAX_CONVERT_BODY) return refuse('body-too-large', tooLarge());
 
   // The paid tier needs BOTH halves: an address to pay to, and a payment
   // presented. Either alone leaves the caller unpaid.
@@ -463,11 +489,16 @@ async function handleConvert(request, env, path, ctx) {
   // Rung 2 is deliberately NOT consulted here. It is a bound on D1 writes, and
   // this path performs none; making a doomsday day answer 503 instead of 402
   // would trade a free, correct answer for an expensive, wrong one.
-  if (tier === 0 && !presented) return overQuota(env, entry, conv, { payTo, tier });
+  if (tier === 0 && !presented) {
+    return meterOffer(env, ctx, request, await overQuota(env, entry, conv, { payTo, tier }), shed, {
+      tier,
+      price: entry.hosted.price,
+    });
+  }
 
   // --- the conversion budget ---------------------------------------------
   const db = env.DB;
-  if (!db) return json({ error: 'conversion is unavailable' }, 503);
+  if (!db) return refuse('unavailable', json({ error: 'conversion is unavailable' }, 503));
 
   const now = Math.floor(Date.now() / 1000);
   const day = new Date(now * 1000).toISOString().slice(0, 10); // UTC
@@ -528,7 +559,7 @@ async function handleConvert(request, env, path, ctx) {
     // Rung 2 is still the outer bound over every route, and it is read first:
     // a doomsday day should not spend anyone's daily allowance.
     if (await globalExceeded(db, day)) {
-      return json({ error: 'daily call limit reached' }, 429);
+      return refuse('global-ceiling', json({ error: 'daily call limit reached' }, 429));
     }
 
     // WHEN A FREE TIER IS CONFIGURED IT IS CLAIMED FIRST, ALWAYS — and that
@@ -552,7 +583,16 @@ async function handleConvert(request, env, path, ctx) {
       // NOTHING FREE LEFT — either the tier is spent or there is no tier.
       // Without somewhere to pay, or without a payment, there is nothing to
       // verify and the answer is the 402/429.
-      if (!payTo || !presented) return overQuota(env, entry, conv, { payTo, tier, now, dayStart });
+      if (!payTo || !presented) {
+        return meterOffer(
+          env,
+          ctx,
+          request,
+          await overQuota(env, entry, conv, { payTo, tier, now, dayStart }),
+          shed,
+          { tier, price: entry.hosted.price }
+        );
+      }
 
       const price = entry.hosted.price;
       const offer = await paymentOffer(env, entry, conv, price, payTo);
@@ -606,6 +646,16 @@ async function handleConvert(request, env, path, ctx) {
             })
           );
         }
+        // `payer` rides along on this one refusal, and only when the facilitator
+        // recovered one: it is what makes a rejected buyer joinable to the
+        // settlement they eventually complete, and it is already on the
+        // `settlements` row written two statements up.
+        callRefused(env, ctx, request, {
+          ...shed,
+          reason: 'payment-invalid',
+          status: 402,
+          payer: verdict.payer ?? null,
+        });
         return paymentRequired(offer, conv, {
           error: 'the payment presented was not accepted',
           invalidReason: verdict.reason,
@@ -620,7 +670,7 @@ async function handleConvert(request, env, path, ctx) {
       // Past this point the conversion WILL be served, so claim against the
       // runaway bound. That is the outer limit on both remaining branches.
       const paidUsed = await claimConvertQuota(db, day, ipHash, PAID_DAILY);
-      if (paidUsed === null) return paidCeilingReached({ now, dayStart });
+      if (paidUsed === null) return refuse('paid-ceiling', paidCeilingReached({ now, dayStart }));
 
       if (verdict.verified) {
         // ONE AUTHORIZATION BUYS ONE CONVERSION, and this insert is what makes
@@ -652,6 +702,12 @@ async function handleConvert(request, env, path, ctx) {
           // claimed it, and releasing here would hand a live payment back to
           // whoever replayed it.
           paymentHash = null;
+          callRefused(env, ctx, request, {
+            ...shed,
+            reason: 'payment-replayed',
+            status: 402,
+            payer: verdict.payer ?? null,
+          });
           return paymentAlreadyUsed(offer, conv);
         }
 
@@ -667,6 +723,12 @@ async function handleConvert(request, env, path, ctx) {
           payload: verdict.payload,
           payer: verdict.payer,
           tool: id,
+          // Carried through for the analytics event settleAndRecord() fires, and
+          // for nothing else: it is read only for its user-agent and country
+          // headers, exactly as everywhere else this Worker hands a request to
+          // analytics. The body has already been consumed by the time that runs.
+          request,
+          priceUsd: shed.price_usd,
         };
       } else {
         // UNREACHABLE / UNCONFIGURED. Availability-first: the price is a signal
@@ -716,7 +778,7 @@ async function handleConvert(request, env, path, ctx) {
     });
   } catch {
     // Fail closed: an unreachable limiter means no conversions, not unlimited ones.
-    return abandon(json({ error: 'conversion is unavailable' }, 503));
+    return abandon(refuse('unavailable', json({ error: 'conversion is unavailable' }, 503)));
   }
 
   // --- read, convert -----------------------------------------------------
@@ -738,21 +800,29 @@ async function handleConvert(request, env, path, ctx) {
   let input;
   try {
     const buf = await request.arrayBuffer();
-    if (buf.byteLength > MAX_CONVERT_BODY) return abandon(tooLarge());
+    if (buf.byteLength > MAX_CONVERT_BODY) return abandon(refuse('body-too-large', tooLarge()));
     input = new TextDecoder().decode(buf);
   } catch {
-    return abandon(json({ error: 'could not read the request body' }, 400));
+    return abandon(refuse('bad-input', json({ error: 'could not read the request body' }, 400)));
   }
-  if (!input.trim()) return abandon(json({ error: 'the request body is empty' }, 400));
+  if (!input.trim()) {
+    return abandon(refuse('bad-input', json({ error: 'the request body is empty' }, 400)));
+  }
 
   let output;
   try {
     output = conv.run(input);
   } catch (err) {
-    if (err instanceof ConvertError) return abandon(json({ error: err.message }, 400));
+    // ONE REASON FOR ALL THREE, and that is the closed-vocabulary rule doing its
+    // job: a ConvertError's message is written for a human and quotes the
+    // caller's own file back at them, so the class is what ships and the prose
+    // stays in the response body where the caller asked for it.
+    if (err instanceof ConvertError) return abandon(refuse('bad-input', json({ error: err.message }, 400)));
     // Never surface a stack trace. Anything unexpected is still the input's
     // most likely cause, so it is reported as a bad request, not as a crash.
-    return abandon(json({ error: `could not convert the input: ${oneLineMessage(err)}` }, 400));
+    return abandon(
+      refuse('bad-input', json({ error: `could not convert the input: ${oneLineMessage(err)}` }, 400))
+    );
   }
 
   // SETTLE AFTER RESPONDING, never before. The caller has paid for a
@@ -771,6 +841,15 @@ async function handleConvert(request, env, path, ctx) {
   if (settle) deferred.push(settleAndRecord(env, db, settle));
   if (alert) deferred.push(sendPaymentAlert(env, alert));
   if (deferred.length) await deferWork(ctx, Promise.all(deferred));
+
+  // The 200, and the only event on this route that means work was done. `paid`
+  // is the tier it went out under — `paid`, `free` or `unverified` — which is
+  // what turns a served count into a revenue question.
+  toolServed(env, ctx, request, {
+    ...shed,
+    paid: outcome.kind,
+    payer: settle?.payer ?? alert?.payer ?? null,
+  });
 
   return new Response(output, {
     status: 200,
@@ -792,6 +871,43 @@ async function deferWork(ctx, work) {
 
 const tooLarge = () =>
   json({ error: `input is larger than the ${MAX_CONVERT_BODY / 1024} KB limit` }, 413);
+
+/**
+ * What one call of this tool costs, in dollars, READ OFF THE CATALOG.
+ *
+ * Not a second pricing implementation: `hosted.price.amount_usd` is the exact
+ * number `atomicAmount()` turns into the envelope's `maxAmountRequired`, taken
+ * here as-is. A `price: free` entry costs nothing; anything else the catalog
+ * could not state is `null` rather than 0, because a graph that cannot tell
+ * "free" from "unknown" will read the wrong one as revenue.
+ */
+function entryPriceUsd(entry) {
+  const price = entry?.hosted?.price;
+  if (price === 'free') return 0;
+  return typeof price?.amount_usd === 'number' ? price.amount_usd : null;
+}
+
+/**
+ * Record what overQuota() decided, and hand its answer straight back.
+ *
+ * overQuota() is left pure — it returns one of four responses and nothing about
+ * analytics is its business — so the event is chosen HERE from what it returned.
+ * A 402 is a quote: the front door working exactly as designed, and the top of
+ * the funnel this whole file exists to make visible. Anything else is a 429, and
+ * the three shapes of 429 want different names because they are three different
+ * operator problems: an allowance spent (waiting fixes it), a priced tool with
+ * nowhere to take money, and a `price: free` entry on a deployment with no free
+ * tier (neither is fixed by waiting, and they send you to different config).
+ */
+function meterOffer(env, ctx, request, response, shed, { tier, price }) {
+  if (response.status === 402) quoteIssued(env, ctx, request, shed);
+  else {
+    const priced = price !== 'free';
+    const reason = tier > 0 ? 'free-tier-spent' : priced ? 'no-payto' : 'no-price';
+    callRefused(env, ctx, request, { ...shed, reason, status: response.status });
+  }
+  return response;
+}
 
 // ------------------------------------------------------------------ tiers & x402
 //
@@ -1616,7 +1732,11 @@ async function verifyPayment(env, payment, requirements) {
  * Never throws, for the same reason as above and one more: it runs inside
  * ctx.waitUntil, where an exception is invisible.
  */
-async function settleAndRecord(env, db, { requirements, facRequirements, version, network, payload, payer, tool }) {
+async function settleAndRecord(
+  env,
+  db,
+  { requirements, facRequirements, version, network, payload, payer, tool, request, priceUsd }
+) {
   let settleOk = 0;
   let txHash = null;
   let error = null;
@@ -1681,6 +1801,27 @@ async function settleAndRecord(env, db, { requirements, facRequirements, version
   // the facilitator returned isValid — so this fires on real money moving, or
   // on real money that was supposed to move and did not. Both are worth waking
   // up for; `settleOk` is what tells them apart.
+  // The bottom of the funnel, and the one event that closes the quote→settle
+  // loop the graphs are for. `ctx` is null: this function already runs inside a
+  // waitUntil, so the send is awaited inline rather than registering a second
+  // one there that nobody would await. It cannot throw (see capture), so it can
+  // sit in front of the alert without being able to cost one.
+  await paymentSettled(env, null, request, {
+    endpoint: '/convert/:id',
+    path: `/convert/${tool}`,
+    tool,
+    price_usd: priceUsd ?? usdOf(requirements.maxAmountRequired),
+    payer,
+    amount_atomic: requirements.maxAmountRequired,
+    rail: railOf(network),
+    tx_hash: txHash,
+    settle_ok: settleOk === 1,
+    // The class of what went wrong, straight off the facilitator — `settle_failed`,
+    // `insufficient_funds` and friends. Already a code rather than prose, which
+    // is the same closed-vocabulary reason `x402 call refused` carries one.
+    settle_error: error,
+  });
+
   await sendPaymentAlert(env, {
     kind: 'settled',
     tool,
