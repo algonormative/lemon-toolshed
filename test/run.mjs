@@ -31,6 +31,18 @@ import { bootWorker, PAYTO_TEST, TIER_ON_VARS } from './harness.mjs';
 
 const PHASES = [
   {
+    // FIRST, and the only phase that boots nothing at all: worker/analytics.js
+    // is imported in process and driven against a stubbed fetch. It runs ahead
+    // of everything else because it is ~200 ms and it is what proves the
+    // property every later phase quietly depends on — with no
+    // POSTHOG_PROJECT_TOKEN set (which is every phase here) the analytics path
+    // makes no network call whatsoever.
+    name: 'analytics (in process, stubbed fetch)',
+    standalone: true,
+    note: 'boots no worker: worker/analytics.js is imported directly and fetch is stubbed',
+    files: ['test/analytics.test.mjs'],
+  },
+  {
     // First because it is the cheapest thing in the run: it runs the
     // production build, then boots its own worker (same shape as
     // settlement/solana/alerts below) to exercise the machine surfaces the

@@ -87,6 +87,7 @@ dossier wins.
 entries.yaml                 content tier — 33 draft entries, in git; review is a diff
 build.mjs                    build step — emits dist/, worker/catalog.generated.js, worker/surfaces.generated.js
 worker/beacon.js             the API Worker — /b, /check, /convert/*, plus the machine surfaces
+worker/analytics.js          the estate's PostHog x402 event family; unset token = no network call at all
 worker/catalog.generated.js  GENERATED from entries.yaml; committed, because deploy reads it
 worker/surfaces.generated.js GENERATED from entries.yaml; committed, because deploy reads it — see § Layout below
 worker/schema.sql            D1 schema — events / daily_aggregates / blocklist / salt / counters / convert_quota / settlements
@@ -671,7 +672,9 @@ reached.
 | `TELEGRAM_CHAT_ID` | yes | owner alerts. A **Worker secret**. Unset = no Telegram channel. |
 | `TELEGRAM_API_BASE` | yes | optional override of the Telegram API root, default `https://api.telegram.org`. Only the test suite sets it, to reach a local mock. |
 | `ALERT_EMAIL_TO` | yes | owner alerts by email. A **Worker secret**, and it must be a **verified Email Routing destination** on the zone. Unset = no email channel. |
-| `HOUSE_PAYERS` | yes | comma-separated wallet addresses whose payments read as a 🧪 test rather than a 🍋💰 sale. Compared lowercased, so a base58 Solana address matches in any case. Holds both house buyers — the EVM one and the Solana one. Non-secret: these are public chain addresses, and it lives in `wrangler.toml`. |
+| `HOUSE_PAYERS` | yes | comma-separated wallet addresses whose payments read as a 🧪 test rather than a 🍋💰 sale. Compared lowercased, so a base58 Solana address matches in any case. Holds both house buyers — the EVM one and the Solana one. Non-secret: these are public chain addresses, and it lives in `wrangler.toml`. Also the source of the `house` flag on every analytics event. |
+| `POSTHOG_PROJECT_TOKEN` | yes | the estate's shared PostHog project. A **Worker secret**. Unset = no analytics and **no network call at all**. See [Traffic analytics](#traffic-analytics). |
+| `POSTHOG_HOST` | yes | optional override of the PostHog ingest root, default `https://us.i.posthog.com`. Only a test would set it, to reach a local mock — the same pattern `FACILITATOR_URL` and `TELEGRAM_API_BASE` use. |
 
 **`FREE_TIER_DAILY` is only half the switch.** It is what the *Worker* enforces;
 the *static* copy — the page, `catalog.json`, `llms.txt`, `llms-full.txt`,
@@ -1336,6 +1339,81 @@ rejecting a message with no `Message-ID` or a `From` that disagrees with the
 envelope sender — so `test/alerts.test.mjs` reads the generated `.eml` back and
 asserts on the real bytes.
 
+## Traffic analytics
+
+The `events` and `settlements` tables are exact and they are the source of
+truth, and neither answers the question that was actually open on 2026-09-02:
+**where does a caller stop?** `events` records one row per call we *served* —
+no user agent, no per-endpoint quote — so a 402 nobody ever paid, an agent that
+reads `/llms.txt` every hour and never buys, and a client stuck on an id that
+does not exist were all invisible. The property with the most third-party
+paying customers in the estate had sent PostHog exactly zero events, all time.
+
+`worker/analytics.js` is the funnel, and only the funnel.
+
+### The events
+
+Four names, and **three of them are the estate's, not this service's** —
+`10x402`, `kino402`, `penny402` and `parallax` already send them into the same
+project. Renaming one here would split every estate-wide funnel in two,
+silently, and the graph would just show a smaller number.
+
+| event | fires when |
+| --- | --- |
+| `x402 quote issued` | a 402 went out — an envelope was quoted and nobody has paid it yet. The top of the funnel. |
+| `x402 call refused` | a call was turned away. Carries a closed-vocabulary `reason` (below). |
+| `x402 tool served` | the 200. `paid` says under which tier: `paid`, `free` or `unverified`. |
+| `x402 payment settled` | a verified payment reached the facilitator's settle endpoint. Carries `payer`, `amount_atomic`, `rail`, `tx_hash`, `settle_ok`. The bottom of the funnel. |
+
+Every event carries `endpoint` (`/convert/:id`), `path`, `tool`, `price_usd`,
+`house`, `$raw_user_agent` and `$host`. `house` is derived from `HOUSE_PAYERS`,
+in one place rather than at each of thirteen call sites, so the owner's own
+drills cannot land in the revenue graph.
+
+`distinct_id` is the **estate-compatible** caller id: a presented payer address
+wins whenever there is one — the same wallet across every property, across IPs
+and across days — and otherwise it is `edge-<16 hex>`, SHA-256 over
+`${POSTHOG_PROJECT_TOKEN}:${cf-connecting-ip}` truncated to 8 bytes. That
+derivation is copied byte-for-byte from the other four properties, which is the
+whole point of it. Note it is **not** the `events` identity: that one is salted
+with a rotating daily salt and is deliberately unlinkable across days, which is
+exactly what makes it useless for a funnel.
+
+### `reason` is a class, never a message
+
+A refusal body carries prose written for a human — `could not convert the
+input: Unexpected token } in JSON at position 41` — and prose is where a
+fragment of the caller's own file ends up quoted into an analytics store. So
+the vocabulary is closed, one entry per refusing branch, and anything
+unrecognised is coerced to `other` rather than widening the breakdown:
+
+`method-not-allowed` · `unknown-tool` · `not-implemented` · `body-too-large` ·
+`bad-input` · `no-payto` · `no-price` · `free-tier-spent` · `paid-ceiling` ·
+`global-ceiling` · `payment-invalid` · `payment-replayed` · `unavailable` ·
+`other`
+
+`test/analytics.test.mjs` asserts both halves: that a bogus reason becomes
+`other`, and — by reading `worker/beacon.js` as text — that no call site names a
+reason the vocabulary has never heard of.
+
+### The rules it is built on
+
+The same five the payment alerts follow — never on the caller's path, no
+retries, unset is a working state, nothing the caller owns leaves the Worker,
+events are anonymous — and no new dependency. They are stated and enforced in
+the header of `worker/analytics.js`; the token-unset claim is checked by the
+suite's fetch stub, not documented.
+
+### Turning it on
+
+```bash
+npx wrangler secret put POSTHOG_PROJECT_TOKEN
+```
+
+That is the whole switch, and it takes effect on the next request. There is
+nothing to add to `wrangler.toml`: the token is a credential, and
+`POSTHOG_HOST` has no non-test reason to move.
+
 ## Shutdown runbook
 
 There is **no preventive spend cap** on Workers. The controls are detective: a
@@ -1619,6 +1697,7 @@ test/x402.test.mjs                the 402 envelope, and PAYTO set with no facili
 test/x402-settlement.test.mjs     verify/settle against a mock facilitator + a real client
 test/x402-solana.test.mjs         the dual-rail accepts, the fee-payer fetch, (version, network) selection
 test/beacon.test.mjs              rows, bot drops, salt rotation
+test/analytics.test.mjs           the PostHog event family — IN PROCESS, boots no worker, fetch stubbed
 test/live.smoke.mjs               the production smoke (`npm run test:live`)
 ```
 
