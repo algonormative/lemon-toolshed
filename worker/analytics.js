@@ -80,6 +80,18 @@ export const EVENTS = {
   paymentSettled: 'x402 payment settled',
 };
 
+export const ROUTINE_MONITOR_UAS = [
+  'CarbonMonitor/0.1 healthcheck (+https://carbon-cashmere.de)',
+];
+
+export function shouldCapture(event, request, _properties = {}, env = {}) {
+  if (env.ANALYTICS_MONITOR_FILTER === 'off') return true;
+  if (!request || !ROUTINE_MONITOR_UAS.includes(request.headers?.get?.('user-agent') || '')) return true;
+  if (request.headers?.get?.('x-payment') || request.headers?.get?.('payment-signature')) return true;
+  if (event === EVENTS.quoteIssued) return false;
+  return true;
+}
+
 /**
  * The complete vocabulary of `x402 call refused`.
  *
@@ -108,6 +120,7 @@ export const REFUSAL_REASONS = [
   'global-ceiling', // 429 — rung 2, the whole-service daily bound
   'payment-invalid', // 402 — the facilitator refused the presented payment
   'payment-replayed', // 402 — that exact payload already bought a conversion
+  'settlement-failed', // 200 already served — facilitator could not settle it
   'unavailable', // 503 — the limiter/store is unreachable; we fail closed
   'other', // the coercion sink; a reason outside this list is a bug
 ];
@@ -143,15 +156,17 @@ export function analyticsEnabled(env) {
  * revenue graph or in the drill bucket. A no-payer event is `false`: an
  * unauthenticated 402 is not the house.
  *
- * Lowercased on both sides, so a base58 Solana address matches in whatever case
- * the facilitator reports it in.
+ * Base addresses compare case-insensitively. Base58 Solana addresses are
+ * case-sensitive, so the configured and reported spellings must match exactly.
  */
-export function housePayer(env, payer) {
+export function housePayer(env, payer, rail = null) {
   if (!payer) return false;
-  const target = String(payer).trim().toLowerCase();
+  const raw = String(payer).trim();
+  const solana = rail === 'solana';
+  const target = solana ? raw : raw.toLowerCase();
   return String(env?.HOUSE_PAYERS || '')
     .split(',')
-    .map((entry) => entry.trim().toLowerCase())
+    .map((entry) => solana ? entry.trim() : entry.trim().toLowerCase())
     .filter(Boolean)
     .includes(target);
 }
@@ -235,6 +250,7 @@ function shape(props = {}) {
  */
 export function capture(env, ctx, event, properties = {}, request = null) {
   if (!analyticsEnabled(env)) return undefined;
+  if (!shouldCapture(event, request, properties, env)) return undefined;
 
   // .catch here as well as inside send(): belt and braces on the one promise
   // that is allowed to be abandoned, because an unhandled rejection inside a
@@ -279,7 +295,7 @@ async function send(env, event, properties, request) {
       // that reason: it decides whether a point lands in the revenue graph or in
       // the drill bucket, and that is not a decision a call site should be able
       // to get wrong in one place out of thirteen.
-      house: housePayer(env, properties?.payer),
+      house: housePayer(env, properties?.payer, properties?.rail),
       // ON EVERY EVENT, not just a pageview. These land in a PostHog project
       // shared with every other house property, and $host is what separates
       // them — without it an estate-wide "which property is doing anything"

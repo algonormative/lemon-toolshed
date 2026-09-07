@@ -1806,21 +1806,21 @@ async function settleAndRecord(
   // waitUntil, so the send is awaited inline rather than registering a second
   // one there that nobody would await. It cannot throw (see capture), so it can
   // sit in front of the alert without being able to cost one.
-  await paymentSettled(env, null, request, {
-    endpoint: '/convert/:id',
-    path: `/convert/${tool}`,
-    tool,
-    price_usd: priceUsd ?? usdOf(requirements.maxAmountRequired),
-    payer,
-    amount_atomic: requirements.maxAmountRequired,
-    rail: railOf(network),
-    tx_hash: txHash,
-    settle_ok: settleOk === 1,
-    // The class of what went wrong, straight off the facilitator — `settle_failed`,
-    // `insufficient_funds` and friends. Already a code rather than prose, which
-    // is the same closed-vocabulary reason `x402 call refused` carries one.
-    settle_error: error,
-  });
+  if (settleOk === 1) {
+    await paymentSettled(env, null, request, {
+      endpoint: '/convert/:id', path: `/convert/${tool}`, tool,
+      price_usd: priceUsd ?? usdOf(requirements.maxAmountRequired), payer,
+      amount_atomic: requirements.maxAmountRequired, rail: railOf(network),
+      tx_hash: txHash, settle_ok: true,
+    });
+  } else {
+    await callRefused(env, null, request, {
+      endpoint: '/convert/:id', path: `/convert/${tool}`, tool,
+      price_usd: priceUsd ?? usdOf(requirements.maxAmountRequired), payer,
+      amount_atomic: requirements.maxAmountRequired, rail: railOf(network),
+      reason: 'settlement-failed', status: 200,
+    });
+  }
 
   await sendPaymentAlert(env, {
     kind: 'settled',

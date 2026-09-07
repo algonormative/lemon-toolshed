@@ -38,6 +38,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
+import { createServer } from 'node:http';
 import {
   bootWorker,
   client,
@@ -60,6 +61,44 @@ const CLAIMED_PAYER = '0x000000000000000000000000000000000000Bad1';
 let worker;
 let api;
 let mock;
+let posthog;
+
+async function startPosthogMock() {
+  const hits = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      if (req.method === 'POST' && req.url === '/i/v0/e/') {
+        try { hits.push(JSON.parse(body)); } catch { hits.push({ malformed: body }); }
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  return {
+    hits,
+    url: `http://127.0.0.1:${address.port}`,
+    reset() { hits.length = 0; },
+    stop: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+}
+
+async function awaitAnalytics(predicate, label) {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    const hit = posthog.hits.find(predicate);
+    if (hit) return hit;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for ${label}; captured ${JSON.stringify(posthog.hits)}`);
+}
 
 // USDC on Base — the asset both envelopes name, in the one spelling it has.
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
@@ -193,8 +232,15 @@ async function usedBy(ip) {
 
 before(async () => {
   mock = await startMockFacilitator();
+  posthog = await startPosthogMock();
   worker = await bootWorker({
-    vars: { PAYTO: PAYTO_TEST, FACILITATOR_URL: mock.url, ...fakeCdpCredentials() },
+    vars: {
+      PAYTO: PAYTO_TEST,
+      FACILITATOR_URL: mock.url,
+      POSTHOG_PROJECT_TOKEN: 'phc_local_test_only',
+      POSTHOG_HOST: posthog.url,
+      ...fakeCdpCredentials(),
+    },
   });
   api = client(worker);
 });
@@ -202,6 +248,7 @@ before(async () => {
 after(async () => {
   await worker?.stop();
   await mock?.stop();
+  await posthog?.stop();
 });
 
 // ------------------------------------------------------------------ tests
@@ -785,6 +832,7 @@ describe('the facilitator is unavailable', () => {
 describe('settlement fails after a good verify', () => {
   test('the response was already sent, and the loss is recorded as settle_ok = 0', async () => {
     mock.reset();
+    posthog.reset();
     mock.state.settle = {
       status: 200,
       body: { success: false, errorReason: 'unexpected_settle_error', payer: VERIFIED_PAYER },
@@ -808,6 +856,18 @@ describe('settlement fails after a good verify', () => {
     assert.equal(row.error, 'unexpected_settle_error');
     assert.ok(isSqlNull(row.tx_hash), 'a failed settlement recorded a transaction hash');
     assert.equal(row.amount, '2000');
+
+    const refusal = await awaitAnalytics(
+      (hit) => hit.event === 'x402 call refused' && hit.properties?.tool === 'json-yaml',
+      'the failed-settlement refusal event',
+    );
+    assert.equal(refusal.properties.reason, 'settlement-failed');
+    assert.equal(refusal.properties.status, 200);
+    assert.equal(
+      posthog.hits.some((hit) => hit.event === 'x402 payment settled' && hit.properties?.tool === 'json-yaml'),
+      false,
+      'a failed facilitator verdict emitted a settled event',
+    );
   });
 
   test('an unreachable facilitator at settle time is recorded too', async () => {
