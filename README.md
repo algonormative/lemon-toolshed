@@ -1414,6 +1414,47 @@ That is the whole switch, and it takes effect on the next request. There is
 nothing to add to `wrangler.toml`: the token is a credential, and
 `POSTHOG_HOST` has no non-test reason to move.
 
+### Timed full capture across the fleet
+
+Routine known-monitor traffic is filtered from the high-volume analytics
+stream. To diagnose the full existing analytics stream for a bounded period,
+use the fleet control script from this repository:
+
+```bash
+# Preview the four affected Workers. This makes no Cloudflare call.
+npm run analytics:firehose -- --for 6h --dry-run
+
+# Capture the full existing analytics stream for six hours. The Workers resume
+# filtering automatically at one shared UTC deadline.
+npm run analytics:firehose -- --for 6h
+
+# Restore the baseline filter immediately.
+npm run analytics:firehose -- --off
+
+# A single affected property can be selected explicitly.
+npm run analytics:firehose -- --for 30m --site tenx
+```
+
+`--site` accepts `all`, `toolshed`, `kino`, `tenx`, or `penny`, and defaults to
+`all`. Parallax already captures its full stream and is deliberately excluded.
+Durations use whole minutes, hours, or days (`30m`, `6h`, `2d`) and cannot
+exceed 30 days.
+
+The script updates only the encrypted
+`ANALYTICS_FULL_CAPTURE_UNTIL` Worker binding. The value is an ordinary UTC
+timestamp rather than a credential; storing it as an encrypted binding lets
+Wrangler change the running configuration without rebuilding or uploading a
+possibly stale local Worker. The timestamp binding persists across normal
+deployments, but an expired supplied deadline is inert. `--off` writes an
+expired deadline; any supplied deadline, including expired or invalid values,
+takes precedence over the legacy `ANALYTICS_MONITOR_FILTER=off` switch. Before
+changing anything, the script proves that every selected fixed Worker name has
+a current deployment. One failed
+preflight prevents all updates. Updates are reported per Worker, and any
+failure gives the command a nonzero exit status. This control changes no
+PostHog feature flag. The Worker-side override creates no timer, outbound
+request, or storage of its own.
+
 ## Shutdown runbook
 
 There is **no preventive spend cap** on Workers. The controls are detective: a

@@ -2,6 +2,13 @@ name = "lemon-toolshed-beacon"
 main = "worker/beacon.js"
 compatibility_date = "2026-08-01"
 
+# Analytics normally suppresses routine unpaid CarbonMonitor quotes. A
+# non-sensitive ANALYTICS_FULL_CAPTURE_UNTIL timestamp is stored as a secret
+# binding for persistence across deploys. A future UTC value restores full capture.
+# At or after the deadline, or when malformed or empty, normal suppression
+# resumes. When this
+# field is present it overrides the legacy ANALYTICS_MONITOR_FILTER=off switch.
+
 # The Worker imports marked, js-yaml, turndown and @mixmark-io/domino. Wrangler
 # bundles npm dependencies natively, so there is no build step to configure —
 # but `npm ci` must have run before `wrangler deploy`.

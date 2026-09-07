@@ -37,10 +37,10 @@ const PHASES = [
     // property every later phase quietly depends on — with no
     // POSTHOG_PROJECT_TOKEN set (which is every phase here) the analytics path
     // makes no network call whatsoever.
-    name: 'analytics (in process, stubbed fetch)',
+    name: 'analytics (in process, stubbed fetch and subprocess)',
     standalone: true,
-    note: 'boots no worker: worker/analytics.js is imported directly and fetch is stubbed',
-    files: ['test/analytics.test.mjs'],
+    note: 'boots no worker: analytics fetch and firehose subprocess execution are stubbed',
+    files: ['test/analytics.test.mjs', 'test/analytics-firehose.test.mjs'],
   },
   {
     // First because it is the cheapest thing in the run: it runs the
