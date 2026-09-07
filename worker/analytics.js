@@ -84,8 +84,22 @@ export const ROUTINE_MONITOR_UAS = [
   'CarbonMonitor/0.1 healthcheck (+https://carbon-cashmere.de)',
 ];
 
+/** Temporarily retain the full analytics firehose until a strict UTC deadline. */
+export function fullCaptureEnabled(env, now = Date.now()) {
+  if (Object.prototype.hasOwnProperty.call(env ?? {}, 'ANALYTICS_FULL_CAPTURE_UNTIL')) {
+    const value = env.ANALYTICS_FULL_CAPTURE_UNTIL;
+    if (typeof value !== 'string'
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)) return false;
+    const deadline = Date.parse(value);
+    const normalized = value.replace(/Z$/, value.includes('.') ? 'Z' : '.000Z');
+    return Number.isFinite(deadline) && new Date(deadline).toISOString() === normalized
+      && Number.isFinite(now) && now < deadline;
+  }
+  return env?.ANALYTICS_MONITOR_FILTER === 'off';
+}
+
 export function shouldCapture(event, request, _properties = {}, env = {}) {
-  if (env.ANALYTICS_MONITOR_FILTER === 'off') return true;
+  if (fullCaptureEnabled(env)) return true;
   if (!request || !ROUTINE_MONITOR_UAS.includes(request.headers?.get?.('user-agent') || '')) return true;
   if (request.headers?.get?.('x-payment') || request.headers?.get?.('payment-signature')) return true;
   if (event === EVENTS.quoteIssued) return false;

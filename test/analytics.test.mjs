@@ -26,6 +26,7 @@ import {
   analyticsEnabled,
   callRefused,
   capture,
+  fullCaptureEnabled,
   housePayer,
   paymentSettled,
   quoteIssued,
@@ -168,6 +169,23 @@ describe('narrow CarbonMonitor suppression', () => {
     headers: { 'user-agent': 'CarbonMonitor/0.1 healthcheck (+https://carbon-cashmere.de)', ...headers },
   });
 
+  it('enables full capture only before a strict valid deadline', () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    assert.equal(fullCaptureEnabled({ ANALYTICS_FULL_CAPTURE_UNTIL: '2026-09-07T12:00:00.001Z' }, now), true);
+    assert.equal(fullCaptureEnabled({ ANALYTICS_FULL_CAPTURE_UNTIL: '2026-09-07T12:00:00Z' }, now - 1), true);
+    assert.equal(fullCaptureEnabled({ ANALYTICS_FULL_CAPTURE_UNTIL: '2026-09-07T12:00:00.000Z' }, now), false);
+    assert.equal(fullCaptureEnabled({ ANALYTICS_FULL_CAPTURE_UNTIL: '2026-09-07T11:59:59.999Z' }, now), false);
+    for (const value of ['malformed', '', '2026-02-30T12:00:00Z']) {
+      assert.equal(fullCaptureEnabled({ ANALYTICS_FULL_CAPTURE_UNTIL: value }, now), false);
+    }
+  });
+
+  it('gives an explicit deadline precedence over the legacy rollback', () => {
+    const now = Date.parse('2026-09-07T12:00:00.000Z');
+    assert.equal(fullCaptureEnabled({ ANALYTICS_FULL_CAPTURE_UNTIL: '', ANALYTICS_MONITOR_FILTER: 'off' }, now), false);
+    assert.equal(fullCaptureEnabled({ ANALYTICS_MONITOR_FILTER: 'off' }, now), true);
+  });
+
   it('drops only exact unpaid routine quotes', () => {
     assert.equal(shouldCapture(EVENTS.quoteIssued, monitor(), {}, {}), false);
     assert.equal(shouldCapture(EVENTS.quoteIssued, monitor({ 'x-payment': 'present' }), {}, {}), true);
@@ -179,6 +197,11 @@ describe('narrow CarbonMonitor suppression', () => {
       assert.equal(shouldCapture(event, monitor(), {}, {}), true);
     }
     assert.equal(shouldCapture(EVENTS.quoteIssued, monitor(), {}, { ANALYTICS_MONITOR_FILTER: 'off' }), true);
+  });
+
+  it('an active deadline restores the exact monitor through shouldCapture', () => {
+    const env = { ANALYTICS_FULL_CAPTURE_UNTIL: '2999-01-01T00:00:00Z' };
+    assert.equal(shouldCapture(EVENTS.quoteIssued, monitor(), {}, env), true);
   });
 });
 
