@@ -30,6 +30,7 @@ import {
   paymentSettled,
   quoteIssued,
   refusalReason,
+  shouldCapture,
   toolServed,
   usdOf,
 } from '../worker/analytics.js';
@@ -162,6 +163,25 @@ describe('the event family', () => {
   });
 });
 
+describe('narrow CarbonMonitor suppression', () => {
+  const monitor = (headers = {}) => new Request('https://toolshed.lemon-agent.dev/convert/md-html', {
+    headers: { 'user-agent': 'CarbonMonitor/0.1 healthcheck (+https://carbon-cashmere.de)', ...headers },
+  });
+
+  it('drops only exact unpaid routine quotes', () => {
+    assert.equal(shouldCapture(EVENTS.quoteIssued, monitor(), {}, {}), false);
+    assert.equal(shouldCapture(EVENTS.quoteIssued, monitor({ 'x-payment': 'present' }), {}, {}), true);
+    assert.equal(shouldCapture(EVENTS.quoteIssued, new Request('https://x', { headers: { 'user-agent': 'CarbonMonitor/0.2' } }), {}, {}), true);
+  });
+
+  it('preserves refusals, served work and settlements; rollback restores quotes', () => {
+    for (const event of [EVENTS.callRefused, EVENTS.toolServed, EVENTS.paymentSettled]) {
+      assert.equal(shouldCapture(event, monitor(), {}, {}), true);
+    }
+    assert.equal(shouldCapture(EVENTS.quoteIssued, monitor(), {}, { ANALYTICS_MONITOR_FILTER: 'off' }), true);
+  });
+});
+
 describe('the refusal vocabulary', () => {
   it('is closed, and every emitted reason is in it', async () => {
     for (const reason of REFUSAL_REASONS) {
@@ -290,6 +310,7 @@ describe('the house flag', () => {
       paymentSettled(ENV, null, req(), { ...SHED, payer: 'D7f9EifwoMdfwozWDNLFhBGwecVhryc5fs2SxLK93M45' })
     );
     assert.equal(body.properties.house, true);
+    assert.equal(housePayer(ENV, 'd7f9EifwoMdfwozWDNLFhBGwecVhryc5fs2SxLK93M45', 'solana'), false);
   });
 
   it('is false for a third party, and for an event with no payer at all', async () => {
