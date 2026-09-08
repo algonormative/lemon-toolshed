@@ -68,12 +68,18 @@ const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 // entries.yaml: $0.002 is "2000", $0.004 is "4000", $0.006 is "6000". The descriptions are
 // asserted verbatim rather than derived — the string is published in the
 // envelope and in the Bazaar listing, so a silent edit to one is worth failing on.
+//
+// Those five strings were "<X> to <Y> conversion" — 27 characters — until
+// 2026-09-02, when they were rewritten to say what a tool actually does, because
+// description is what an agent RANKS on in Bazaar and x402scan. The bar the
+// suite now holds is in surfaces.test.mjs (>= 100 characters, all 19 distinct);
+// what is held here is that the envelope publishes the exact string.
 const TOOLS = {
-  'md-html': { input: '# hi\n', amount: '4000', description: 'Markdown to HTML conversion', mimeType: 'text/html', from: 'Markdown', to: 'HTML' },
-  'csv-json': { input: 'a\n1\n', amount: '2000', description: 'CSV to JSON conversion', mimeType: 'application/json', from: 'CSV', to: 'JSON' },
-  'json-yaml': { input: '{"a":1}', amount: '2000', description: 'JSON to YAML conversion', mimeType: 'application/yaml', from: 'JSON', to: 'YAML' },
-  'yaml-json': { input: 'a: 1\n', amount: '2000', description: 'YAML to JSON conversion', mimeType: 'application/json', from: 'YAML', to: 'JSON' },
-  'html-markdown': { input: '<p>hi</p>', amount: '6000', description: 'HTML to Markdown conversion', mimeType: 'text/markdown', from: 'HTML', to: 'Markdown' },
+  'md-html': { input: '# hi\n', amount: '4000', description: 'Markdown to HTML. POST a Markdown file; the response is an HTML FRAGMENT — CommonMark plus GitHub tables, no <html> wrapper and no stylesheet. It does not sanitize: raw HTML in the input passes through, so sanitize before rendering untrusted output into a page.', mimeType: 'text/html', from: 'Markdown', to: 'HTML' },
+  'csv-json': { input: 'a\n1\n', amount: '2000', description: 'CSV to JSON. POST a CSV file with a header row; the response is an array of objects keyed by that row. RFC 4180, so quoted commas and embedded newlines survive. Short rows are padded; a row with MORE fields than the header is an error, never a silent truncation.', mimeType: 'application/json', from: 'CSV', to: 'JSON' },
+  'json-yaml': { input: '{"a":1}', amount: '2000', description: 'JSON to YAML. POST any JSON value; the response is block-style YAML — the readable, indented form, not flow style. Any top-level shape is accepted, not just an object. There are no comments to preserve in either direction, because JSON has none.', mimeType: 'application/yaml', from: 'JSON', to: 'YAML' },
+  'yaml-json': { input: 'a: 1\n', amount: '2000', description: 'YAML to JSON. POST a YAML document; the response is pretty-printed JSON. Anchors and aliases are resolved, and a multi-document stream converts as its FIRST document rather than as an array — the direction that bites, because YAML is the larger language.', mimeType: 'application/json', from: 'YAML', to: 'JSON' },
+  'html-markdown': { input: '<p>hi</p>', amount: '6000', description: 'HTML to Markdown. POST a saved page or an HTML fragment; the response is Markdown with ATX headings and fenced code. The page is parsed with a real DOM, so structure survives — but nav, ads and cookie banners convert too: pre-strip if you only want the article body.', mimeType: 'text/markdown', from: 'HTML', to: 'Markdown' },
   'json-csv': { input: '[{"a":1}]', amount: '2000', mimeType: 'text/csv', from: 'JSON', to: 'CSV' },
   'csv-yaml': { input: 'a\n1\n', amount: '2000', mimeType: 'application/yaml', from: 'CSV', to: 'YAML' },
   'yaml-csv': { input: '- a: 1\n', amount: '2000', mimeType: 'text/csv', from: 'YAML', to: 'CSV' },

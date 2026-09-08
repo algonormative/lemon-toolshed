@@ -331,7 +331,10 @@ describe('verify says yes', () => {
         network: 'base',
         maxAmountRequired: '2000',
         resource: `${SITE_BASE}/convert/csv-json`,
-        description: 'CSV to JSON conversion',
+        description:
+          'CSV to JSON. POST a CSV file with a header row; the response is an array of objects ' +
+          'keyed by that row. RFC 4180, so quoted commas and embedded newlines survive. Short rows ' +
+          'are padded; a row with MORE fields than the header is an error, never a silent truncation.',
         mimeType: 'application/json',
         payTo: PAYTO_TEST,
         maxTimeoutSeconds: 60,

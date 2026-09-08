@@ -95,6 +95,44 @@ describe('the 402 is the front door', () => {
     }
   });
 
+  // The 402 is the ONLY response on this service that carries an unbounded-ish
+  // header: the whole v2 envelope travels base64 in PAYMENT-REQUIRED, and it
+  // contains each tool's description, its sample body and that sample's
+  // converted output. Descriptions grew from 27 characters to a few hundred on
+  // 2026-09-02 because description is what an agent ranks on — which makes the
+  // header budget a thing to measure rather than assume.
+  //
+  // Cloudflare's documented limits: 16 KB for ONE header value, 32 KB for all
+  // headers together. Blowing either does not degrade gracefully — the response
+  // is rejected at the edge, so every v2 client sees a seller with no terms.
+  const MAX_HEADER_VALUE_BYTES = 16 * 1024;
+  const MAX_ALL_HEADERS_BYTES = 32 * 1024;
+
+  test('every tool 402 stays inside the Cloudflare header budget', async () => {
+    for (const id of HOSTED_IDS) {
+      const res = await api.convert(id, INPUTS[id], { ip: ips.next(), ua: 'tier-off-suite/1' });
+      assert.equal(res.status, 402, `${id}: expected a 402 to measure, got ${res.status}`);
+
+      const envelope = res.headers.get('payment-required');
+      assert.ok(envelope, `${id}: no PAYMENT-REQUIRED header to measure`);
+      const envelopeBytes = Buffer.byteLength(envelope, 'utf8');
+      assert.ok(
+        envelopeBytes < MAX_HEADER_VALUE_BYTES,
+        `${id}: PAYMENT-REQUIRED is ${envelopeBytes} bytes, over the ${MAX_HEADER_VALUE_BYTES} cap on one header value`
+      );
+
+      // "name: value\r\n" per header, which is how the byte budget is spent.
+      let total = 0;
+      for (const [name, value] of res.headers) {
+        total += Buffer.byteLength(name, 'utf8') + Buffer.byteLength(value, 'utf8') + 4;
+      }
+      assert.ok(
+        total < MAX_ALL_HEADERS_BYTES,
+        `${id}: response headers total ${total} bytes, over the ${MAX_ALL_HEADERS_BYTES} cap`
+      );
+    }
+  });
+
   test('the envelope carries outputSchema with discoverable inside input', async () => {
     // The exact shape Coinbase's validator reads. `discoverable` lives INSIDE
     // outputSchema.input — an envelope that hoists it to the top level is

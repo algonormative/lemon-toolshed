@@ -675,6 +675,19 @@ reached.
 | `HOUSE_PAYERS` | yes | comma-separated wallet addresses whose payments read as a 🧪 test rather than a 🍋💰 sale. Compared lowercased, so a base58 Solana address matches in any case. Holds both house buyers — the EVM one and the Solana one. Non-secret: these are public chain addresses, and it lives in `wrangler.toml`. Also the source of the `house` flag on every analytics event. |
 | `POSTHOG_PROJECT_TOKEN` | yes | the estate's shared PostHog project. A **Worker secret**. Unset = no analytics and **no network call at all**. See [Traffic analytics](#traffic-analytics). |
 | `POSTHOG_HOST` | yes | optional override of the PostHog ingest root, default `https://us.i.posthog.com`. Only a test would set it, to reach a local mock — the same pattern `FACILITATOR_URL` and `TELEGRAM_API_BASE` use. |
+| `WELLKNOWN_402INDEX` | yes | the 402 Index ownership-verification **hash**, served verbatim as `text/plain` at `GET /.well-known/402index-verify.txt`. **Unset = 404**, which is the normal state outside a verification window. |
+| `WELLKNOWN_X402LIST` | yes | the x402-list one-time ownership **token**, served verbatim as `text/plain` at `GET /.well-known/x402list.txt`. **Unset = 404**, same as above. |
+
+**The two `WELLKNOWN_*` vars are vars and not committed files on purpose.** Both
+registries verify origin ownership by fetching a static file, and both hand out
+a credential that expires in about 72 hours — 402 Index's claim hash (from
+`POST https://402index.io/api/v1/claim`) and x402-list's update token (from
+`POST /api/v1/services/<slug>/request-update`). A committed file would be a
+short-lived secret in git, stale before the next deploy, and re-verifying would
+mean a code change. As vars, a rotation rebuilds nothing. The body is served
+**byte for byte** — no trim, no appended newline — because a registry compares
+bytes; an all-whitespace value reads as unset. `test/wellknown.test.mjs` boots a
+worker with each var set and one without and pins both behaviours.
 
 **`FREE_TIER_DAILY` is only half the switch.** It is what the *Worker* enforces;
 the *static* copy — the page, `catalog.json`, `llms.txt`, `llms-full.txt`,

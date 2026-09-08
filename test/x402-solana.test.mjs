@@ -226,7 +226,10 @@ describe('PAYTO_SOLANA unset leaves the envelope exactly as it was', () => {
         network: 'base',
         maxAmountRequired: AMOUNT,
         resource: `${SITE_BASE}/convert/md-html`,
-        description: 'Markdown to HTML conversion',
+        description:
+          'Markdown to HTML. POST a Markdown file; the response is an HTML FRAGMENT — CommonMark ' +
+          'plus GitHub tables, no <html> wrapper and no stylesheet. It does not sanitize: raw HTML ' +
+          'in the input passes through, so sanitize before rendering untrusted output into a page.',
         mimeType: 'text/html',
         payTo: PAYTO_TEST,
         maxTimeoutSeconds: 60,

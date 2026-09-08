@@ -3,15 +3,20 @@
 //
 // Reads entries.yaml and emits:
 //   dist/index.html               — the page (picker, shelves, for-agents, notes)
+//   dist/404.html                 — so Pages answers an unknown path 404 rather
+//                                    than 200 + the landing page (soft-404)
 //   dist/catalog.json             — every field, including the hosted/local blocks
+//   dist/sitemap.xml              — the page plus every machine surface
+//   dist/.well-known/x402         — the x402 discovery document (v2 shape)
 //   dist/llms.txt                 — one line per pair
 //   dist/llms-full.txt            — full verdicts
 //   worker/catalog.generated.js   — the same catalog compiled into the API Worker,
 //                                    so GET /check needs no fetch, no KV and no D1
 //   worker/surfaces.generated.js  — the non-HTML machine surfaces above (catalog,
-//                                    openapi, robots, llms, llms-full), compiled
-//                                    into the API Worker so it can serve them
-//                                    directly — see the note below
+//                                    openapi, robots, llms, llms-full, sitemap,
+//                                    .well-known/x402), compiled into the API
+//                                    Worker so it can serve them directly — see
+//                                    the note below
 //
 // The read surface is static: the Pages project ships static assets and ZERO
 // Functions (dossier § Limits) — a Function re-opens the pages.dev twin's
@@ -2097,15 +2102,137 @@ export const CATALOG = ${JSON.stringify(
 )};
 `;
 
+// ---------------------------------------------------------------- .well-known/x402
+//
+// The discovery document — the file a crawler, a registry or a linter reads
+// before it ever makes a paid call. It did not exist until 2026-09-02, and its
+// absence was worse than nothing: the Pages project answered every unknown path
+// with a 200 and the landing page, so `GET /.well-known/x402` returned 152 KB of
+// HTML and an indexer could not tell "no discovery document" from "a discovery
+// document that is not JSON". Shape mirrors 10x402's (~/git/10x402/build.mjs).
+//
+// TWO THINGS THIS FILE DELIBERATELY DOES NOT CARRY.
+//
+//   `payTo`. It is a runtime var (PAYTO / PAYTO_SOLANA) the build cannot read,
+//   and a stale receiving address in a static file is the single worst thing
+//   this repo could publish. The live 402 is the authority.
+//
+//   Which rails are actually ON. Solana is env-gated on PAYTO_SOLANA at
+//   runtime, so a deployment may answer with one accepts entry or two. Both are
+//   listed here because both are configured in production; the LIVE 402
+//   ENVELOPE IS AUTHORITATIVE, and the `note` below says so in the document
+//   itself rather than only in this comment.
+
+// MIRRORS worker/beacon.js (USDC_BASE, NETWORK_V2, USDC_SOLANA,
+// NETWORK_SOLANA_V2 — lines ~127-157 there). They are duplicated rather than
+// imported because build.mjs CANNOT import worker/beacon.js: that module pulls
+// in the workerd built-in `cloudflare:email`, which Node's ESM loader refuses.
+// KEEP THEM IN SYNC — test/surfaces.test.mjs reads beacon.js as text and fails
+// if any of the four literals below has drifted out of it.
+const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const NETWORK_BASE_V2 = 'eip155:8453';
+const USDC_SOLANA = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const NETWORK_SOLANA_V2 = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp';
+
+// USDC has 6 decimals on BOTH rails, so one atomic figure serves both entries —
+// the same identity worker/beacon.js relies on. Rendered through the same
+// rounding as usdDecimal() above, so the decimal published in openapi.json and
+// the atomic amount published here cannot disagree.
+const atomicAmount = (usd) => String(Math.round(usd * 10 ** USD_DECIMALS));
+
+// `accepts` for one hosted tool: Base first, Solana second, same price on
+// either. Order matters — it is the order the live envelope uses, and a client
+// that takes the first entry it understands should land on the rail with
+// settlements on it. A free tool (none today) quotes no terms rather than an
+// invented price.
+const wellKnownAccepts = (hosted) =>
+  isFree(hosted)
+    ? []
+    : [
+        { scheme: hosted.price.scheme, network: NETWORK_BASE_V2, amount: atomicAmount(hosted.price.amount_usd), asset: USDC_BASE },
+        { scheme: hosted.price.scheme, network: NETWORK_SOLANA_V2, amount: atomicAmount(hosted.price.amount_usd), asset: USDC_SOLANA },
+      ];
+
+const wellKnownX402 = {
+  x402Version: 2,
+  service: {
+    name: SITE_NAME,
+    description:
+      'Paid file conversions for agents over x402: POST the raw file, get the converted file back. ' +
+      'No install, no account, no API key — the 402 is the front door.',
+    url: BASE,
+    tags: ['x402', 'conversion', 'file-conversion', 'developer-tools', 'agents'],
+    // The same address openapi.json's `info.contact` publishes.
+    contact: 'support@lemon-agent.dev',
+    // The estate, declared where a discovery crawler already looks, so the
+    // house's documents describe one graph rather than unrelated services.
+    related: [
+      {
+        name: '10x402',
+        url: 'https://10x402.com',
+        relation: 'sibling: x402 conformance linting',
+      },
+    ],
+  },
+  // One entry per HOSTED LIVE tool — the same list openapi.json's convert paths
+  // are built from, so a tool cannot appear in one document and not the other.
+  resources: hostedLive.map((e) => ({
+    url: `${API_BASE}${e._hosted.path}`,
+    method: 'POST',
+    // entries.yaml carries no `description` field; `x`/`y` are the pair, and
+    // this is the exact string openapi.json publishes as the operation summary.
+    // Derived rather than typed, so a re-worded entry cannot leave a stale
+    // sentence in the discovery document.
+    description: `${oneLine(e.x)} to ${oneLine(e.y)}`,
+    mimeType: responseMime(e),
+    accepts: wellKnownAccepts(e._hosted),
+  })),
+  note:
+    'The authoritative terms — including payTo, and which rails are actually accepted — are in the ' +
+    '402 each resource answers with. This document is static and carries no receiving address: a ' +
+    'stale one in a file is worse than none. The Solana entry is present because that rail is ' +
+    'configured in production, but whether a deployment offers it is a runtime fact this build ' +
+    `cannot know. GET ${API_BASE}/check for the live catalogue.`,
+};
+
 // ---------------------------------------------------------------- emit
 
 // robots.txt: allow everything. It exists so a prober gets a real 200 with a
 // real answer instead of the SPA fallback, which is indistinguishable from a
 // misconfigured site to anything that checks.
-const robots = ['User-agent: *', 'Allow: /', '', `Sitemap: ${BASE}/`, ''].join('\n');
+//
+// `Sitemap:` used to point at `${BASE}/` — the site root, which is not a
+// sitemap. A crawler that follows it gets the landing page and learns nothing.
+const robots = ['User-agent: *', 'Allow: /', '', `Sitemap: ${BASE}/sitemap.xml`, ''].join('\n');
+
+// sitemap.xml — the browsable page plus the machine surfaces, so a crawler that
+// starts at robots.txt can enumerate the whole read surface without guessing.
+const SITEMAP_PATHS = ['/', '/llms.txt', '/llms-full.txt', '/openapi.json', '/catalog.json', '/.well-known/x402'];
+const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${SITEMAP_PATHS.map((p) => `<url><loc>${BASE}${p}</loc></url>`).join('\n')}
+</urlset>
+`;
 
 const catalogJson = `${JSON.stringify(catalog, null, 2)}\n`;
 const openapiJson = `${JSON.stringify(openapi, null, 2)}\n`;
+const wellKnownJson = `${JSON.stringify(wellKnownX402, null, 2)}\n`;
+
+// 404.html — WITHOUT this file Cloudflare Pages treats the site as an SPA and
+// answers EVERY unknown path with 200 and the 151 KB landing page. Measured
+// 2026-09-02: `/.well-known/x402`, `/skill.md` and `/sitemap.xml` all came back
+// as that HTML body with a 200, which makes "surface missing" and "surface
+// present" indistinguishable to a crawler, a linter or the Bazaar indexer.
+// Small and plain on purpose: it is an error page, not a second landing page.
+const notFoundHtml = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex"><title>404 — ${SITE_NAME}</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#faf7f0;color:#241f16;font:500 1rem/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}main{text-align:center;padding:2rem;max-width:34rem}h1{font-size:1.3rem;margin:0 0 .5rem}p{color:#6b6152}a{color:#8a5a00}</style>
+</head><body><main><h1>404 — no such path</h1>
+<p>That path does not exist on ${SITE_NAME}, and this is a real 404 with a real 404 status.</p>
+<p><a href="/">the shed</a> · <a href="/llms.txt">llms.txt</a> · <a href="/openapi.json">openapi.json</a> · <a href="/.well-known/x402">.well-known/x402</a></p>
+</main></body></html>
+`;
 
 // The non-HTML machine surfaces. ONE list drives both dist/ and the Worker
 // bundle, so the copy the zone Worker serves can never drift from the static
@@ -2114,18 +2241,34 @@ const openapiJson = `${JSON.stringify(openapi, null, 2)}\n`;
 // project, Functions included). index.html is deliberately not in this list:
 // it stays Pages-only, and so does '/' — browsers pass the integrity check,
 // and that is the volume worth keeping off the metered Worker path.
+//
+// `.well-known/x402` is in here rather than dist-only because wrangler.toml
+// already routes `/.well-known/*` to the zone Worker: a dist-only copy would
+// simply never be reached in production. `sitemap.xml` is in here for the
+// byte-identity guarantee only — there is no zone route for it, so Pages is
+// what serves it today (test/surfaces.test.mjs pins that exception by name).
 const MACHINE_SURFACES = [
   { file: 'catalog.json', body: catalogJson, contentType: 'application/json; charset=utf-8' },
   { file: 'openapi.json', body: openapiJson, contentType: 'application/json; charset=utf-8' },
   { file: 'robots.txt', body: robots, contentType: 'text/plain; charset=utf-8' },
   { file: 'llms.txt', body: llms, contentType: 'text/plain; charset=utf-8' },
   { file: 'llms-full.txt', body: llmsFull, contentType: 'text/plain; charset=utf-8' },
+  { file: 'sitemap.xml', body: sitemap, contentType: 'application/xml; charset=utf-8' },
+  { file: '.well-known/x402', body: wellKnownJson, contentType: 'application/json; charset=utf-8' },
 ];
 
 rmSync(DIST, { recursive: true, force: true });
 mkdirSync(DIST, { recursive: true });
 writeFileSync(join(DIST, 'index.html'), html);
-for (const s of MACHINE_SURFACES) writeFileSync(join(DIST, s.file), s.body);
+// 404.html is dist-only: Pages is what serves an unmatched path, and the Worker
+// never sees one (its routes are exact paths plus /convert/*, /check* and
+// /.well-known/*, each of which it answers itself).
+writeFileSync(join(DIST, '404.html'), notFoundHtml);
+for (const s of MACHINE_SURFACES) {
+  // `.well-known/x402` has a directory component; the rest do not.
+  mkdirSync(dirname(join(DIST, s.file)), { recursive: true });
+  writeFileSync(join(DIST, s.file), s.body);
+}
 writeFileSync(join(ROOT, 'worker', 'catalog.generated.js'), workerCatalog);
 
 // worker/surfaces.generated.js — the MACHINE_SURFACES bodies, compiled into
@@ -2180,8 +2323,13 @@ console.log(
         'enforces env.FREE_TIER_DAILY (unset = off).'
 );
 console.log(
-  'build: wrote dist/index.html dist/catalog.json dist/openapi.json dist/robots.txt dist/llms.txt ' +
-    'dist/llms-full.txt worker/catalog.generated.js worker/surfaces.generated.js'
+  'build: wrote dist/index.html dist/404.html dist/catalog.json dist/openapi.json dist/robots.txt ' +
+    'dist/sitemap.xml dist/.well-known/x402 dist/llms.txt dist/llms-full.txt ' +
+    'worker/catalog.generated.js worker/surfaces.generated.js'
+);
+console.log(
+  `build: discovery doc lists ${wellKnownX402.resources.length} paid resources on ` +
+    `${NETWORK_BASE_V2} and ${NETWORK_SOLANA_V2}; sitemap lists ${SITEMAP_PATHS.length} URLs`
 );
 console.log(
   `build: Worker-served machine surfaces ${MACHINE_SURFACES.map((s) => `/${s.file}`).join(' ')}`
