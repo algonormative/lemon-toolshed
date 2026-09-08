@@ -250,6 +250,56 @@ function handleSurface(request, surface) {
   });
 }
 
+// ------------------------------------------------------------------ registry ownership files
+//
+// Two registries verify that we own this origin by asking for a static file at
+// a well-known path, and BOTH HAND OUT A TOKEN THAT EXPIRES — 402 Index's claim
+// hash and x402-list's one-time update token are good for about 72 hours. A
+// committed file is therefore the wrong shape: it would be a secret in git that
+// is stale before the next deploy, and re-verifying would mean a code change.
+// They are read from env vars instead, so a rotation is a `wrangler secret put`
+// (or a dashboard edit) and nothing rebuilds.
+//
+//   /.well-known/402index-verify.txt   env.WELLKNOWN_402INDEX
+//     body is exactly the verification HASH returned by
+//     POST https://402index.io/api/v1/claim {"domain": …}
+//   /.well-known/x402list.txt          env.WELLKNOWN_X402LIST
+//     the one-time ownership token returned by
+//     POST /api/v1/services/<slug>/request-update
+//
+// UNSET IS A WORKING STATE, not a misconfiguration: outside a verification
+// window there is no token, and the honest answer is 404 — the file genuinely
+// is not there. That is also why the body is served VERBATIM (no trim, no
+// appended newline): a registry compares bytes, and "helpfully" normalising one
+// is how a verification fails for a reason nobody can see.
+const WELLKNOWN_VARS = {
+  '/.well-known/402index-verify.txt': 'WELLKNOWN_402INDEX',
+  '/.well-known/x402list.txt': 'WELLKNOWN_X402LIST',
+};
+
+function handleWellKnownVar(request, env, varName) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return new Response(null, { status: 405, headers: { ...CORS, allow: 'GET, HEAD' } });
+  }
+  const value = env?.[varName];
+  // Trimmed only for the EMPTINESS test — an all-whitespace var is an unset one
+  // that a dashboard field left behind. What is served is the raw value.
+  if (typeof value !== 'string' || !value.trim()) {
+    return new Response(null, { status: 404, headers: CORS });
+  }
+  return new Response(request.method === 'HEAD' ? null : value, {
+    status: 200,
+    headers: {
+      ...CORS,
+      'content-type': 'text/plain; charset=utf-8',
+      // The token rotates inside a 72-hour window; a cached copy of a retired
+      // one is a verification that fails against a file we already replaced.
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    },
+  });
+}
+
 export default {
   // `ctx` is threaded through for exactly one thing: ctx.waitUntil, which lets
   // /convert answer the caller and settle the payment afterwards. Nothing on
@@ -260,9 +310,12 @@ export default {
     if (surface) return handleSurface(request, surface);
     if (path === '/check') return handleCheck(request, env);
     if (path.startsWith('/convert/')) return handleConvert(request, env, path, ctx);
-    // wrangler.toml also routes /.well-known/* here, forward-looking for
-    // discovery/registry-verification files that do not exist yet (tracked:
-    // vault-1x3u5) — a plain 404 (a file genuinely is not there), not the 405
+    // The env-backed registry ownership files, ahead of the generic
+    // /.well-known/ 404 below. See WELLKNOWN_VARS.
+    const wellKnownVar = WELLKNOWN_VARS[path];
+    if (wellKnownVar) return handleWellKnownVar(request, env, wellKnownVar);
+    // wrangler.toml routes all of /.well-known/* here. Everything not handled
+    // above is a plain 404 (a file genuinely is not there), not the 405
     // handleBeacon()'s catch-all gives every other GET on an unrecognised path.
     if (path.startsWith('/.well-known/')) return new Response(null, { status: 404, headers: CORS });
     return handleBeacon(request, env, path);
@@ -2446,10 +2499,24 @@ function oneLineMessage(err) {
 // the bazaar spec treats as a worked example of the call rather than as a
 // description of one. So it has to actually convert — an example that 400s is
 // worse than no example, and the suite pays for each of these and asserts a 200.
-// Kept short because it rides in a response HEADER on every unpaid call.
+//
+// `description` IS THE RANKING SURFACE. It is what Bazaar and x402scan show an
+// agent choosing between endpoints, so it says what goes in, what comes out and
+// the one caveat that decides whether this is the right tool — not "X to Y
+// conversion", which was the whole 27-character description five of these
+// carried until 2026-09-02 and which distinguishes us from nobody.
+//
+// It also rides in the base64 PAYMENT-REQUIRED header on EVERY unpaid call, so
+// it is bounded rather than unbounded: a few hundred characters, no more.
+// Cloudflare caps one header value at 16 KB and all response headers at 32 KB;
+// test/tier-off.test.mjs measures the built envelope for every tool against
+// both ceilings, so the budget is asserted rather than assumed.
 const CONVERTERS = {
   'md-html': {
-    description: 'Markdown to HTML conversion',
+    description:
+      'Markdown to HTML. POST a Markdown file; the response is an HTML FRAGMENT — CommonMark plus ' +
+      'GitHub tables, no <html> wrapper and no stylesheet. It does not sanitize: raw HTML in the ' +
+      'input passes through, so sanitize before rendering untrusted output into a page.',
     mimeType: 'text/html',
     inputFormat: 'Markdown',
     outputFormat: 'HTML',
@@ -2459,7 +2526,10 @@ const CONVERTERS = {
   },
 
   'json-yaml': {
-    description: 'JSON to YAML conversion',
+    description:
+      'JSON to YAML. POST any JSON value; the response is block-style YAML — the readable, ' +
+      'indented form, not flow style. Any top-level shape is accepted, not just an object. There ' +
+      'are no comments to preserve in either direction, because JSON has none.',
     mimeType: 'application/yaml',
     inputFormat: 'JSON',
     outputFormat: 'YAML',
@@ -2477,7 +2547,10 @@ const CONVERTERS = {
   },
 
   'yaml-json': {
-    description: 'YAML to JSON conversion',
+    description:
+      'YAML to JSON. POST a YAML document; the response is pretty-printed JSON. Anchors and ' +
+      'aliases are resolved, and a multi-document stream converts as its FIRST document rather ' +
+      'than as an array — the direction that bites, because YAML is the larger language.',
     mimeType: 'application/json',
     inputFormat: 'YAML',
     outputFormat: 'JSON',
@@ -2497,7 +2570,10 @@ const CONVERTERS = {
   },
 
   'csv-json': {
-    description: 'CSV to JSON conversion',
+    description:
+      'CSV to JSON. POST a CSV file with a header row; the response is an array of objects keyed ' +
+      'by that row. RFC 4180, so quoted commas and embedded newlines survive. Short rows are ' +
+      'padded; a row with MORE fields than the header is an error, never a silent truncation.',
     mimeType: 'application/json',
     inputFormat: 'CSV',
     outputFormat: 'JSON',
@@ -2507,7 +2583,10 @@ const CONVERTERS = {
   },
 
   'html-markdown': {
-    description: 'HTML to Markdown conversion',
+    description:
+      'HTML to Markdown. POST a saved page or an HTML fragment; the response is Markdown with ATX ' +
+      'headings and fenced code. The page is parsed with a real DOM, so structure survives — but ' +
+      'nav, ads and cookie banners convert too: pre-strip if you only want the article body.',
     mimeType: 'text/markdown',
     inputFormat: 'HTML',
     outputFormat: 'Markdown',

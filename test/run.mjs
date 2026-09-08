@@ -55,6 +55,16 @@ const PHASES = [
     files: ['test/surfaces.test.mjs'],
   },
   {
+    // STANDALONE, same shape as machine surfaces above and for a sharper
+    // reason: the registry ownership files are answered out of env vars whose
+    // values are fixed for the life of a `wrangler dev` process, and the suite
+    // needs BOTH a worker with them set and one without. It boots its own two.
+    name: 'registry ownership files (WELLKNOWN_* vars set and unset)',
+    standalone: true,
+    note: 'boots its own two workers: one with the verification vars set, one without',
+    files: ['test/wellknown.test.mjs'],
+  },
+  {
     // The env-gated free tier. These suites need conversions actually SERVED —
     // the converter fixtures because that is what they assert on, the quota and
     // spoof suites because the tier IS what they assert on — and with no

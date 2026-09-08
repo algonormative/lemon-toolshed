@@ -29,7 +29,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, extname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parse as tomlParse } from 'smol-toml';
-import { bootWorker, client } from './harness.mjs';
+import { XMLParser } from 'fast-xml-parser';
+import { bootWorker, client, CATALOG } from './harness.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = join(ROOT, 'dist');
@@ -60,7 +61,23 @@ const HOST = 'toolshed.lemon-agent.dev';
 const EXPECTED_CONTENT_TYPE = {
   '.txt': 'text/plain; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
 };
+
+// The discovery document has no extension by design — `/.well-known/x402` is
+// the path the x402 ecosystem reads, not `/.well-known/x402.json` — so it is
+// registered by path instead. Kept as a named exception rather than a default,
+// so a NEW extensionless surface still has to declare what it serves.
+const EXPECTED_CONTENT_TYPE_BY_PATH = {
+  '/.well-known/x402': 'application/json; charset=utf-8',
+};
+
+// Surfaces compiled into the Worker bundle that have NO wrangler.toml route,
+// and are therefore served by Pages today. This is a deliberate, enumerated
+// exception — wrangler.toml is not edited by the change that added it — and it
+// exists so the route assertion below still fails for any surface added
+// without a route by accident.
+const ROUTELESS_SURFACES = new Set(['/sitemap.xml']);
 
 let worker;
 let api;
@@ -90,8 +107,19 @@ describe('worker/surfaces.generated.js', () => {
     assert.ok(!('/' in SURFACES), '/ must stay Pages-only');
   });
 
-  test('at least the five discovery surfaces are present', () => {
-    for (const p of ['/llms.txt', '/llms-full.txt', '/openapi.json', '/catalog.json', '/robots.txt']) {
+  test('every discovery surface is present', () => {
+    for (const p of [
+      '/llms.txt',
+      '/llms-full.txt',
+      '/openapi.json',
+      '/catalog.json',
+      '/robots.txt',
+      // Added 2026-09-02. `/.well-known/x402` MUST be here rather than
+      // dist-only: wrangler.toml routes /.well-known/* to this Worker, so a
+      // Pages-only copy would never be reached in production.
+      '/sitemap.xml',
+      '/.well-known/x402',
+    ]) {
       assert.ok(p in SURFACES, `worker/surfaces.generated.js is missing ${p}`);
     }
   });
@@ -108,7 +136,7 @@ describe('worker/surfaces.generated.js', () => {
 
   test('content-type follows the file-extension convention', () => {
     for (const [path, surface] of Object.entries(SURFACES)) {
-      const expected = EXPECTED_CONTENT_TYPE[extname(path)];
+      const expected = EXPECTED_CONTENT_TYPE_BY_PATH[path] ?? EXPECTED_CONTENT_TYPE[extname(path)];
       assert.ok(expected, `${path}: no expected content-type registered for this extension`);
       assert.equal(surface.contentType, expected, `${path}: unexpected content-type`);
     }
@@ -163,9 +191,254 @@ describe('wrangler.toml routes every surface to this Worker', () => {
   };
 
   for (const path of Object.keys(SURFACES)) {
+    if (ROUTELESS_SURFACES.has(path)) continue;
     test(`${path} has a matching wrangler.toml route for ${HOST}`, () => {
       const matched = routes.some((r) => covers(r.pattern, path));
       assert.ok(matched, `no wrangler.toml route for ${HOST} covers ${path}`);
     });
   }
+
+  // The exception list is itself asserted: an entry that has quietly GAINED a
+  // route should come off the list rather than sit there hiding a route test.
+  test('the routeless exceptions are exactly the surfaces with no route', () => {
+    const actuallyRouteless = Object.keys(SURFACES).filter(
+      (path) => !routes.some((r) => covers(r.pattern, path))
+    );
+    assert.deepEqual(actuallyRouteless.sort(), [...ROUTELESS_SURFACES].sort());
+  });
+});
+
+// ------------------------------------------------------------------ discovery artifacts
+//
+// Added 2026-09-02 (vault-1x3u5). WHY: the Pages project answered EVERY unknown
+// path with HTTP 200 and the 151 KB landing page, so `/.well-known/x402`,
+// `/skill.md` and `/sitemap.xml` were all indistinguishable from a surface that
+// exists — a crawler, a linter or the Bazaar indexer could not tell "missing"
+// from "present". Four artifacts fix that and each one is asserted to PARSE,
+// not merely to be non-empty: a 404 page that is not HTML, a sitemap that is
+// not XML or a discovery document that is not JSON would each read as present
+// and be useless.
+
+const SITE_BASE_URL = 'https://toolshed.lemon-agent.dev';
+
+describe('dist/404.html', () => {
+  const html = readFileSync(join(DIST, '404.html'), 'utf8');
+
+  test('exists, is HTML, and names itself', () => {
+    assert.match(html, /^<!doctype html>/i);
+    assert.match(html, /<title>[^<]*404[^<]*<\/title>/i);
+  });
+
+  test('is small — an error page, not a second landing page', () => {
+    assert.ok(html.length < 4096, `404.html is ${html.length} bytes; keep it small`);
+  });
+
+  test('points at the machine surfaces a prober would want next', () => {
+    for (const href of ['/', '/llms.txt', '/openapi.json', '/.well-known/x402']) {
+      assert.ok(html.includes(`href="${href}"`), `404.html does not link ${href}`);
+    }
+  });
+
+  test('is deliberately NOT compiled into the Worker bundle', () => {
+    // Pages serves an unmatched path; the Worker only ever sees paths its
+    // wrangler.toml routes name, and it answers each of those itself.
+    assert.ok(!('/404.html' in SURFACES), '404.html must stay Pages-only');
+  });
+});
+
+describe('dist/sitemap.xml', () => {
+  const xml = readFileSync(join(DIST, 'sitemap.xml'), 'utf8');
+  const parsed = new XMLParser().parse(xml);
+
+  test('parses as a sitemap urlset', () => {
+    assert.ok(parsed.urlset, 'no <urlset> element');
+    assert.ok(Array.isArray(parsed.urlset.url), '<urlset> carries no <url> list');
+  });
+
+  test('lists the page and every machine surface a crawler should enumerate', () => {
+    const locs = parsed.urlset.url.map((u) => u.loc);
+    for (const path of ['/', '/llms.txt', '/llms-full.txt', '/openapi.json', '/catalog.json', '/.well-known/x402']) {
+      assert.ok(locs.includes(`${SITE_BASE_URL}${path}`), `sitemap.xml omits ${path}`);
+    }
+  });
+
+  test('every loc is an absolute production URL', () => {
+    for (const u of parsed.urlset.url) {
+      assert.ok(String(u.loc).startsWith(`${SITE_BASE_URL}/`), `relative or foreign loc: ${u.loc}`);
+    }
+  });
+});
+
+describe('dist/robots.txt', () => {
+  test('Sitemap: points at the sitemap, not at the site root', () => {
+    const robots = readFileSync(join(DIST, 'robots.txt'), 'utf8');
+    assert.ok(
+      robots.includes(`Sitemap: ${SITE_BASE_URL}/sitemap.xml`),
+      `robots.txt does not point at the sitemap:\n${robots}`
+    );
+  });
+});
+
+describe('dist/.well-known/x402', () => {
+  const doc = JSON.parse(readFileSync(join(DIST, '.well-known', 'x402'), 'utf8'));
+
+  test('is a v2 discovery document with a named service', () => {
+    assert.equal(doc.x402Version, 2);
+    assert.equal(doc.service.name, 'Toolshed');
+    assert.equal(doc.service.url, SITE_BASE_URL);
+    assert.ok(doc.service.description.length > 40, 'the service description is a stub');
+    assert.ok(Array.isArray(doc.service.tags) && doc.service.tags.includes('x402'));
+    assert.match(doc.service.contact, /@/);
+    assert.ok(Array.isArray(doc.service.related) && doc.service.related.length >= 1);
+    for (const r of doc.service.related) {
+      assert.ok(r.name && r.url && r.relation, `a related entry is incomplete: ${JSON.stringify(r)}`);
+    }
+  });
+
+  test('carries one resource per hosted live tool', () => {
+    const hostedLive = CATALOG.filter((e) => e.hosted && e.hosted.status === 'live');
+    assert.equal(doc.resources.length, 19);
+    assert.equal(doc.resources.length, hostedLive.length);
+    assert.deepEqual(
+      doc.resources.map((r) => r.url).sort(),
+      hostedLive.map((e) => `${SITE_BASE_URL}/convert/${e.id}`).sort()
+    );
+  });
+
+  test('every resource states url, method, description and both rails', () => {
+    for (const r of doc.resources) {
+      assert.ok(r.url.startsWith(`${SITE_BASE_URL}/convert/`), `bad resource url: ${r.url}`);
+      assert.equal(r.method, 'POST');
+      assert.ok(r.description && r.description.length > 5, `${r.url}: empty description`);
+      assert.ok(r.mimeType, `${r.url}: no mimeType`);
+      assert.equal(r.accepts.length, 2, `${r.url}: expected a Base and a Solana accepts entry`);
+      const [base, solana] = r.accepts;
+      assert.equal(base.network, 'eip155:8453');
+      assert.equal(base.asset, '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913');
+      assert.equal(solana.network, 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp');
+      assert.equal(solana.asset, 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+      for (const a of r.accepts) {
+        assert.equal(a.scheme, 'exact');
+        assert.match(a.amount, /^[1-9][0-9]*$/, `${r.url}: amount is not atomic USDC`);
+      }
+    }
+  });
+
+  test('quotes each tool at the atomic USDC of its catalog price, on both rails', () => {
+    for (const r of doc.resources) {
+      const id = r.url.slice(`${SITE_BASE_URL}/convert/`.length);
+      const entry = CATALOG.find((e) => e.id === id);
+      const expected = String(Math.round(entry.hosted.price.amount_usd * 1e6));
+      for (const a of r.accepts) assert.equal(a.amount, expected, `${id}: wrong atomic amount`);
+    }
+  });
+
+  test('publishes NO receiving address — the live 402 is the authority', () => {
+    // A stale payTo in a static file is the single worst thing this repo could
+    // ship, so its absence is asserted rather than assumed. `note` says the
+    // word "payTo" on purpose (it explains the omission); what must not exist
+    // is a payTo FIELD, or anything address-shaped outside the two asset
+    // contracts the accepts entries legitimately name.
+    for (const r of doc.resources) {
+      for (const a of r.accepts) {
+        assert.ok(!('payTo' in a), `${r.url}: an accepts entry names a payTo`);
+        assert.deepEqual(Object.keys(a).sort(), ['amount', 'asset', 'network', 'scheme']);
+      }
+    }
+    const addresses = JSON.stringify(doc).match(/0x[0-9a-fA-F]{40}/g) || [];
+    assert.deepEqual(
+      [...new Set(addresses)],
+      ['0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'],
+      'an EVM address other than the USDC contract appears in the discovery document'
+    );
+    assert.ok(doc.note.includes('402'), 'the note does not defer to the live 402');
+  });
+});
+
+// ------------------------------------------------------------------ rail-constant drift guard
+//
+// build.mjs CANNOT import worker/beacon.js (it pulls in the workerd built-in
+// `cloudflare:email`, which Node's ESM loader refuses), so the four rail
+// constants the discovery document quotes are duplicated there. This is the
+// cheap guard that keeps the copies honest: if a rail moves in beacon.js and
+// not in build.mjs, .well-known/x402 would quietly advertise the old asset.
+
+describe('build.mjs rail constants mirror worker/beacon.js', () => {
+  const beacon = readFileSync(join(ROOT, 'worker', 'beacon.js'), 'utf8');
+
+  for (const literal of [
+    '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    'eip155:8453',
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+  ]) {
+    test(`${literal} still appears in worker/beacon.js`, () => {
+      assert.ok(beacon.includes(literal), `worker/beacon.js no longer carries ${literal}`);
+    });
+  }
+});
+
+// ------------------------------------------------------------------ converter descriptions
+//
+// `description` is the string an agent RANKS on in Bazaar and x402scan. Five of
+// the nineteen carried "<X> to <Y> conversion" — 27 characters, indistinguishable
+// from every other converter on the index — until 2026-09-02.
+//
+// Read as TEXT rather than imported, for the reason at the top of this file:
+// worker/beacon.js cannot be loaded by plain Node. The extraction is pinned by
+// asserting the count, so a regex that stops matching fails loudly instead of
+// silently checking nothing.
+
+describe('CONVERTERS descriptions', () => {
+  const beacon = readFileSync(join(ROOT, 'worker', 'beacon.js'), 'utf8');
+  const block = beacon.slice(
+    beacon.indexOf('const CONVERTERS = {'),
+    beacon.indexOf('const turndown = new TurndownService')
+  );
+
+  // One entry per converter: the id, then everything between `description:` and
+  // the `mimeType:` line that always follows it. The value may be a single
+  // quoted string or a `+`-joined concatenation across lines.
+  const found = [...block.matchAll(/^ {2}'([a-z0-9-]+)': \{\n {4}description:\s*([\s\S]*?),\n {4}mimeType:/gm)].map(
+    ([, id, literal]) => ({ id, text: new Function(`return (${literal});`)() })
+  );
+
+  test('all nineteen descriptions were extracted', () => {
+    assert.equal(found.length, 19, `extracted ${found.length} descriptions, not 19 — fix the regex`);
+    for (const { id, text } of found) assert.equal(typeof text, 'string', `${id}: not a string`);
+  });
+
+  test('every description is at least 100 characters', () => {
+    for (const { id, text } of found) {
+      assert.ok(text.length >= 100, `${id}: description is ${text.length} chars, under the 100 floor`);
+    }
+  });
+
+  test('no description is unbounded — it rides in a response header', () => {
+    for (const { id, text } of found) {
+      assert.ok(text.length <= 500, `${id}: description is ${text.length} chars; keep it bounded`);
+    }
+  });
+
+  test('every description is distinct', () => {
+    const seen = new Map();
+    for (const { id, text } of found) {
+      assert.ok(!seen.has(text), `${id} shares its description with ${seen.get(text)}`);
+      seen.set(text, id);
+    }
+  });
+
+  test('no shared boilerplate suffix across descriptions', () => {
+    // The old shape was "<X> to <Y> conversion" for five of them. A common tail
+    // is what makes nineteen listings read as one undifferentiated blob.
+    const tails = found.map(({ text }) => text.slice(-40));
+    assert.equal(new Set(tails).size, tails.length, 'two descriptions end with the same 40 characters');
+  });
+
+  test('every hosted live catalog entry has one', () => {
+    const ids = new Set(found.map((f) => f.id));
+    for (const e of CATALOG.filter((c) => c.hosted && c.hosted.status === 'live')) {
+      assert.ok(ids.has(e.id), `${e.id} is hosted live but has no CONVERTERS entry`);
+    }
+  });
 });
