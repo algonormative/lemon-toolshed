@@ -30,6 +30,7 @@ import { dirname, extname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parse as tomlParse } from 'smol-toml';
 import { XMLParser } from 'fast-xml-parser';
+import { marked } from 'marked';
 import { bootWorker, client, CATALOG } from './harness.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -98,6 +99,25 @@ describe('build.mjs', () => {
 
   test('the removed Pages Function is gone', () => {
     assert.equal(existsSync(join(ROOT, 'functions', '[[path]].js')), false);
+  });
+
+  test('publishes one bounded md-html sample verified against the converter', () => {
+    const catalog = JSON.parse(readFileSync(join(DIST, 'catalog.json'), 'utf8'));
+    const sample = catalog.entries.find((entry) => entry.id === 'md-html')?.hosted?.sample;
+    assert.ok(sample, 'md-html has no free fixed sample');
+    assert.equal(sample.content_type, 'text/html; charset=utf-8');
+    assert.equal(marked.parse(sample.request), sample.response);
+    assert.ok(Buffer.byteLength(sample.request) <= 4096);
+    assert.ok(Buffer.byteLength(sample.response) <= 4096);
+
+    const html = readFileSync(join(DIST, 'index.html'), 'utf8');
+    assert.ok(html.includes('free fixed sample'));
+    assert.ok(html.includes('&lt;h1&gt;Title&lt;/h1&gt;'), 'sample response is not escaped on the page');
+    assert.ok(!html.includes(sample.response), 'sample response was rendered as live HTML');
+
+    const llms = readFileSync(join(DIST, 'llms.txt'), 'utf8');
+    assert.match(llms, /Free fixed sample: the md-html entry/);
+    assert.match(llms, /hosted\.sample\.request and\n  hosted\.sample\.response/);
   });
 });
 

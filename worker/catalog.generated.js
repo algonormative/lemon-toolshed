@@ -144,7 +144,12 @@ export const CATALOG = [
         "scheme": "exact"
       },
       "status": "live",
-      "free_tier_daily": 0
+      "free_tier_daily": 0,
+      "sample": {
+        "request": "# Title\n\nSome **bold** text.\n",
+        "response": "<h1>Title</h1>\n<p>Some <strong>bold</strong> text.</p>\n",
+        "content_type": "text/html; charset=utf-8"
+      }
     },
     "local": {
       "tool": "pandoc",

@@ -30,12 +30,14 @@
 // the volume worth keeping off the metered Worker path. The conversion
 // endpoints live in the Worker too, not in Pages.
 //
-// Dependency: js-yaml. Nothing else.
+// Dependencies: js-yaml, plus marked to verify the published md-html sample
+// against the same converter implementation the Worker uses.
 
 import { readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
+import { marked } from 'marked';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DIST = join(ROOT, 'dist');
@@ -487,7 +489,24 @@ for (const e of entries) {
     // free_tier_daily rides along on every hosted entry, so catalog.json, the
     // Worker's compiled catalog and therefore GET /check all state the tier
     // rule per tool instead of leaving a reader to find it in prose.
-    e._hosted = { path: wantPath, price, status: h.status, free_tier_daily: FREE_TIER_DAILY };
+    let sample = null;
+    if (h.sample) {
+      const { request, response, content_type: contentType } = h.sample;
+      if (![request, response, contentType].every((v) => typeof v === 'string' && v.length > 0)) {
+        problems.push(`${e.id}: hosted.sample needs non-empty request, response and content_type strings`);
+      } else if (Buffer.byteLength(request) > 4096 || Buffer.byteLength(response) > 4096) {
+        problems.push(`${e.id}: hosted.sample request and response must each be at most 4096 bytes`);
+      } else {
+        sample = { request, response, content_type: contentType };
+      }
+    }
+    e._hosted = {
+      path: wantPath,
+      price,
+      status: h.status,
+      free_tier_daily: FREE_TIER_DAILY,
+      ...(sample ? { sample } : {}),
+    };
   }
 
   e._xlabel = labelOf(e.x, e.id, 'x');
@@ -499,6 +518,15 @@ for (const e of entries) {
 if (problems.length) {
   console.error('build: entries.yaml failed validation');
   for (const p of problems) console.error(`  - ${p}`);
+  process.exit(1);
+}
+
+// This is a checked-in preview, not hand-written marketing output. Keep the
+// verification beside catalog validation so every build proves that the exact
+// fixed request still produces the exact response under the Worker's parser.
+const mdHtml = entries.find((e) => e.id === 'md-html');
+if (mdHtml?._hosted?.sample && marked.parse(mdHtml._hosted.sample.request) !== mdHtml._hosted.sample.response) {
+  console.error('build: md-html hosted.sample.response differs from marked.parse(hosted.sample.request)');
   process.exit(1);
 }
 for (const w of labelWarnings) console.warn(`build: LABEL — ${w}`);
@@ -1146,7 +1174,17 @@ function hostedBlock(e) {
             ${pricePills(h)}
           </p>`;
   if (planned) return `${row}\n          <p class="note">Not live yet — the tool below is the one to reach for meanwhile.</p>`;
-  return `${row}\n          ${cmdRow(convertCurl(e), `Copy the convert command for ${oneLine(e.x)} to ${oneLine(e.y)}`)}`;
+  const sample = h.sample
+    ? `
+          <details class="sample">
+            <summary>free fixed sample</summary>
+            <p class="meta"><span class="label">Request</span></p>
+            <pre><code>${esc(h.sample.request)}</code></pre>
+            <p class="meta"><span class="label">Response</span>${esc(h.sample.content_type)}</p>
+            <pre><code>${esc(h.sample.response)}</code></pre>
+          </details>`
+    : '';
+  return `${row}\n          ${cmdRow(convertCurl(e), `Copy the convert command for ${oneLine(e.x)} to ${oneLine(e.y)}`)}${sample}`;
 }
 
 // The base tool behind the entry: its name, linked to its own site. This is the
@@ -1591,6 +1629,8 @@ const API_HEADER = [
   `  the accepted spellings can be read rather than guessed. No parameters returns every hosted tool.`,
   `Convert: POST ${API_BASE}/convert/<id> with the raw file as the body (256 KB cap).`,
   `  The converted file comes back as the body, with the right Content-Type.`,
+  `Free fixed sample: the md-html entry in ${BASE}/catalog.json carries the exact hosted.sample.request and`,
+  `  hosted.sample.response shown on the human converter card. It accepts no caller input and invokes no endpoint.`,
   ...TIER_LINES,
   ...PAYMENT_LINES,
   `OpenAPI: ${BASE}/openapi.json`,

@@ -163,6 +163,10 @@ entries:
         amount_usd: 0.004
         scheme: exact
       status: live
+      sample:
+        request: "# Title\n\nSome **bold** text.\n"
+        response: "<h1>Title</h1>\n<p>Some <strong>bold</strong> text.</p>\n"
+        content_type: "text/html; charset=utf-8"
 
   - id: rendered-dom-to-markdown
     x: "Live DOM in a browser or headless page (JS-rendered)"
