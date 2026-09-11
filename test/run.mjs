@@ -128,6 +128,18 @@ const PHASES = [
     files: ['test/x402-solana.test.mjs'],
   },
   {
+    // STANDALONE for the same two reasons as the solana phase above: the
+    // Solana half of the discovery document can only be compared against a 402
+    // that actually offers the rail, which needs a mock facilitator on a port
+    // learned at startup, and the addresses a worker substitutes are fixed by
+    // PAYTO / PAYTO_SOLANA for the life of its process — this suite wants one
+    // worker with both and one with Base only.
+    name: 'discovery payTo (well-known vs the live envelope, both rails)',
+    standalone: true,
+    note: 'boots its own two workers plus a mock facilitator: dual-rail, then Base only',
+    files: ['test/wellknown-payto.test.mjs'],
+  },
+  {
     // STANDALONE for the same reason as settlement, twice over: this suite runs
     // a mock facilitator AND a mock Telegram, both on ports it only learns at
     // startup, so FACILITATOR_URL and TELEGRAM_API_BASE cannot be known out
