@@ -235,11 +235,14 @@ const json = (body, status = 200, headers = {}) =>
 // `max-age=0, must-revalidate` rather than immutable: the bundle is
 // redeployed on every `entries.yaml` change, and a stale llms.txt served from
 // a CDN cache is exactly the failure this route exists to avoid.
-function handleSurface(request, surface) {
+function handleSurface(request, surface, env, path) {
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     return new Response(null, { status: 405, headers: { ...CORS, allow: 'GET, HEAD' } });
   }
-  return new Response(request.method === 'HEAD' ? null : surface.body, {
+  // ONE surface is not wholly a build-time fact — see discoveryBody(). Every
+  // other path is the bundle string, untouched.
+  const body = path === WELLKNOWN_X402 ? discoveryBody(env, surface) : surface.body;
+  return new Response(request.method === 'HEAD' ? null : body, {
     status: 200,
     headers: {
       ...CORS,
@@ -248,6 +251,84 @@ function handleSurface(request, surface) {
       'x-content-type-options': 'nosniff',
     },
   });
+}
+
+// ------------------------------------------------------------------ discovery payTo
+//
+// `/.well-known/x402` is the document a buyer, a registry or a linter reads
+// BEFORE it ever makes a paid call, and until 2026-09-10 its `accepts` entries
+// carried no `payTo` at all — the house's own estate-watch collector found
+// toolshed the odd one out against kino402, penny402 and parallax. The 402
+// envelope was correct throughout; discovery simply said less than it could.
+//
+// The reason it said less was real: the receiving addresses are RUNTIME vars
+// (`PAYTO` is a secret, `PAYTO_SOLANA` a var), so the build cannot read them,
+// and baking an address into a static file is how a rotated address becomes a
+// stale published one. The fix is neither — the build still bakes nothing, and
+// the address is substituted HERE, from the same env the 402 is built from. A
+// deployment that rotates its address serves the new one on the next request,
+// with no rebuild, and the two documents cannot disagree because there is only
+// one place either of them can read it from.
+//
+// It stays a pure in-memory transform: a read-only document GET makes no fetch,
+// no KV read and no D1 query, exactly as before. In particular it does NOT go
+// through paymentOffer(), which would put the facilitator's /supported read
+// (the Solana feePayer) on a GET that has no payment in it.
+const WELLKNOWN_X402 = '/.well-known/x402';
+
+// v2 CAIP-2 network → the var naming where that rail is paid. Keyed on the same
+// two constants requirementsV2() projects onto, so discovery cannot attach an
+// address to a network the envelope spells differently.
+const DISCOVERY_PAYTO_OF = {
+  [NETWORK_V2]: (env) => env?.PAYTO || '',
+  [NETWORK_SOLANA_V2]: (env) => env?.PAYTO_SOLANA || '',
+};
+
+// Per-isolate memo. `env` is fixed for the life of an isolate, so this holds at
+// most one entry; it exists so a crawler hammering the document does not re-parse
+// and re-serialise ~20 KB of JSON per request.
+let discoveryMemo = null;
+
+/**
+ * The discovery document as THIS deployment should publish it.
+ *
+ * Per network, per entry: an entry whose network names a configured address
+ * gains `payTo`, and nothing else about it changes — `scheme`, `network`,
+ * `amount` and `asset` are the bytes the build wrote. An address that is unset
+ * or empty leaves the entry exactly as built, so the KEY IS ABSENT rather than
+ * `""`: this is JSON a machine compares, and an empty string is a value someone
+ * could try to pay to.
+ *
+ * The emptiness test is the same truthiness test handleConvert() and
+ * paymentOffer() apply to the same two vars, which is what makes "discovery
+ * carries the envelope's payTo, or no payTo" true by construction rather than
+ * by agreement.
+ *
+ * With NOTHING configured this returns the bundle string itself — the identity
+ * path is the literal same value, not a re-serialisation that happens to match,
+ * so a deployment with no address serves bytes identical to `dist/`.
+ */
+function discoveryBody(env, surface) {
+  const addresses = Object.fromEntries(
+    Object.entries(DISCOVERY_PAYTO_OF).map(([network, read]) => [network, read(env)])
+  );
+  if (!Object.values(addresses).some(Boolean)) return surface.body;
+
+  const key = JSON.stringify(addresses);
+  if (discoveryMemo?.key === key) return discoveryMemo.body;
+
+  const doc = JSON.parse(surface.body);
+  for (const resource of doc.resources || []) {
+    resource.accepts = (resource.accepts || []).map((entry) => {
+      const payTo = addresses[entry?.network] || '';
+      return payTo ? { ...entry, payTo } : entry;
+    });
+  }
+  // The same serialisation build.mjs writes, so the no-op is byte-identical and
+  // the substituted document differs only by the keys that were added.
+  const body = `${JSON.stringify(doc, null, 2)}\n`;
+  discoveryMemo = { key, body };
+  return body;
 }
 
 // ------------------------------------------------------------------ registry ownership files
@@ -307,7 +388,7 @@ export default {
   async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
     const surface = SURFACES[path];
-    if (surface) return handleSurface(request, surface);
+    if (surface) return handleSurface(request, surface, env, path);
     if (path === '/check') return handleCheck(request, env);
     if (path.startsWith('/convert/')) return handleConvert(request, env, path, ctx);
     // The env-backed registry ownership files, ahead of the generic

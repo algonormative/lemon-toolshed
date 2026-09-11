@@ -133,6 +133,9 @@ const SUITE_OCTET = {
   // The second rail (2026-08-31). Boots its own workers, but takes an octet on
   // the same rule so nothing it does can collide with a shared-worker suite.
   solana: 37,
+  // Discovery's payTo against the live envelope (2026-09-10). Boots its own
+  // workers, same as solana, and takes an octet on the same rule.
+  'wellknown-payto': 38,
 };
 
 /**

@@ -2151,17 +2151,25 @@ export const CATALOG = ${JSON.stringify(
 // HTML and an indexer could not tell "no discovery document" from "a discovery
 // document that is not JSON". Shape mirrors 10x402's (~/git/10x402/build.mjs).
 //
-// TWO THINGS THIS FILE DELIBERATELY DOES NOT CARRY.
+// TWO THINGS THE BUILD DELIBERATELY DOES NOT BAKE IN.
 //
 //   `payTo`. It is a runtime var (PAYTO / PAYTO_SOLANA) the build cannot read,
-//   and a stale receiving address in a static file is the single worst thing
-//   this repo could publish. The live 402 is the authority.
+//   and a stale receiving address baked into a static file is the single worst
+//   thing this repo could publish. So the accepts entries below carry no
+//   address — but the SERVED document does, from 2026-09-10: the zone Worker
+//   substitutes it per network at serve time, out of the same env the 402
+//   envelope is built from (discoveryBody() in worker/beacon.js). Discovery
+//   and the envelope therefore cannot disagree, a rotation needs no rebuild,
+//   and a deployment with no address configured serves these bytes unchanged —
+//   key absent, never an empty string.
 //
 //   Which rails are actually ON. Solana is env-gated on PAYTO_SOLANA at
-//   runtime, so a deployment may answer with one accepts entry or two. Both are
-//   listed here because both are configured in production; the LIVE 402
-//   ENVELOPE IS AUTHORITATIVE, and the `note` below says so in the document
-//   itself rather than only in this comment.
+//   runtime — and on a fee-payer read from the facilitator, which a read-only
+//   document GET deliberately does not make — so a deployment may answer with
+//   one accepts entry or two. Both are listed here because both are configured
+//   in production; the LIVE 402 ENVELOPE IS AUTHORITATIVE about which rail is
+//   offerable right now, and the `note` below says so in the document itself
+//   rather than only in this comment.
 
 // MIRRORS worker/beacon.js (USDC_BASE, NETWORK_V2, USDC_SOLANA,
 // NETWORK_SOLANA_V2 — lines ~127-157 there). They are duplicated rather than
@@ -2228,11 +2236,12 @@ const wellKnownX402 = {
     accepts: wellKnownAccepts(e._hosted),
   })),
   note:
-    'The authoritative terms — including payTo, and which rails are actually accepted — are in the ' +
-    '402 each resource answers with. This document is static and carries no receiving address: a ' +
-    'stale one in a file is worse than none. The Solana entry is present because that rail is ' +
-    'configured in production, but whether a deployment offers it is a runtime fact this build ' +
-    `cannot know. GET ${API_BASE}/check for the live catalogue.`,
+    'Each accepts entry carries the payTo of its rail, substituted at serve time from this ' +
+    "deployment's configuration — nothing here is baked into a file that could go stale, and an " +
+    'entry with no address configured omits the key rather than publishing an empty one. The ' +
+    'authoritative terms are still the 402 each resource answers with, and one thing only it can ' +
+    'tell you: whether a rail is offerable right now. The Solana entry is listed because that rail ' +
+    `is configured in production. GET ${API_BASE}/check for the live catalogue.`,
 };
 
 // ---------------------------------------------------------------- emit

@@ -353,12 +353,17 @@ describe('dist/.well-known/x402', () => {
     }
   });
 
-  test('publishes NO receiving address — the live 402 is the authority', () => {
-    // A stale payTo in a static file is the single worst thing this repo could
-    // ship, so its absence is asserted rather than assumed. `note` says the
-    // word "payTo" on purpose (it explains the omission); what must not exist
-    // is a payTo FIELD, or anything address-shaped outside the two asset
-    // contracts the accepts entries legitimately name.
+  test('BAKES no receiving address — the Worker substitutes it at serve time', () => {
+    // The BUILT bytes carry no payTo, and that is what is asserted here: a
+    // stale address baked into a static file is the single worst thing this
+    // repo could ship. The address reaches the published document from env,
+    // per network, in discoveryBody() (worker/beacon.js) — which is asserted
+    // against the live 402 envelope in test/wellknown-payto.test.mjs and
+    // test/x402.test.mjs, and which serves THESE bytes unchanged when nothing
+    // is configured. `note` says the word "payTo" on purpose (it explains the
+    // substitution); what must not exist HERE is a payTo FIELD, or anything
+    // address-shaped outside the two asset contracts the accepts entries
+    // legitimately name.
     for (const r of doc.resources) {
       for (const a of r.accepts) {
         assert.ok(!('payTo' in a), `${r.url}: an accepts entry names a payTo`);

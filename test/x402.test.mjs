@@ -596,3 +596,85 @@ describe('the v2 envelope in the PAYMENT-REQUIRED header', () => {
     assert.equal(res.headers.get('cache-control'), 'no-store');
   });
 });
+
+// ------------------------------------------------------------------ discovery payTo
+//
+// `GET /.well-known/x402` is read BEFORE anything is paid, and until 2026-09-10
+// its accepts entries named no `payTo` at all — the house's estate-watch
+// collector found toolshed the odd one out against kino402, penny402 and
+// parallax. The address is a runtime var the build cannot read, so it is not
+// baked into the file; the Worker substitutes it per network at serve time
+// (discoveryBody() in worker/beacon.js), out of the SAME env the envelope above
+// is built from.
+//
+// This phase is the natural home for the BASE rail of that claim: PAYTO is set,
+// PAYTO_SOLANA is not. The Solana rail needs a 402 that actually offers it,
+// which needs a mock facilitator — test/wellknown-payto.test.mjs.
+
+describe('/.well-known/x402 carries the payTo the 402 names', () => {
+  /** The served discovery document, parsed. */
+  async function discovery(apiClient = api) {
+    const res = await apiClient.get('/.well-known/x402');
+    assert.equal(res.status, 200, 'the discovery document did not answer 200');
+    return JSON.parse(await res.text());
+  }
+
+  test('every Base entry names the address the live envelope names', async () => {
+    // Compared against the ENVELOPE rather than against PAYTO_TEST, because two
+    // documents built independently from the same literal would agree with each
+    // other and still be wrong together.
+    const doc = await discovery();
+    assert.equal(doc.resources.length, Object.keys(TOOLS).length);
+
+    for (const resource of doc.resources) {
+      const id = resource.url.slice(resource.url.lastIndexOf('/') + 1);
+      const tool = TOOLS[id];
+      assert.ok(tool, `discovery lists ${id}, which this suite does not know`);
+
+      const res = await api.convert(id, tool.input, { ip: ips.next(), ua: 'x402-suite/1' });
+      assert.equal(res.status, 402, `${id} answered ${res.status}: ${res.text}`);
+      const live = v2Envelope(res).accepts.find((a) => a.network === 'eip155:8453');
+      assert.ok(live, `${id}: the 402 offers no Base entry`);
+
+      const entry = resource.accepts.find((a) => a.network === 'eip155:8453');
+      assert.ok(entry, `${id}: discovery lists no Base entry`);
+      assert.equal(entry.payTo, live.payTo, `${id}: discovery and the 402 disagree about payTo`);
+      // payTo is the ONLY thing substitution may add; the price is the build's.
+      assert.equal(entry.amount, live.amount, `${id}: discovery and the 402 disagree about amount`);
+      assert.equal(entry.asset, live.asset, `${id}: discovery and the 402 disagree about asset`);
+      assert.equal(entry.scheme, live.scheme, `${id}: discovery and the 402 disagree about scheme`);
+    }
+  });
+
+  test('the unconfigured Solana entry carries no payTo — not an empty one', async () => {
+    // PAYTO_SOLANA is unset in this phase. The key must be ABSENT: this is JSON
+    // a machine compares, and `""` is a value someone could try to pay to.
+    const doc = await discovery();
+    for (const resource of doc.resources) {
+      const solana = resource.accepts.find((a) => a.network.startsWith('solana:'));
+      assert.ok(solana, `${resource.url}: discovery lists no Solana entry`);
+      assert.ok(!('payTo' in solana), `${resource.url}: an unconfigured rail named a payTo`);
+    }
+  });
+
+  test('PAYTO unset omits the key on every entry', async () => {
+    // The state a deployment is in before an address is configured — the same
+    // state in which an unpaid call answers 429 rather than 402. Its own worker,
+    // because PAYTO is fixed for the life of a `wrangler dev` process.
+    const scratch = await bootWorker({ vars: { PAYTO: '' } });
+    try {
+      const doc = await discovery(client(scratch));
+      const entries = doc.resources.flatMap((r) => r.accepts);
+      assert.ok(entries.length > 0, 'the discovery document lists no accepts entries at all');
+      for (const entry of entries) {
+        assert.deepEqual(
+          Object.keys(entry).sort(),
+          ['amount', 'asset', 'network', 'scheme'],
+          `an entry gained a key with no address configured: ${JSON.stringify(entry)}`
+        );
+      }
+    } finally {
+      await scratch.stop();
+    }
+  });
+});
