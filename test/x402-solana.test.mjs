@@ -38,6 +38,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import {
   bootWorker,
   client,
@@ -105,6 +106,23 @@ async function envelopes(apiClient, tool, ip) {
   };
 }
 
+/** A 32-byte hex nonce, single-use like the real thing. */
+const freshNonce = () => `0x${randomBytes(32).toString('hex')}`;
+
+/**
+ * A fake serialised transaction whose BYTES move with the nonce it carries.
+ *
+ * The SVM `exact` payload has no nonce field to vary, but the Worker's
+ * single-use claim keys on sha256 of the RAW header — so what has to differ
+ * between two fixtures is the serialised transaction itself. Nothing anywhere
+ * parses these bytes (not the Worker's Solana verify path, not
+ * mock-facilitator.mjs — both only pass `payload.transaction` along), so the
+ * nonce rides inside them: the shape stays the base64 string every reader
+ * expects, and only the part that is opaque moves.
+ */
+const fakeTransaction = (nonce, label = 'a serialised transaction') =>
+  Buffer.from(`${label} ${nonce}`).toString('base64');
+
 /**
  * A well-formed x402 v1 payment on the SOLANA rail.
  *
@@ -113,30 +131,42 @@ async function envelopes(apiClient, tool, ip) {
  * can read no `from` out of, which is deliberate: it forces the ledger
  * assertions to prove the payer came from the FACILITATOR, which on this rail
  * is the only place it can come from.
+ *
+ * THE NONCE IS FRESH PER CALL, as it is for a real client: one payment buys one
+ * conversion, and a replay is answered `payment_already_used`. A fixed nonce
+ * here would make two fixtures byte-identical, and the second call would be
+ * refused for reasons that have nothing to do with the test that made it. Pass
+ * `nonce` to replay one deliberately.
  */
-const solanaPaymentV1 = () =>
+const solanaPaymentV1 = ({ nonce = freshNonce() } = {}) =>
   Buffer.from(
     JSON.stringify({
       x402Version: 1,
       scheme: 'exact',
       network: SOLANA_V1,
-      payload: { transaction: Buffer.from('a serialised solana transaction').toString('base64') },
+      payload: { transaction: fakeTransaction(nonce, 'a serialised solana transaction') },
     })
   ).toString('base64');
 
 /** The same, on whichever rail is named — for the un-offered-network test. */
-const paymentV1On = (network) =>
+const paymentV1On = (network, { nonce = freshNonce() } = {}) =>
   Buffer.from(
     JSON.stringify({
       x402Version: 1,
       scheme: 'exact',
       network,
-      payload: { transaction: 'AA==' },
+      payload: { transaction: fakeTransaction(nonce) },
     })
   ).toString('base64');
 
-/** A v1 payment on BASE, in the EVM shape, so the control is a real control. */
-function basePaymentV1() {
+/**
+ * A v1 payment on BASE, in the EVM shape, so the control is a real control.
+ *
+ * Here the nonce is a real protocol field as well as what keeps the header
+ * distinct: an EIP-3009 authorization is single-use on chain too. Fresh per
+ * call; pass `nonce` to replay one deliberately.
+ */
+function basePaymentV1({ nonce = freshNonce() } = {}) {
   const now = Math.floor(Date.now() / 1000);
   return Buffer.from(
     JSON.stringify({
@@ -151,7 +181,7 @@ function basePaymentV1() {
           value: AMOUNT,
           validAfter: String(now - 600),
           validBefore: String(now + 60),
-          nonce: `0x${'cd'.repeat(32)}`,
+          nonce,
         },
       },
     })
@@ -165,8 +195,14 @@ function basePaymentV1() {
  * v2 payloads: `accepted` has to be the accepts entry we advertised, byte for
  * byte, or the signature was made over something else — and the mock compares
  * the two.
+ *
+ * Fresh per call for the same reason the v1 builders are: everything else in
+ * this payload is read off an envelope that does not move between two calls in
+ * one test, so without the nonce the second header would hash to the first
+ * one's claim and be refused `payment_already_used`. Pass `nonce` to replay one
+ * deliberately.
  */
-async function paymentV2(apiClient, tool, ip, index) {
+async function paymentV2(apiClient, tool, ip, index, { nonce = freshNonce() } = {}) {
   const { v2 } = await envelopes(apiClient, tool, ip);
   const accepted = v2.accepts[index];
   assert.ok(accepted, `${tool} published no accepts[${index}]`);
@@ -175,7 +211,7 @@ async function paymentV2(apiClient, tool, ip, index) {
       x402Version: 2,
       resource: v2.resource,
       accepted,
-      payload: { transaction: Buffer.from('a serialised transaction').toString('base64') },
+      payload: { transaction: fakeTransaction(nonce) },
       extensions: v2.extensions,
     })
   ).toString('base64');
@@ -859,5 +895,53 @@ describe('the owner alert names the rail the money moved on', () => {
       await telegram.stop();
       await alertMock.stop();
     }
+  });
+});
+
+// ------------------------------------------------------------------ fixtures
+//
+// LAST ON PURPOSE. These assertions are about the builders above rather than
+// about the Worker, but they drive the shared worker to get a v2 envelope — and
+// the /supported read that first probe provokes is exactly what the fee-payer
+// describe counts hits on. Run first, this would warm the cache before that
+// suite ever looked, and the read it asserts on would never happen.
+
+describe('the payment fixtures are single-use, like the payments they stand in for', () => {
+  test('every builder is fresh per call, and an explicit nonce replays one', async () => {
+    // THE LATENT REFUSAL THIS PINS. The single-use claim keys on sha256 of the
+    // raw header, so two fixtures that serialise identically are ONE payment:
+    // the second presentation is answered `payment_already_used` for reasons
+    // that have nothing to do with the test that made it. This file is green
+    // today only because every repeat use happens to sit on a verify-rejected
+    // path that never takes a claim — that is luck, and this is what stops the
+    // next test written on a verified path from inheriting it.
+    assert.notEqual(solanaPaymentV1(), solanaPaymentV1(), 'solanaPaymentV1 repeats itself');
+    assert.notEqual(paymentV1On('polygon'), paymentV1On('polygon'), 'paymentV1On repeats itself');
+    assert.notEqual(basePaymentV1(), basePaymentV1(), 'basePaymentV1 repeats itself');
+
+    const ip = ips.next();
+    assert.notEqual(
+      await paymentV2(api, 'csv-json', ip, 1),
+      await paymentV2(api, 'csv-json', ip, 1),
+      'paymentV2 repeats itself'
+    );
+
+    // …and the override still works, so a replay can be staged deliberately —
+    // the other half of the contract, because a fixture nobody can repeat on
+    // purpose cannot test the refusal either.
+    const nonce = freshNonce();
+    assert.equal(solanaPaymentV1({ nonce }), solanaPaymentV1({ nonce }));
+    assert.equal(paymentV1On('polygon', { nonce }), paymentV1On('polygon', { nonce }));
+    assert.equal(
+      await paymentV2(api, 'csv-json', ip, 1, { nonce }),
+      await paymentV2(api, 'csv-json', ip, 1, { nonce })
+    );
+    // basePaymentV1 also carries clock-derived validAfter/validBefore, so byte
+    // identity across two calls is a property of the second they landed in
+    // rather than of the override — the override is asserted where it lives. A
+    // deliberate replay reuses the STRING, which is what the settlement suite's
+    // replay tests do.
+    const decoded = JSON.parse(Buffer.from(basePaymentV1({ nonce }), 'base64').toString('utf8'));
+    assert.equal(decoded.payload.authorization.nonce, nonce, 'the basePaymentV1 nonce override was ignored');
   });
 });
