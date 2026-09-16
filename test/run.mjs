@@ -149,6 +149,17 @@ const PHASES = [
     standalone: true,
     files: ['test/alerts.test.mjs'],
   },
+  {
+    // STANDALONE for the same reasons as alerts, and one more: POSTHOG_HOST is
+    // a dev var, so the ingest root must name a port the mock only learns at
+    // startup — and the suite needs BOTH the production shape (no free tier,
+    // PAYTO set) and a worker with the free tier on, to capture a served
+    // conversion that nobody paid for. It boots its own two.
+    name: 'analytics capture (booted worker + mock PostHog)',
+    standalone: true,
+    note: 'boots its own two workers plus a mock PostHog host and a mock facilitator',
+    files: ['test/analytics-capture.test.mjs'],
+  },
 ];
 
 const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));
