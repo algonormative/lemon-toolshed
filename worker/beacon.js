@@ -31,6 +31,10 @@
 //      OPTIONAL, env-gated: setting FREE_TIER_DAILY = N restores a free tier of
 //      N calls / caller / UTC day on the same counter and the same key. Unset
 //      (the production default) means every call is a paid call.
+//   1d the invalid-payment bound, REJECTED_PAYMENTS_DAILY facilitator-REJECTED
+//      payments / caller / UTC day                                     [below]
+//      Same key as 1c, namespaced `reject:`, so a rejected payment costs a
+//      facilitator round trip that nothing else counts — until it does not.
 //   2  global fail-closed, 200,000 events / UTC day                    [below]
 //   3  the residual — priced, not bounded by mechanism; detective controls
 //      are the $25 billing alert plus the route-disable runbook in README.md
@@ -92,6 +96,18 @@ const RUNG2_GLOBAL_PER_DAY = 200_000;
 // absent from the catalog, the page and the machine files, because publishing it
 // would read as a promise. OWNER-TUNABLE.
 const PAID_DAILY = 5000;
+
+// The invalid-payment bound, per caller per UTC day. OWNER-TUNABLE.
+//
+// Past the free tier every request presenting a payment header costs a
+// facilitator round trip, and a rejected payment is answered 402 — which writes
+// no `events` row, so rung 2 does not see it, and claims nothing against
+// PAID_DAILY, which is deliberately claimed only AFTER a verify says yes. That
+// left the round trips themselves unbounded. This counts the refusals the
+// facilitator ITSELF returned: a client refused 50 times in one day is broken or
+// hostile, and the bound must never touch a legitimate buyer, whose payments
+// verify and are counted by nothing here.
+const REJECTED_PAYMENTS_DAILY = 50;
 
 /**
  * The free tier, per caller per UTC day. 0 (the default) means there is none.
@@ -728,6 +744,23 @@ async function handleConvert(request, env, path, ctx) {
         );
       }
 
+      // THE INVALID-PAYMENT BOUND, read before anything is built or asked.
+      //
+      // Everything below this line costs a facilitator round trip, and a
+      // rejection is answered 402 — which writes no `events` row and claims
+      // nothing against PAID_DAILY, so neither of the other bounds can see it.
+      // A caller the facilitator has already refused REJECTED_PAYMENTS_DAILY
+      // times today is answered 429 here instead, and the facilitator is not
+      // asked again until midnight UTC.
+      //
+      // It is a rate-limit answer rather than a 402: the caller cannot fix this
+      // one by paying, and it is not told to try. Nothing is written on this
+      // path — no `settlements` row, no `events` row, and no claim against the
+      // paid ceiling, which a caller that never got a conversion must not hold.
+      if ((await rejectedPaymentsToday(db, day, ipHash)) >= REJECTED_PAYMENTS_DAILY) {
+        return refuse('rejected-payments-ceiling', rejectedPaymentsCeilingReached({ now, dayStart }));
+      }
+
       const price = entry.hosted.price;
       const offer = await paymentOffer(env, entry, conv, price, payTo);
       // The PRIMARY rail's v1 requirements: Base. It is what the ledger amount,
@@ -749,6 +782,14 @@ async function handleConvert(request, env, path, ctx) {
       // REJECTED. No conversion is served, so no quota is claimed and no event
       // is written — and the 402 names why, so the caller can fix it.
       if (verdict.rejected) {
+        // …but the round trip it cost IS counted, when there was one. Only a
+        // refusal the facilitator itself returned carries `checked` — a header
+        // we could not decode and a network we never offered are both rejected
+        // without asking anyone, and charging a caller's bound for a call that
+        // was never made would be the same mistake in the other direction. A
+        // verdict flag rather than a reason-string match: the facilitator owns
+        // that vocabulary and may add to it at any time.
+        if (verdict.checked) await claimRejectedPaymentSafely(db, day, ipHash);
         await recordSettlementSafely(db, {
           now,
           tool: id,
@@ -1217,19 +1258,28 @@ async function overQuota(env, entry, conv, { payTo, tier, now, dayStart }) {
   );
 }
 
+// Both per-caller daily bounds answer in the same shape: a plain rate-limit
+// response with a Retry-After to midnight UTC and no envelope. NO `accepts` on
+// either, deliberately — neither can be bought past, so offering terms would be
+// a lie the client would act on.
+function dailyCeilingReached(error, { now, dayStart }) {
+  return json({ error, retry: 'tomorrow UTC' }, 429, {
+    'retry-after': String(Math.max(1, dayStart + SECONDS_PER_DAY - now)),
+    'x-payment-verified': 'false',
+  });
+}
+
 // The paid ceiling is a runaway bound, not a price gate. A caller that already
 // paid cannot buy its way past it, so answering 402 "pay to continue" would be a
 // lie; it gets the plain rate-limit answer instead.
-function paidCeilingReached({ now, dayStart }) {
-  return json(
-    { error: 'the daily conversion ceiling for this caller is reached', retry: 'tomorrow UTC' },
-    429,
-    {
-      'retry-after': String(Math.max(1, dayStart + SECONDS_PER_DAY - now)),
-      'x-payment-verified': 'false',
-    }
-  );
-}
+const paidCeilingReached = ({ now, dayStart }) =>
+  dailyCeilingReached('the daily conversion ceiling for this caller is reached', { now, dayStart });
+
+// Its sibling: the caller is not over its conversion budget, it is over its
+// budget for being WRONG — REJECTED_PAYMENTS_DAILY payments the facilitator
+// refused today. Same answer for the same reason (there is nothing to pay).
+const rejectedPaymentsCeilingReached = ({ now, dayStart }) =>
+  dailyCeilingReached('too many rejected payments today', { now, dayStart });
 
 /**
  * The x402 paymentRequirements for one tool ON BASE — ONE definition, used by
@@ -1817,7 +1867,8 @@ function presentedPayment(request) {
  * and an exception here would become a 503 for something that should be served.
  * Returns exactly one of:
  *   { verified: true, payload, payer }   isValid — serve, then settle
- *   { rejected: true, reason, message }  the facilitator said no — 402
+ *   { rejected: true, reason, message }  no — 402. `checked: true` when the
+ *                                        facilitator is the one that said it
  *   { unavailable: '<reason>' }          we could not ask — serve, unverified
  */
 async function verifyPayment(env, payment, requirements) {
@@ -1849,6 +1900,11 @@ async function verifyPayment(env, payment, requirements) {
   if (data?.isValid === false) {
     return {
       rejected: true,
+      // CHECKED: the facilitator was asked and said no, so this rejection cost
+      // us a round trip — which is exactly what REJECTED_PAYMENTS_DAILY bounds.
+      // The undecodable-header rejection above deliberately carries no such
+      // flag, and neither does unofferedNetwork(): both are decided here.
+      checked: true,
       reason: data.invalidReason || 'unspecified',
       message: data.invalidMessage || null,
       payer: data.payer || payer,
@@ -3694,6 +3750,40 @@ async function claimConvertQuota(db, day, ipHash, ceiling) {
     .bind(day, ipHash, ceiling)
     .first();
   return typeof row?.used === 'number' ? row.used : null;
+}
+
+// The invalid-payment counter lives in the SAME table under a namespaced key —
+// no second table, no migration, and the same day-scoped IP hash the paid
+// ceiling keys on, so rotating a user-agent buys nothing here either and the row
+// is unlinkable once the salt is overwritten. `reject:` cannot collide with a
+// quota key: those are 16 hex characters and nothing else.
+const rejectedKey = (ipHash) => `reject:${ipHash}`;
+
+// How many payments the facilitator has refused this caller today. A read, on
+// the path that is about to ask the facilitator again — so it is inside the
+// handler's try and an unreachable D1 fails closed with the rest of them.
+async function rejectedPaymentsToday(db, day, ipHash) {
+  const row = await db
+    .prepare('SELECT used FROM convert_quota WHERE day = ?1 AND ip_hash = ?2')
+    .bind(day, rejectedKey(ipHash))
+    .first();
+  return typeof row?.used === 'number' ? row.used : 0;
+}
+
+/**
+ * Count one facilitator refusal against this caller's day. Best-effort.
+ *
+ * The same guarded upsert as every other claim, so it saturates at the ceiling
+ * rather than counting past it — and swallowed on purpose: this runs while a 402
+ * is being assembled, and a D1 hiccup turning a correct 402 into a 500 would
+ * trade the caller's answer for a counter nobody is reading yet.
+ */
+async function claimRejectedPaymentSafely(db, day, ipHash) {
+  try {
+    await claimConvertQuota(db, day, rejectedKey(ipHash), REJECTED_PAYMENTS_DAILY);
+  } catch {
+    /* the 402 is the answer that matters */
+  }
 }
 
 /**

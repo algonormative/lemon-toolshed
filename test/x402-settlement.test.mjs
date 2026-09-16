@@ -47,6 +47,7 @@ import {
   isSqlNull,
   PAYTO_TEST,
   PAID_DAILY,
+  REJECTED_PAYMENTS_DAILY,
   SITE_BASE,
 } from './harness.mjs';
 import { startMockFacilitator, shapeProblem, VERIFIED_PAYER, TX_HASH } from './mock-facilitator.mjs';
@@ -219,13 +220,34 @@ async function awaitSettlement(predicate, what, timeoutMs = 15_000) {
  * than about whichever row happens to be largest.
  */
 async function usedBy(ip) {
-  const [salt] = await worker.d1("SELECT value FROM salt WHERE key = 'current';");
-  const ipHash = createHash('sha256')
+  return usedOn(worker, await ipHashOn(worker, ip));
+}
+
+/**
+ * The key the Worker computes for one caller today, on ONE worker's D1.
+ *
+ * Split out of usedBy so the same derivation serves a throwaway worker and both
+ * counters: the conversions counter is keyed on this hash, the invalid-payment
+ * counter on `reject:` + the very same hash.
+ */
+async function ipHashOn(handle, ip) {
+  const [salt] = await handle.d1("SELECT value FROM salt WHERE key = 'current';");
+  return createHash('sha256')
     .update(`${salt.value}${ip}`)
     .digest('hex')
     .slice(0, 16);
-  const rows = await worker.d1(`SELECT used FROM convert_quota WHERE ip_hash = '${ipHash}';`);
+}
+
+/** One `convert_quota` row by key, or 0 when the caller has none. */
+async function usedOn(handle, key) {
+  const rows = await handle.d1(`SELECT used FROM convert_quota WHERE ip_hash = '${key}';`);
   return rows.length ? rows[0].used : 0;
+}
+
+/** How many rows a `SELECT COUNT(*) AS n` comes back with, on one worker. */
+async function countOn(handle, sql) {
+  const [row] = await handle.d1(sql);
+  return Number(row.n);
 }
 
 // ------------------------------------------------------------------ lifecycle
@@ -775,6 +797,141 @@ describe('verify says no', () => {
     }
     // Nothing decodable to send, so nothing was sent.
     assert.equal(mock.hits.length, 0, 'a garbage header was forwarded to the facilitator');
+  });
+});
+
+describe('junk payments cannot buy unbounded facilitator calls', () => {
+  // The residual the settlement work left behind: a 402 writes no `events` row,
+  // so rung 2 cannot see it, and the paid ceiling is deliberately claimed only
+  // AFTER a verify says yes — so past the free tier every presented header
+  // bought a facilitator round trip that nothing counted.
+  //
+  // REJECTED_PAYMENTS_DAILY is that bound, in `convert_quota` under a `reject:`
+  // key. This runs on a throwaway worker with its own mock: the counter is
+  // parked one short of the ceiling rather than by making 50 calls, and a blunt
+  // UPDATE must not land in the shared worker's rows.
+  test('past REJECTED_PAYMENTS_DAILY the facilitator is not asked again', async () => {
+    const scratchMock = await startMockFacilitator();
+    const scratch = await bootWorker({
+      vars: { PAYTO: PAYTO_TEST, FACILITATOR_URL: scratchMock.url, ...fakeCdpCredentials() },
+    });
+    try {
+      const scratchApi = client(scratch);
+      scratchMock.state.verify = {
+        status: 200,
+        body: { isValid: false, invalidReason: 'insufficient_funds', payer: VERIFIED_PAYER },
+      };
+
+      const ip = ips.pinned(29);
+      const reject = (id, input) =>
+        scratchApi.convert(id, input, { ip, ua: 'settlement-suite/1', headers: { 'x-payment': paymentHeader() } });
+      // One real rejection, to prove the counter exists and that it is the
+      // FACILITATOR's refusal being counted rather than the request. It also
+      // has to come first: the daily salt the key is derived from is written
+      // lazily, by the first request this worker serves.
+      const first = await reject('md-html', '# hi\n');
+      assert.equal(first.status, 402, `a rejected payment answered ${first.status}: ${first.text}`);
+      const rejectKey = `reject:${await ipHashOn(scratch, ip)}`;
+      assert.equal(scratchMock.hitsOn('verify').length, 1, 'the rejection never reached the facilitator');
+      assert.equal(await usedOn(scratch, rejectKey), 1, 'a facilitator rejection was not counted');
+
+      // …then park it one short of the ceiling.
+      await scratch.d1(
+        `UPDATE convert_quota SET used = ${REJECTED_PAYMENTS_DAILY - 1} WHERE ip_hash = '${rejectKey}';`
+      );
+
+      const last = await reject('md-html', '# hi\n');
+      assert.equal(last.status, 402, `the last allowed rejection answered ${last.status}: ${last.text}`);
+      assert.equal(scratchMock.hitsOn('verify').length, 2, 'the last allowed rejection skipped the facilitator');
+      assert.equal(await usedOn(scratch, rejectKey), REJECTED_PAYMENTS_DAILY, 'the ceiling call was not counted');
+
+      // THE BOUND. 429 instead of a 402, and — the whole point — no round trip.
+      const settlementsBefore = await countOn(scratch, 'SELECT COUNT(*) AS n FROM settlements;');
+      const eventsBefore = await countOn(scratch, 'SELECT COUNT(*) AS n FROM events;');
+
+      const capped = await reject('md-html', '# hi\n');
+      assert.equal(capped.status, 429, `expected 429 past the ceiling, got ${capped.status}: ${capped.text}`);
+      assert.equal(scratchMock.hitsOn('verify').length, 2, 'A CAPPED CALLER STILL REACHED THE FACILITATOR');
+      assert.ok(capped.headers.get('retry-after'), 'the 429 carried no Retry-After');
+      assert.ok(Number(capped.headers.get('retry-after')) > 0, 'Retry-After was not a positive number of seconds');
+      assert.equal(capped.headers.get('x-payment-verified'), 'false');
+      // Not a price gate: a caller that cannot fix this by paying is not told to pay.
+      assert.ok(!('accepts' in capped.json()), 'a capped caller was handed payment terms it cannot use');
+
+      // The refusal is pure: no ledger row, no event row, and no claim against
+      // the paid ceiling — a call that got no conversion must hold no quota.
+      assert.equal(
+        await countOn(scratch, 'SELECT COUNT(*) AS n FROM settlements;'),
+        settlementsBefore,
+        'the 429 wrote a settlements row'
+      );
+      assert.equal(
+        await countOn(scratch, 'SELECT COUNT(*) AS n FROM events;'),
+        eventsBefore,
+        'the 429 wrote an events row'
+      );
+      assert.equal(
+        await usedOn(scratch, await ipHashOn(scratch, ip)),
+        0,
+        'a capped caller claimed quota against the paid ceiling'
+      );
+
+      // And a buyer whose payment verifies never meets any of this.
+      scratchMock.reset();
+      const paying = await scratchApi.convert('md-html', '# hi\n', {
+        ip: ips.pinned(30),
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+      assert.equal(paying.status, 200, `a verified payment was refused: ${paying.status} ${paying.text}`);
+      assert.ok(paying.text.includes('<h1>hi</h1>'), 'the paid conversion did not run');
+    } finally {
+      await scratch.stop();
+      await scratchMock.stop();
+    }
+  });
+
+  test('a facilitator outage is not the caller being wrong, and is not counted', async () => {
+    // The distinction the `checked` flag on the verdict exists to make: these
+    // calls are served FREE, so counting them would bound the caller for our
+    // dependency's bad day — and would do it while charging nothing.
+    mock.reset();
+    mock.state.verify = { status: 500, body: { error: 'internal' } };
+
+    const ip = ips.pinned(31);
+    const rejectKey = `reject:${await ipHashOn(worker, ip)}`;
+    assert.equal(await usedOn(worker, rejectKey), 0, 'a fresh caller already holds a rejection count');
+
+    for (let i = 0; i < 3; i++) {
+      const res = await api.convert('md-html', '# hi\n', {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+      assert.equal(res.status, 200, `an outage-served call answered ${res.status}: ${res.text}`);
+      assert.equal(res.headers.get('x-payment-verified'), 'false');
+    }
+
+    assert.equal(await usedOn(worker, rejectKey), 0, 'a facilitator outage was counted against the caller');
+  });
+
+  test('a malformed header never reaches the facilitator, so it is not counted', async () => {
+    mock.reset();
+    const ip = ips.pinned(32);
+    const rejectKey = `reject:${await ipHashOn(worker, ip)}`;
+
+    for (const value of ['x', 'not-base64-!!']) {
+      const res = await api.convert('md-html', '# hi\n', {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': value },
+      });
+      assert.equal(res.status, 402, `a malformed header answered ${res.status}`);
+      assert.equal(res.json().invalidReason, 'malformed_payment_header');
+    }
+
+    assert.equal(mock.hits.length, 0, 'a garbage header was forwarded to the facilitator');
+    assert.equal(await usedOn(worker, rejectKey), 0, 'a rejection nobody was asked about was counted');
   });
 });
 

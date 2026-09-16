@@ -998,6 +998,25 @@ for a chain confirmation. A settlement that fails after a good verify is the
 accepted exposure: one conversion served for its price that never arrived,
 recorded as `settle_ok = 0`.
 
+**A payment the facilitator refuses is counted, per caller per UTC day.** Every
+presented payment header costs a `verify` round trip, and a rejection is answered
+402 — which writes no `events` row, so the global bound never sees it, and claims
+nothing against the paid ceiling, which is deliberately claimed only *after* a
+verify says yes. So the round trips themselves needed their own bound. It is
+`REJECTED_PAYMENTS_DAILY` (**50**), kept in `convert_quota` under a `reject:` key
+on the same daily-salted IP hash the paid ceiling uses — same table, no schema
+change, and rotating a user-agent mints no fresh allowance. Past 50, a further
+payment header from that caller is answered **429 with `Retry-After`** to
+midnight UTC **without calling the facilitator at all**, and that refusal writes
+nothing: no `settlements` row, no `events` row, no quota. Only refusals the
+facilitator itself returned are counted — a header we could not decode and a
+network we never offered are rejected without asking anyone, and a facilitator
+**outage** is not the caller being wrong (those calls are served free, see
+below). A legitimate buyer never reaches this bound, because its payments verify;
+a rejected payment still buys nothing against the paid ceiling either way. The
+`verify_ok = 0` breakdown under [Reading the ledger](#reading-the-ledger) is
+still how you see it happening.
+
 ### The endpoints, and what we send
 
 | | |
@@ -1655,6 +1674,7 @@ the same argument.
 | 0 | Cloudflare edge | REACTIVE — free WAF custom rule blocking blocklist IPs (`ip.src in {…}`), populated from the `blocklist` table; the planned rate-limiting rule is unavailable on this account's plan (owner-verified 2026-08-18) | nothing blocks a first-seen IP at the edge; the in-Worker tiers below are the standing bound, and abuse is blocked at the edge only after it is identified |
 | 1 | Worker | 100 events / identifier / UTC day — **`/b` only**; convert rows are excluded from the count | honest runaway client stops being counted; UA rotation still mints fresh identifiers, which is a measurement cost, not a spend |
 | 1c | Worker | **5,000 SERVED conversions / caller / UTC day** (`PAID_DAILY`), claimed only once a payment has been **verified** by the facilitator (changed 2026-08-18 — presenting a header is no longer enough). Optionally, `env FREE_TIER_DAILY = N` puts a free tier of N/caller/day on the same counter and the same key; unset (the default) means no tier | unpaid callers get 402 (or 429 with no `PAYTO`) without touching this counter at all; a caller past the ceiling gets 429 + `Retry-After`. The key is the IP hash, so UA rotation does **not** mint a fresh allowance |
+| 1d | Worker | **50 facilitator-REJECTED payments / caller / UTC day** (`REJECTED_PAYMENTS_DAILY`), in the same `convert_quota` table under a `reject:` key. Only refusals the facilitator itself returned count — a malformed header and an unoffered network never reach it, and an outage is not the caller's fault | a caller spamming junk payments stops costing facilitator round trips after 50: the 51st is 429 + `Retry-After` and is **not** forwarded. It writes no `settlements` row, no `events` row and no quota. Legitimate buyers never reach it, because their payments verify; UA rotation does **not** mint a fresh allowance (same key as 1c) |
 | 2 | Worker | 200,000 events / UTC day, fail-closed before insert | metrics loss and no conversions for the rest of the day |
 | 3 | — | none; priced, not bounded — $2.49/day at 100 req/s, $25.82/day at 1,000 req/s | detective only: $25 alert + shutdown runbook |
 
