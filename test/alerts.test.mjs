@@ -837,3 +837,106 @@ describe('the email channel produces a valid RFC 5322 message', () => {
     }
   });
 });
+
+// ------------------------------------------------------------------ the daily cap
+
+describe('the channel has a daily budget, so a bad day cannot mute it forever', () => {
+  // The four rules at the top of the alerts section bound everything about an
+  // alert except HOW MANY. Alerts fire per payment, and one of the paths that
+  // fires them is the availability-first unverified serve — which is the path a
+  // missing facilitator config or a CDP outage puts EVERY call down. An alert
+  // per call for an hour is how a notification channel actually dies: not by
+  // failing, but by tripping Telegram's bot rate limit and then being muted,
+  // burying the one 🍋💰 the channel exists for.
+  //
+  // The worker below is booted with ALERT_DAILY = 2 so the cap is reachable in
+  // three sends; production is 20. Every alert kind shares that one per-channel
+  // budget deliberately — see the note under rule five in worker/beacon.js.
+  let cappedFacilitator;
+  let cappedTelegram;
+  let capped;
+  let cappedApi;
+
+  before(async () => {
+    cappedFacilitator = await startMockFacilitator();
+    cappedTelegram = await startMockTelegram();
+    capped = await bootWorker({
+      vars: {
+        PAYTO: PAYTO_TEST,
+        FACILITATOR_URL: cappedFacilitator.url,
+        ...fakeCdpCredentials(),
+        ...telegramVars(cappedTelegram.url),
+        HOUSE_PAYERS: HOUSE_PAYER,
+        ALERT_DAILY: '2',
+      },
+    });
+    cappedApi = client(capped);
+  });
+
+  after(async () => {
+    await capped?.stop();
+    await cappedTelegram?.stop();
+    await cappedFacilitator?.stop();
+  });
+
+  /** One third-party paid conversion — the loudest alert shape there is. */
+  const cappedBuy = () =>
+    cappedApi.convert('md-html', '# hi\n', {
+      ip: ips.next(),
+      ua: 'alerts-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+
+  test('two get through, the third says the cap is reached, the fourth is silent', async () => {
+    for (let i = 0; i < 2; i++) {
+      const res = await cappedBuy();
+      assert.equal(res.status, 200, res.text);
+    }
+    await awaitTelegram(
+      cappedTelegram,
+      () => cappedTelegram.sends().length >= 2,
+      'the first two alerts'
+    );
+    for (const send of cappedTelegram.sends()) {
+      assert.match(send.text, /THIRD PARTY PAID/, 'the budget swallowed a real alert');
+    }
+
+    // The one that trips it SAYS SO. Going quiet without a word would leave an
+    // empty channel reading as "nothing happened", which is the same failure as
+    // the flood and harder to notice.
+    assert.equal((await cappedBuy()).status, 200);
+    const notice = await awaitTelegram(
+      cappedTelegram,
+      (s) => /alerts capped|daily cap/.test(s.text),
+      'the cap notice'
+    );
+    assert.match(notice.text, /settlements/, 'the notice does not say where the events are');
+    assert.equal(cappedTelegram.sends().length, 3);
+
+    // And then nothing at all.
+    assert.equal((await cappedBuy()).status, 200);
+    await settleFor();
+    assert.equal(cappedTelegram.sends().length, 3, 'the cap did not hold after the notice');
+  });
+
+  test('the paying caller is never affected by the cap', async () => {
+    // Rule one still holds. A capped channel is a notification decision and must
+    // not be visible to anyone who paid.
+    const res = await cappedBuy();
+    assert.equal(res.status, 200, res.text);
+    assert.equal(res.headers.get('x-payment-verified'), 'true');
+    assert.ok(res.text.includes('<h1>hi</h1>'), 'the conversion did not run');
+
+    await settleFor();
+    assert.equal(cappedTelegram.sends().length, 3, 'the cap did not hold');
+  });
+
+  test('the ledger is unaffected — the cap is on the ping, not on the record', async () => {
+    // `settlements` is the source of truth and a notification budget must never
+    // be able to lose a row from it: five buys, five settled rows, three pings.
+    const [row] = await capped.d1(
+      'SELECT COUNT(*) AS n FROM settlements WHERE verify_ok = 1 AND settle_ok = 1;'
+    );
+    assert.ok(Number(row.n) >= 5, `only ${row.n} settled rows for 5 paid conversions`);
+  });
+});
