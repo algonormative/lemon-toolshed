@@ -2151,7 +2151,7 @@ async function recordSettlement(db, { now, tool, payer, amount, verifyOk, settle
 // event this service is built to produce — a stranger paying for something —
 // is worth a phone buzzing.
 //
-// FOUR RULES, and together they are the whole design.
+// FIVE RULES, and together they are the whole design.
 //
 //   AN ALERT NEVER TOUCHES THE PAYING CALLER. Everything here runs inside
 //   ctx.waitUntil, after the response has shipped, and each channel is caught
@@ -2180,6 +2180,34 @@ async function recordSettlement(db, { now, tool, payer, amount, verifyOk, settle
 //   fire: a payment the facilitator accepted (settled or not), a call served
 //   with nothing checked at all, and a non-house payer lost at verify or at
 //   settle.
+//
+//   A CHANNEL HAS A DAILY BUDGET, AND THE CAP TRIPS ONCE AND SAYS SO. The four
+//   rules above bound everything about an alert except HOW MANY. Alerts fire
+//   per payment, and one of the paths that fires them is the unverified serve —
+//   which is exactly the path a missing facilitator config or a CDP outage puts
+//   EVERY call down. An alert per call for an hour is how a notification
+//   channel actually dies: not by failing, but by tripping Telegram's bot rate
+//   limit and then being muted by its owner, burying the one 🍋💰 the channel
+//   exists for. So twenty a day per channel (ALERT_DAILY, env-tunable), and the
+//   send that trips it carries a notice instead of the alert — going quiet
+//   without a word would leave an empty channel reading as "nothing happened",
+//   which is the same failure as the flood and harder to notice.
+//
+// WHY ONE BUDGET PER CHANNEL RATHER THAN ONE PER ALERT KIND. All four shapes —
+// third-party paid, test settlement, served-without-verification, lost
+// conversion (at verify or at settle) — draw from the SAME per-channel counter,
+// deliberately. The cap protects the CHANNEL, not any one class of event: what
+// is scarce is Telegram's per-bot send rate and the owner's willingness to keep
+// notifications on, and both are consumed by every alert regardless of which
+// branch queued it. Give each kind its own allowance and the protection
+// evaporates — an unverified-serve flood would spend its own twenty AND still
+// leave the bot throttled and the owner desensitised when the paid ping
+// arrives, which is the precise failure this cap exists to prevent. No class
+// needs a reserved allowance either, because THE LEDGER IS THE RECORD: every
+// one of these events is a `settlements` row whether or not a ping went out
+// (rule two), so a capped channel loses a notification, never an event. The two
+// CHANNELS do keep separate budgets — an inbox absorbs far more than a lock
+// screen, and a Telegram flood must not silence email as well.
 
 // The email channel's identity. `alerts@lemon-agent.dev` need not be a real
 // mailbox — Email Routing sends FROM the zone — but it must be ON the zone.
@@ -2191,6 +2219,60 @@ const DEFAULT_TELEGRAM_API_BASE = 'https://api.telegram.org';
 // Generous, because nobody is waiting: the response shipped before this ran.
 // It exists only so a hung socket cannot pin a waitUntil open indefinitely.
 const ALERT_TIMEOUT_MS = 10_000;
+
+// Rule five's number: sends per channel per UTC day. Not a way of hiding events
+// — `settlements` has all of them and is the source of truth — but a way of
+// keeping the twenty-first alert from destroying the value of the first.
+const ALERT_DAILY = 20;
+
+/** The alert budget. Env-tunable so the suite can exhaust it in three sends. */
+function alertDaily(env) {
+  const raw = Number(env?.ALERT_DAILY ?? ALERT_DAILY);
+  if (!Number.isFinite(raw)) return ALERT_DAILY;
+  return Math.min(1000, Math.max(1, Math.floor(raw)));
+}
+
+/**
+ * Claim one send against today's budget for a channel.
+ *
+ * Returns 'send' (under the cap), 'final' (this is the one that trips it, and
+ * it carries the notice instead of the alert) or 'silent'.
+ *
+ * The ceiling handed to the claim is cap + 1 precisely so there is one claim
+ * left to spend on SAYING the cap was reached — see rule five.
+ *
+ * It reuses claimConvertQuota, which is the guarded upsert written once: the row
+ * is created at 1 and incremented only WHILE it is under the ceiling, so the
+ * "may I" read and the "spend one" write cannot race apart across isolates. The
+ * key namespace is what lets one table hold both budgets — a conversion counter
+ * is keyed on an IP hash, an alert budget on `alert:<channel>`, and distinct
+ * keys cannot spend each other's allowance.
+ *
+ * With no DB bound this returns 'send': a courtesy channel must not stop working
+ * because the store is missing, and a deployment with no D1 has larger problems
+ * than its notification volume. Any thrown error lands the same way — the budget
+ * is a courtesy on top of a courtesy.
+ */
+async function claimAlertBudget(env, channel) {
+  const db = env?.DB;
+  if (!db) return 'send';
+  const cap = alertDaily(env);
+  try {
+    const day = new Date().toISOString().slice(0, 10); // UTC
+    const used = await claimConvertQuota(db, day, `alert:${channel}`, cap + 1);
+    if (used === null) return 'silent';
+    return used <= cap ? 'send' : 'final';
+  } catch {
+    return 'send';
+  }
+}
+
+/** What the channel says as it goes quiet for the day. */
+const cappedNotice = (env) =>
+  `Toolshed alerts: the daily cap of ${alertDaily(env)} has been reached, so no more will be sent ` +
+  'today. Nothing is lost — every payment is in the `settlements` table, which is the source of ' +
+  'truth. A day that hits this cap is usually one thing repeating: check for a run of ' +
+  'verify_ok = 0 rows, which is the paid rail quietly down.';
 
 /**
  * Atomic USDC (6 decimals) rendered as money: "5000" → "$0.005".
@@ -2370,9 +2452,15 @@ async function sendPaymentAlert(env, alert) {
  * exactly as FACILITATOR_URL is; production never sets it.
  */
 async function sendTelegramAlert(env, text) {
-  // Config presence FIRST, before anything that costs. Both halves are needed:
-  // a token with no chat id has nowhere to send.
+  // Config presence FIRST, before anything that costs — including the budget
+  // claim, which is a D1 write. An unconfigured channel must behave exactly as
+  // if this code did not exist (rule three), and that includes not touching the
+  // store. Both halves are needed: a token with no chat id has nowhere to send.
   if (!env?.TELEGRAM_BOT_TOKEN || !env?.TELEGRAM_CHAT_ID) return;
+
+  const budget = await claimAlertBudget(env, 'telegram');
+  if (budget === 'silent') return;
+  const message = budget === 'final' ? cappedNotice(env) : text;
 
   const base = (env.TELEGRAM_API_BASE || DEFAULT_TELEGRAM_API_BASE).replace(/\/+$/, '');
   const controller = new AbortController();
@@ -2385,7 +2473,7 @@ async function sendTelegramAlert(env, text) {
     await fetch(`${base}/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text }),
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: message }),
       signal: controller.signal,
     });
   } catch {
@@ -2409,8 +2497,16 @@ async function sendTelegramAlert(env, text) {
  */
 async function sendEmailAlert(env, subject, text) {
   if (typeof env?.ALERT_EMAIL?.send !== 'function' || !env?.ALERT_EMAIL_TO) return;
+
+  // Its OWN budget, not a share of Telegram's — see the note under rule five.
+  const budget = await claimAlertBudget(env, 'email');
+  if (budget === 'silent') return;
+  const capped = budget === 'final';
+
   try {
-    const raw = rawEmail({ to: env.ALERT_EMAIL_TO, subject, text });
+    const raw = capped
+      ? rawEmail({ to: env.ALERT_EMAIL_TO, subject: 'alerts capped for today', text: cappedNotice(env) })
+      : rawEmail({ to: env.ALERT_EMAIL_TO, subject, text });
     await env.ALERT_EMAIL.send(new EmailMessage(ALERT_FROM, env.ALERT_EMAIL_TO, raw));
   } catch {
     /* best-effort: an unverified destination or a dead zone costs a ping */

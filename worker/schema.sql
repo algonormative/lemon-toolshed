@@ -61,10 +61,18 @@ CREATE TABLE IF NOT EXISTS counters (
 -- the same reason `events.id_hash` is: the salt is overwritten, and the overwrite
 -- is the discard. Only today's row is ever read; older rows are pruned on the
 -- same 90-day chore as the raw events (README.md § Retention chores).
+--
+-- The key column ALSO carries the owner's notification budget, as `alert:
+-- telegram` and `alert:email` rows: the daily alert cap is the same question
+-- asked about a different key — "may I have one more today, and if so how many
+-- have I had?" — and distinct keys cannot spend each other's allowance, so one
+-- table holds both. THE UPSERT IS THE CORRECTNESS, so it is written once
+-- (claimConvertQuota in worker/beacon.js) rather than twice; a second copy would
+-- be a second chance to get the race wrong, found only in production under load.
 CREATE TABLE IF NOT EXISTS convert_quota (
   day     TEXT,     -- UTC date, YYYY-MM-DD
-  ip_hash TEXT,     -- truncated day-scoped hash of the IP alone
-  used    INTEGER,  -- conversions claimed today
+  ip_hash TEXT,     -- truncated day-scoped hash of the IP alone, or 'alert:<channel>'
+  used    INTEGER,  -- conversions (or alert sends) claimed today
   PRIMARY KEY (day, ip_hash)
 );
 
