@@ -131,6 +131,7 @@ export const REFUSAL_REASONS = [
   'no-price', // 429 — a `price: free` entry with no free tier enabled
   'free-tier-spent', // 429 — the caller's free allowance is gone
   'paid-ceiling', // 429 — the per-caller runaway bound (PAID_DAILY)
+  'rejected-payments-ceiling', // 429 — too many refused payments (REJECTED_PAYMENTS_DAILY)
   'global-ceiling', // 429 — rung 2, the whole-service daily bound
   'payment-invalid', // 402 — the facilitator refused the presented payment
   'payment-replayed', // 402 — that exact payload already bought a conversion

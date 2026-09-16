@@ -91,6 +91,10 @@ export const PAYTO_SOLANA_TEST = 'So1anaTESTpayTo1111111111111111111111111111';
 // catalog (it is a runaway bound, not an advertised quota), so it is typed here.
 export const PAID_DAILY = 5000;
 
+// Mirrors REJECTED_PAYMENTS_DAILY in worker/beacon.js. Same reason it is typed
+// here: a bound, not an advertised quota, so nothing exports it.
+export const REJECTED_PAYMENTS_DAILY = 50;
+
 const BOOT_TIMEOUT_MS = 120_000;
 const STOP_GRACE_MS = 8_000;
 
