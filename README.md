@@ -1734,11 +1734,10 @@ npm test           # the whole suite, LOCAL ONLY — touches nothing deployed
 npm run test:live  # the production smoke — serves nothing, spends nothing
 ```
 
-`npm test` is the real coverage: **238 tests across eleven files**, per-tool
-fixture batteries plus the protocol, quota, spoof-resistance, tier-off, x402
-v1 and v2, settlement and beacon contracts. It never speaks to production and it never needs
-a Cloudflare login. Framework is `node:test` — no test dependency was added, and
-none is wanted.
+`npm test` is the real coverage: per-tool fixture batteries plus the protocol,
+quota, spoof-resistance, tier-off, x402 v1 and v2, settlement and beacon
+contracts. It never speaks to production and it never needs a Cloudflare login.
+Framework is `node:test` — no test dependency was added, and none is wanted.
 
 Neither costs anything. It used to be a budget question — the live run spent the
 caller's free allowance — and it is not any more: with no free tier, every unpaid
