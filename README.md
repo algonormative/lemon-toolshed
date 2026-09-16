@@ -1254,26 +1254,32 @@ truthfully. The comment above it keeps the 2026-08-18 flip record and appends th
 ## Payment alerts
 
 The `settlements` table is a perfect record that nobody reads at 3am. These are
-the push half: a **Telegram** message and an **email** when money moves.
+the push half: a **Telegram** message and an **email** when money moves — or when
+it should have moved and did not.
 
 ### What fires, and what deliberately does not
 
 | event | alert |
 | --- | --- |
 | verified payment, settled | 🍋💰 `THIRD PARTY PAID — $0.004 md-html — payer 0x… — tx 0x… — settled` |
-| verified payment, from a wallet in `HOUSE_PAYERS` | 🧪 `test settlement — …` — same facts, quiet framing |
-| verified payment, settlement **failed** | the same message ending `SETTLE FAILED (<reason>)`. Verified means the caller was served, so this is money owed that did not arrive |
-| **served without verification** | ⚠️ `SERVED WITHOUT VERIFICATION — … — x-payment-error: <reason>`. Visually distinct because it is a different problem: the conversion went out and **nobody paid** |
+| verified payment, from a wallet in `HOUSE_PAYERS` | 🧪 `test settlement — …` — same facts, quiet framing. It keeps 🧪 when the settlement fails, ending `SETTLE FAILED (<reason>)`: a drill that breaks is a configuration story, not a revenue one |
+| verified payment from a payer **not** in `HOUSE_PAYERS`, settlement **failed** | 🚨 `LOST CONVERSION — $0.004 md-html — payer 0x… — tx none — SETTLE FAILED (<reason>)`. Verified means the caller was served, and the money then did not arrive — as absent as in a refusal, so it wears the same lead rather than 🍋💰 |
+| facilitator-**rejected** payment, where an address was recovered and it is **not** in `HOUSE_PAYERS` | 🚨 `LOST CONVERSION — $0.004 md-html — payer 0x… — rejected: <reason>`. An outside wallet tried to buy and could not: nothing was served, nothing was billed, and a run of these on one reason is a buyer who cannot pay us for a fixable reason |
+| **served without verification** | ⚠️ `SERVED WITHOUT VERIFICATION — … — x-payment-error: <reason>` (` (test payer)` after the headline when the payer is one of ours — the leak is real either way). Visually distinct because it is a different problem: the conversion went out and **nobody paid** |
 | unpaid 402 | **nothing** |
-| malformed `X-PAYMENT` / `PAYMENT-SIGNATURE` | **nothing** |
-| facilitator-rejected payment | **nothing** |
+| malformed `X-PAYMENT` / `PAYMENT-SIGNATURE` — a rejection with **no recoverable payer** | **nothing** |
+| facilitator-rejected payment from a wallet in `HOUSE_PAYERS` | **nothing** |
 | free-tier serve (when a tier is enabled) | **nothing** |
 
 The four silences are the design, not an omission. This service is on a public
-discovery index and is scanned continuously; an alert that fires on someone
-*failing* to pay would page all day and train the owner to swipe it away, which
-is the only way this feature can genuinely fail. **Only verified money, and the
-one case where money should have been taken and was not.**
+discovery index and is scanned continuously; an alert that fires on every
+*failure* to pay would page all day and train the owner to swipe it away, which
+is the only way this feature can genuinely fail. **A ping needs a named
+non-house payer** — the discriminator is the payer, not the verdict. A refused
+payment fires when an address was recovered from the payload and it is not one
+of ours, because that is money that should have been taken and was not; a
+rejection with nobody behind it and a rejection from one of our own wallets are
+the probe-noise class and stay quiet.
 
 The house/third-party split matters for the same reason: if the owner's own
 test buys and a stranger's purchase produced the same message, the loud
