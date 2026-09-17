@@ -38,6 +38,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
 import { marked } from 'marked';
+// The failure disclosure and the two price renderers it shares with the rest of
+// the machine surfaces. Plain ESM with no workerd imports, precisely so this
+// Node build script can read it — see worker/billing-terms.js.
+import { atomicAmount, billingTerms, usdDecimal } from './worker/billing-terms.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DIST = join(ROOT, 'dist');
@@ -1850,18 +1854,11 @@ const paymentRequiredResponse = {
 // into a discovery document a second time is a rate card that goes stale
 // silently, which is the exact failure PRICE_RANGE exists to prevent.
 
-// USDC's 6 decimals — the same base the Worker's atomicAmount() rounds to, so
-// the decimal published here and the atomic amount that settles cannot disagree.
-const USD_DECIMALS = 6;
-
-// Decimal USD as a plain string, rendered THROUGH the atomic amount rather than
-// by stringifying the float: String(0.0000012) is "1.2e-6", and a price in
-// exponent notation is one no discovery parser will read.
-const usdDecimal = (usd) => {
-  const digits = String(Math.round(usd * 10 ** USD_DECIMALS)).padStart(USD_DECIMALS + 1, '0');
-  const frac = digits.slice(-USD_DECIMALS).replace(/0+$/, '');
-  return frac ? `${digits.slice(0, -USD_DECIMALS)}.${frac}` : digits.slice(0, -USD_DECIMALS);
-};
+// `usdDecimal` (the decimal string) and `atomicAmount` (the atomic USDC figure
+// the accepts entries below quote) are imported from worker/billing-terms.js
+// rather than defined here: the billing-terms disclosure quotes the same two
+// figures, and one implementation is the only way three surfaces cannot drift
+// apart on the price. See the header comment in that module.
 
 // Every hosted tool here is flat-priced, so the mode is `fixed`. No `mpp`
 // protocol object (there is no MPP runtime on this Worker) and no
@@ -1892,6 +1889,12 @@ const convertPaths = Object.fromEntries(
         // tool has nothing to quote, and a route that advertises a price it does
         // not charge is the same lie as one that hides the price it does.
         ...(isFree(e._hosted) ? {} : { 'x-payment-info': paymentInfo(e._hosted) }),
+        // The failure disclosure, on the paid operations only and for the same
+        // reason: a free tool has no authorization to spend, release or replay.
+        // Same renderer as /.well-known/x402's `billing_terms`, so the two
+        // machine surfaces cannot say different things about what a failed call
+        // costs — test/billing-terms.test.mjs asserts it field for field.
+        ...(isFree(e._hosted) ? {} : { 'x-billing-terms': billingTerms(e._hosted) }),
         parameters: [
           {
             name: 'X-PAYMENT',
@@ -2182,12 +2185,6 @@ const NETWORK_BASE_V2 = 'eip155:8453';
 const USDC_SOLANA = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const NETWORK_SOLANA_V2 = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp';
 
-// USDC has 6 decimals on BOTH rails, so one atomic figure serves both entries —
-// the same identity worker/beacon.js relies on. Rendered through the same
-// rounding as usdDecimal() above, so the decimal published in openapi.json and
-// the atomic amount published here cannot disagree.
-const atomicAmount = (usd) => String(Math.round(usd * 10 ** USD_DECIMALS));
-
 // `accepts` for one hosted tool: Base first, Solana second, same price on
 // either. Order matters — it is the order the live envelope uses, and a client
 // that takes the first entry it understands should land on the rail with
@@ -2234,6 +2231,11 @@ const wellKnownX402 = {
     description: `${oneLine(e.x)} to ${oneLine(e.y)}`,
     mimeType: responseMime(e),
     accepts: wellKnownAccepts(e._hosted),
+    // What a degraded call costs, next to what a good one does — the same five
+    // fields openapi.json publishes as `x-billing-terms` on this resource's
+    // operation, out of the same renderer. Paid resources only: a free tool has
+    // no authorization to spend, release or replay.
+    ...(isFree(e._hosted) ? {} : { billing_terms: billingTerms(e._hosted) }),
   })),
   note:
     'Each accepts entry carries the payTo of its rail, substituted at serve time from this ' +

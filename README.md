@@ -870,6 +870,80 @@ after step 1 and the tie-breaker if the two halves ever disagree.
 > discovery for a trial allowance, which is precisely the trade that was made in
 > the other direction on 2026-08-19.
 
+## Billing terms
+
+**What a call costs is published; so is what a failed call costs.** Five fields
+travel with the price on every paid tool, in the two places a machine already
+looks and in one a human does:
+
+| surface | where |
+| --- | --- |
+| `x-billing-terms` on every paid operation in `/openapi.json` | next to `x-payment-info`, per operation |
+| `billing_terms` on every resource in `/.well-known/x402` | next to `accepts`, per resource |
+| this section | the same sentences, quoted |
+
+**All three are rendered from one module, `worker/billing-terms.js`**, and
+`test/billing-terms.test.mjs` asserts they still agree field for field —
+including that the atomic amount in the terms is the atomic amount the 402
+envelope quotes for that tool. Three copies is three chances to drift; a
+disclosure that has gone stale on one surface is worse than none, because it is
+a wrong answer to the one question a buyer asked before spending.
+
+Each field carries machine-readable values *and* the sentence below it —
+a router needs `held: false`, a person reading the document needs the reason.
+**Everything here describes shipped behaviour**, and where no path exists the
+value is the string `none` rather than an omitted key.
+
+**`billable_unit`**
+
+One served conversion. A single signed authorization buys exactly one response
+at the listed price; the amount settled is that whole price, and there is no
+partial, metered or per-byte billing. Settlement is queued only after the
+converter has returned an output, and only for a payment the facilitator
+verified — a conversion served while the facilitator was unreachable settles
+nothing at all, and says so in its x-payment-verified header.
+
+**`hold`**
+
+None. Verification is a read at the facilitator, so nothing is reserved,
+escrowed or held: the signed authorization moves no funds until it is submitted
+at settle, which is queued behind the response rather than run in front of it.
+An authorization that never reaches settle simply goes unused.
+
+**`idempotency`**
+
+There is no idempotency-key header. The key is the SHA-256 of the payment
+header exactly as presented — `X-PAYMENT` for x402 v1, `PAYMENT-SIGNATURE` for
+x402 v2, and PAYMENT-SIGNATURE is the one read when a request carries both —
+claimed single-use between verification and the conversion. A retry carrying
+the same authorization, concurrently or an hour later, is answered 402 with
+invalidReason `payment_already_used` and the live terms attached; it converts
+nothing, serves no second response and settles nothing. Sign a fresh
+authorization, with a fresh nonce, to buy another conversion.
+
+**`post_payment_error`**
+
+Nothing is ever settled unless a conversion was served, and every exit after
+the claim hands the claim back, so the very same authorization can be presented
+again. That covers the 4xx paths — a body that cannot be read, an empty body, a
+body over the 256 KB cap, input the converter refused, anything unexpected —
+and the one 5xx after payment, a 503 raised when the metering store is
+unreachable and the route fails closed. The release is best-effort, so a retry
+that is nonetheless refused as already used means signing a fresh
+authorization. What is deliberately not given back is the per-caller daily
+ceiling: it bounds what a request costs us, and the facilitator round trip was
+made either way.
+
+**`refund`**
+
+None. There is no refund, credit or dispute endpoint, and no reversal of a
+settled payment. The mechanism is non-charge rather than refund: an
+authorization for a conversion that was not served is never submitted, so no
+funds move. A settlement that fails after a conversion was served is recorded
+in the ledger with settle_ok = 0 and is not retried — the caller keeps the
+conversion. Anything else is support@lemon-agent.dev and a conversation, not a
+guaranteed remedy.
+
 ## Discoverability (Bazaar)
 
 The 402-first shape is not an aesthetic preference. Coinbase's **Bazaar** is a
@@ -1796,6 +1870,7 @@ test/x402-solana.test.mjs         the dual-rail accepts, the fee-payer fetch, (v
 test/wellknown-payto.test.mjs     discovery's payTo against the live envelope, both rails
 test/beacon.test.mjs              rows, bot drops, salt rotation
 test/analytics.test.mjs           the PostHog event family — IN PROCESS, boots no worker, fetch stubbed
+test/billing-terms.test.mjs       the five billing terms, on all three surfaces — IN PROCESS, boots no worker
 test/live.smoke.mjs               the production smoke (`npm run test:live`)
 ```
 
