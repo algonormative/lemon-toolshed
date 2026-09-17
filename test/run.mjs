@@ -43,6 +43,19 @@ const PHASES = [
     files: ['test/analytics.test.mjs', 'test/analytics-firehose.test.mjs'],
   },
   {
+    // SECOND, and the other phase that boots nothing: the billing-terms
+    // disclosure is read straight out of the COMMITTED
+    // worker/surfaces.generated.js — the exact bytes the zone Worker serves —
+    // and compared against the module that renders it and the README that
+    // quotes it. It runs BEFORE the machine-surfaces phase below, which
+    // rebuilds those bytes, so what it checks is what is committed; that phase
+    // is what proves the committed copy still equals a fresh build.
+    name: 'billing terms (in process, no build, no worker)',
+    standalone: true,
+    note: 'boots no worker: the committed machine surfaces are compared against the renderer and the README',
+    files: ['test/billing-terms.test.mjs'],
+  },
+  {
     // First because it is the cheapest thing in the run: it runs the
     // production build, then boots its own worker (same shape as
     // settlement/solana/alerts below) to exercise the machine surfaces the
