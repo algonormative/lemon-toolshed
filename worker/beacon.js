@@ -822,7 +822,12 @@ async function handleConvert(request, env, path, ctx) {
         // rejection with nobody behind it is the scanner noise rule four names.
         // Queued through deferWork, exactly as the settle/alert block below is,
         // so the 402 never waits on a notification.
-        if (verdict.payer && !isHousePayer(env, verdict.payer)) {
+        //
+        // NOT on a `facilitator-http-*` rejection: there the facilitator gave no
+        // verdict and recovered nobody, so `verdict.payer` is only what the
+        // caller typed into its own payload — and the header most likely to
+        // carry a typed-in `from` is a scanner's. The ledger row still keeps it.
+        if (verdict.payer && !isHousePayer(env, verdict.payer) && !verdict.reason.startsWith('facilitator-http-')) {
           await deferWork(
             ctx,
             sendPaymentAlert(env, {

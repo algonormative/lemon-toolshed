@@ -729,9 +729,10 @@ the fourth**:
 | `PAYTO` | `X-PAYMENT` | facilitator says | response |
 | --- | --- | --- | --- |
 | set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool. **No salt read, no quota claim, no D1 write of any kind** |
-| set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable to send |
+| set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable, or nothing shaped like a payment, to send |
 | set | yes | `isValid` | **200**, the conversion, `x-payment-verified: true`, and settlement runs after the response |
 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served, and nothing settles |
+| set | yes | HTTP 400/413/422, no verdict | **402** + `invalidReason: facilitator-http-<status>` — the request was refused, not the facilitator down; recorded and counted like any other refusal |
 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served unverified, recorded |
 | set | yes | `isValid`, but the input will not convert | **400** — verified and **never settled**, so not charged |
 | set | yes | `isValid`, past 5,000 served calls today | **429** + `Retry-After` — the runaway bound, not a price gate |
@@ -1299,8 +1300,11 @@ facilitator-http-<status>`, writes a `settlements` row with that reason and
 refusal the facilitator returned. 401/403 (our credentials), 404/405 (our
 URL), 429 and every 5xx are still nobody's payment being refused and still
 serve unverified. The trade: if a Worker bug ever makes CDP 400 a *good*
-payment, buyers see 402 instead of a free conversion — and the named-payer
-refusal alert (§ Payment alerts) is what tells you.
+payment, buyers see 402 instead of a free conversion, and because the round
+trip was made it counts against `REJECTED_PAYMENTS_DAILY` — fifty of them and
+the buyer is 429 until midnight UTC. The refusal alert does not fire on this
+reason (the facilitator recovered no payer), so the `settlements` rows with
+`error = 'facilitator-http-400'` and a named `payer` are what tell you.
 
 ### Reading the ledger
 

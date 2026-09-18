@@ -543,6 +543,27 @@ describe('nothing that is not money disturbs the owner', () => {
     assert.equal(telegram.hits.length, 0, 'the 402 front door pinged the owner');
   });
 
+  test('a facilitator 400 with no verdict stays quiet even when the header names a payer', async () => {
+    // The 2026-09-18 door. A well-shaped junk header can carry any `from` it
+    // likes; when the facilitator answers 400 with no verdict it recovered
+    // nobody, so that address is the caller's claim and not a lost buyer. The
+    // ledger row keeps it — the owner is not paged for it.
+    facilitator.reset();
+    telegram.reset();
+    facilitator.state.verify = { status: 400, body: { errorType: 'invalid_request', errorMessage: 'paymentPayload.payload.authorization.value is required' } };
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip: ips.pinned(18),
+      ua: 'alerts-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    assert.equal(res.status, 402, res.text);
+    assert.equal(res.json().invalidReason, 'facilitator-http-400');
+
+    await settleFor();
+    assert.equal(telegram.hits.length, 0, 'a facilitator 400 with a claimed payer pinged the owner');
+  });
+
   test('a malformed payment header is silent — a rejection with nobody behind it', async () => {
     // THE PAYER-LESS REJECTION. An undecodable header is refused before the
     // facilitator is asked and yields no address at all, so there is no wallet

@@ -593,6 +593,11 @@ describe('the v2 envelope in the PAYMENT-REQUIRED header', () => {
     // cannot check is the conversion plus `facilitator-unconfigured` — the same
     // availability-first answer a v1 payment gets above. What matters is that
     // it is NOT the 402: the header was seen.
+    assert.notEqual(
+      res.status === 402 ? res.json().invalidReason : null,
+      'malformed_payment_header',
+      'the minimally shaped v2 fixture no longer passes the shape gate — widen the fixture, not the gate'
+    );
     assert.equal(res.status, 200, `a v2 payment header was ignored: ${res.status} ${res.text}`);
     assert.equal(res.headers.get('x-payment-verified'), 'false');
     assert.equal(res.headers.get('x-payment-error'), 'facilitator-unconfigured');
