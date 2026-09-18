@@ -1272,7 +1272,7 @@ from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
 | --- | --- |
 | `x-payment-verified: true` | the facilitator returned `isValid`. Never inferred from a header |
 | `x-payment-verified: false` | nothing was checked — see `x-payment-error` |
-| `x-payment-error: facilitator-unreachable` | timeout, network failure, or a non-200 from the facilitator |
+| `x-payment-error: facilitator-unreachable` | timeout, network failure, or a 5xx / 401 / 403 / 404 / 429 from the facilitator — nobody could be asked. A 400 / 413 / 422 with no verdict body is NOT this: it is the caller's request being refused, and is answered 402 (see below) |
 | `x-payment-error: facilitator-unconfigured` | no CDP credentials on this Worker. Operator fault, not caller fault |
 | `x-pricing: pending` | served without a verified payment |
 
@@ -1285,6 +1285,22 @@ terms. There is deliberately no `PAYMENT-RESPONSE` — see
 The **ledger** keeps the precise reason (`facilitator-timeout`,
 `facilitator-http-503`, …) because that is what you debug from; the **header**
 keeps a small stable vocabulary because that is what a client branches on.
+
+**A facilitator 4xx with no verdict body is a rejection, not an outage** (since
+2026-09-18). CDP answers a schema-invalid verify body — `payload: {}`,
+`authorization: {}` — with HTTP 400 and an error body that is not a
+`VerifyResponse`. Before that date the Worker filed every non-200 without a
+verdict under availability-first, so a well-shaped junk `X-PAYMENT` header
+bought a free conversion and paged the owner with `facilitator-unreachable`
+while CDP was up; one scanner took six that morning. Now a 400, 413 or 422
+without a verdict is answered **402** with `invalidReason:
+facilitator-http-<status>`, writes a `settlements` row with that reason and
+`verify_ok = 0`, and counts against `REJECTED_PAYMENTS_DAILY` like any other
+refusal the facilitator returned. 401/403 (our credentials), 404/405 (our
+URL), 429 and every 5xx are still nobody's payment being refused and still
+serve unverified. The trade: if a Worker bug ever makes CDP 400 a *good*
+payment, buyers see 402 instead of a free conversion — and the named-payer
+refusal alert (§ Payment alerts) is what tells you.
 
 ### Reading the ledger
 

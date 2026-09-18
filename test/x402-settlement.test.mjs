@@ -920,7 +920,17 @@ describe('junk payments cannot buy unbounded facilitator calls', () => {
     const ip = ips.pinned(32);
     const rejectKey = `reject:${await ipHashOn(worker, ip)}`;
 
-    for (const value of ['x', 'not-base64-!!']) {
+    const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64');
+    for (const value of [
+      'x',
+      'not-base64-!!',
+      // Decodes, but is not a payment. Found in the wild 2026-09-18: forwarded
+      // to the facilitator, answered 400, and at the time served free.
+      b64({ hello: 'world' }),
+      b64({ x402Version: 1, scheme: 'exact', network: 'base' }), // no payload
+      b64({ x402Version: 1, scheme: 'exact', network: 'base', payload: 'sig' }), // payload not an object
+      b64({ x402Version: 2, payload: { signature: '0x00' } }), // v2 with no accepted block
+    ]) {
       const res = await api.convert('md-html', '# hi\n', {
         ip,
         ua: 'settlement-suite/1',
@@ -932,6 +942,70 @@ describe('junk payments cannot buy unbounded facilitator calls', () => {
 
     assert.equal(mock.hits.length, 0, 'a garbage header was forwarded to the facilitator');
     assert.equal(await usedOn(worker, rejectKey), 0, 'a rejection nobody was asked about was counted');
+  });
+});
+
+describe('a facilitator 4xx with no verdict body is a rejection, not an outage', () => {
+  // Measured 2026-09-18: CDP answers a schema-invalid verify body with HTTP 400
+  // and a non-verdict error body. Filed under availability-first, that bought a
+  // free conversion per junk header and paged the owner with
+  // "facilitator-unreachable" while CDP was up. The request was bad; the
+  // facilitator was not down; the answer is 402.
+  test('a 400 with a JSON error body answers 402, writes the ledger row and is counted', async () => {
+    mock.reset();
+    mock.state.verify = { status: 400, body: { errorType: 'invalid_request', errorMessage: 'paymentPayload.payload is required' } };
+
+    const ip = ips.pinned(33);
+    const rejectKey = `reject:${await ipHashOn(worker, ip)}`;
+    const res = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    assert.equal(res.status, 402, `a facilitator 400 answered ${res.status}: ${res.text}`);
+    assert.equal(res.json().invalidReason, 'facilitator-http-400');
+    assert.ok(!res.text.includes('<h1>'), 'THE CONVERSION WAS SERVED on a refused request');
+    assert.equal(res.headers.get('x-payment-verified'), null, 'a 402 carried a verification header');
+    assert.equal(mock.hits.length, 1, 'the facilitator was not asked exactly once');
+
+    const row = await awaitSettlement((r) => r.error === 'facilitator-http-400', 'the rejection row');
+    assert.equal(row.verify_ok, 0);
+    assert.equal(row.settle_ok, 0);
+    assert.ok(isSqlNull(row.tx_hash));
+    assert.equal(await usedOn(worker, rejectKey), 1, 'a refusal the facilitator returned was not counted');
+  });
+
+  test('a 400 with a non-JSON body is the same rejection', async () => {
+    mock.reset();
+    mock.state.verify = { status: 400, body: '<html>Bad Request</html>' };
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip: ips.pinned(34),
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    assert.equal(res.status, 402, `a facilitator 400 answered ${res.status}: ${res.text}`);
+    assert.equal(res.json().invalidReason, 'facilitator-http-400');
+  });
+
+  test('a 401 is our credentials, not their payment — still served unverified', async () => {
+    mock.reset();
+    mock.state.verify = { status: 401, body: { errorType: 'unauthorized' } };
+
+    const ip = ips.pinned(35);
+    const rejectKey = `reject:${await ipHashOn(worker, ip)}`;
+    const res = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    assert.equal(res.status, 200, `an operator-fault 401 answered ${res.status}: ${res.text}`);
+    assert.equal(res.headers.get('x-payment-verified'), 'false');
+    assert.equal(res.headers.get('x-payment-error'), 'facilitator-unreachable');
+
+    const row = await awaitSettlement((r) => r.error === 'facilitator-http-401', 'the outage row');
+    assert.equal(row.verify_ok, 0);
+    assert.equal(await usedOn(worker, rejectKey), 0, 'an outage was counted against the caller');
   });
 });
 
