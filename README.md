@@ -350,6 +350,11 @@ re-applies everything and creates only what is missing. Swap `--remote` for
 npx wrangler d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE name = 'convert_quota';"
 ```
 
+The single-use payment claim needs a third table, `payment_seen`, and that one
+is **not** best-effort the way `settlements` is — see [Migration — the
+payment_seen table](#migration--the-payment_seen-table-existing-databases) under
+Settlement.
+
 **The routes, and the one counter-intuitive bit.** `wrangler.toml` carries them
 live:
 
@@ -1091,6 +1096,40 @@ a rejected payment still buys nothing against the paid ceiling either way. The
 `verify_ok = 0` breakdown under [Reading the ledger](#reading-the-ledger) is
 still how you see it happening.
 
+### Migration — the payment_seen table (existing databases)
+
+The single-use claim in the middle of that flow is one row in one more table, so
+**apply `worker/schema.sql` to the live database before deploying a Worker that
+takes payments:**
+
+```bash
+npx wrangler d1 execute DB --remote --file worker/schema.sql
+```
+
+The file is all `CREATE TABLE IF NOT EXISTS`, so it creates only what is
+missing. The one table, if you would rather be explicit about it:
+
+```bash
+npx wrangler d1 execute DB --remote --command "CREATE TABLE IF NOT EXISTS payment_seen (hash TEXT PRIMARY KEY, created_at INTEGER, route TEXT);"
+```
+
+Unlike [`settlements`](#migration--the-settlements-table-existing-databases),
+a missing `payment_seen` table is **not** best-effort. The claim is the `INSERT`
+itself, it runs on every verified paid call between the facilitator's yes and
+the conversion, and it carries no catch of its own — so a missing table throws
+into the enclosing `try` in `handleConvert` and the route takes its fail-closed
+exit: **503** `{"error": "conversion is unavailable"}`, refusal class
+`unavailable`, the same answer a missing `convert_quota` produces. Paid calls
+therefore fail closed until the table exists. Nothing else is affected: the 402
+envelope, a free tier if one is configured, and every refusal that happens
+before verify are all decided earlier and never touch the table. So the
+forgotten migration looks like "nobody can buy a conversion", not like
+"payments are unmetered" — run the migration, then check it landed:
+
+```bash
+npx wrangler d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE name = 'payment_seen';"
+```
+
 ### The endpoints, and what we send
 
 | | |
@@ -1720,6 +1759,24 @@ npx wrangler d1 execute DB --remote --command "
 Only today's `convert_quota` row is ever read, so pruning it is free of
 consequences — it is kept the 90 days purely so the per-caller pressure query
 above has a history to plot.
+
+**Prune `payment_seen` at a day**, not at ninety. A row there exists to refuse
+the same signed authorization a second time, and it only has to outlive the
+window in which that authorization could be presented again: the 402 envelope
+advertises `maxTimeoutSeconds` of **60 seconds** (`X402_TIMEOUT_SECONDS` in
+`worker/beacon.js`), which is the longest it lets an authorization stay valid,
+and the on-chain EIP-3009 nonce is the authoritative backstop behind it either
+way. Rows older than that guard nothing, so this table can be cut far harder
+than the raw events. A day rather than a minute purely for the operator:
+`route` records which tool a replay was aimed at, and a day is enough history to
+see a pattern between refreshes while still leaving a 1440× margin on the
+60-second bound. Like everything else in this section it is a hand-run chore on
+the refresh cadence, not a cron. `created_at` is unix seconds, like `events.ts`:
+
+```bash
+npx wrangler d1 execute DB --remote --command "
+  DELETE FROM payment_seen WHERE created_at < strftime('%s', 'now', '-1 day');"
+```
 
 **Blocklist expiry — enforced in the operator query, not by a cron.** Rows
 expire 90 days after last-seen; a subject-rights purge is the same `DELETE`
