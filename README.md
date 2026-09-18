@@ -2200,8 +2200,33 @@ an unpaid 402 writes no D1 row at all. Everything there is labelled *list prices
 as of 2026-08-18* and needs re-reading, not trusting, after any Cloudflare
 repricing.
 
-One piece of automation is still **not built**: a CI link-check over every
-`url`.
+`scripts/check-links.mjs` closes the last gap in that pass. It reads every
+`url:` in `entries.yaml`, deduplicates them — several entries lean on the same
+reference site, and the table says how many — and checks each one once. HEAD
+first, because it is the cheapest question that answers *is this
+still here*; anything that comes back `405` or `4xx`/`5xx` gets **one** GET
+retry before the link is called dead, which is what stops a host that answers
+HEAD badly (sqlite.org did exactly that) from reading as rot. Redirects are
+followed and a row that landed somewhere else prints where it landed —
+`jqlang.github.io/jq/ -> jqlang.org` is precisely the kind of thing the refresh
+pass wants to see. It prints a PASS/FAIL table, names the entry ids behind each
+dead link, and exits non-zero if there are any. Zero dependencies; Node 18+ for
+global `fetch`; it reads the file by line scan rather than importing js-yaml, so
+it runs with nothing installed.
+
+```bash
+npm run check-links
+```
+
+It belongs to the **monthly refresh, not to deploy**: nothing in
+`.github/workflows` calls it and nothing should. A rotted reference link is a
+stale opinion rather than a broken product, and a third-party outage must not be
+able to hold up shipping the Worker.
+
+What it cannot see is the other half of rot. A `200` from a URL that now serves
+a parked domain, or a page rewritten around a version the verdict predates, is a
+green row here and a wrong opinion in the catalogue. The script proves the link
+*resolves*; only the human pass can tell you it still says what the entry claims.
 
 Adding a hosted tool is four steps: add the `hosted:` block in `entries.yaml`
 (with a `price` — every hosted tool is priced), add the matching entry to
