@@ -718,6 +718,47 @@ await test(`POST /convert/md-html rejects ${BIG_INPUT_BYTES / 1024} KB with 413`
   return body.error.slice(0, 60);
 });
 
+await test('the http:// twin of a paid route 301s to https with no envelope', async () => {
+  // THE PAYTO MUST NEVER GO OUT IN THE CLEAR. An x402 402 served over plain HTTP
+  // carries the address a client is about to sign a USDC transfer authorization
+  // against, so anything on the path can rewrite it and be paid instead. Found
+  // against production on 2026-09-18 by an outside agent and reproduced from the
+  // shell. Two independent things should now prevent it — the Worker's own
+  // redirect, and the zone's Always Use HTTPS setting — and this row does not
+  // care which one answered: it fails if the envelope comes back at all.
+  //
+  // It is checked HERE rather than in `npm test` because the local suite cannot
+  // see a scheme. `wrangler dev` serves plain HTTP and nothing else, so what is
+  // being asserted — what a stranger gets when they type http:// — only exists
+  // against the deployed origin. Still free: a redirect serves no conversion.
+  if (!BASE.startsWith('https://')) return 'skipped — this run is not against an https origin';
+
+  const url = `${BASE.replace(/^https:/, 'http:')}/convert/md-html`;
+  // Paced like every other request — this one cannot go through `paced()`
+  // because that helper always prefixes BASE, and the whole point here is the
+  // other scheme.
+  const wait = PACE_MS - (Date.now() - lastRequestAt);
+  if (wait > 0) await sleep(wait);
+  requestCount += 1;
+  convertRequestCount += 1;
+  const res = await fetch(url, { method: 'POST', body: '# hi\n', redirect: 'manual' });
+  lastRequestAt = Date.now();
+
+  assert(
+    res.status === 301 || res.status === 302 || res.status === 308,
+    `http:// answered ${res.status} instead of a redirect — THE ENVELOPE MAY BE GOING OUT IN THE CLEAR`
+  );
+  const location = res.headers.get('location') || '';
+  assert(location.startsWith('https://'), `the redirect points at ${location || '(nothing)'}, not https`);
+  assert(
+    res.headers.get('payment-required') === null,
+    'the plain-HTTP answer carried the v2 PAYMENT-REQUIRED envelope'
+  );
+  const body = await res.text();
+  assert(!body.includes('payTo'), 'the plain-HTTP answer carried the v1 envelope in its body');
+  return `${res.status} -> ${location}`;
+});
+
 await test('POST /b accepts a visit beacon with 204', async () => {
   const res = await post('/b', JSON.stringify({ t: 'visit' }), { 'content-type': 'text/plain' });
   assert(res.status === 204, `expected 204, got ${res.status}`);

@@ -287,7 +287,17 @@ export async function bootWorker({ vars = {} } = {}) {
   // the toml value would leak into every test worker. Tests default the rail
   // OFF — the single-rail suites assert the ungated shape — and a suite that
   // wants it on passes its own value (PAYTO_SOLANA_TEST) which wins below.
-  const bootVars = { PAYTO_SOLANA: '', ...vars };
+  //
+  // ALLOW_PLAIN_HTTP is the other default, and it is what makes this harness
+  // work at all: the Worker 301s every plain-HTTP request to https, and every
+  // request in this suite is plain HTTP. It cannot be gated on the hostname,
+  // because `wrangler dev` rewrites the URL *and* the Host header to the
+  // wrangler.toml route — a call to http://127.0.0.1:<port>/check arrives as
+  // http://toolshed.lemon-agent.dev/check (measured 2026-09-19, wrangler
+  // 4.42.2) — so local dev is indistinguishable from production-over-http
+  // inside the Worker. A suite that wants the redirect ON passes
+  // `ALLOW_PLAIN_HTTP: ''`, which wins below; see test/surfaces.test.mjs.
+  const bootVars = { PAYTO_SOLANA: '', ALLOW_PLAIN_HTTP: '1', ...vars };
   for (const [key, value] of Object.entries(bootVars)) args.push('--var', `${key}:${value}`);
 
   const child = spawn(process.execPath, args, {
@@ -355,6 +365,11 @@ export async function bootWorker({ vars = {} } = {}) {
   };
 
   // Readiness: /check is the cheapest route in the Worker — no D1, no rungs.
+  //
+  // A 301 counts as ready too, and only one configuration produces one: a
+  // worker booted with ALLOW_PLAIN_HTTP cleared, which 301s every plain-HTTP
+  // request including this probe. Waiting for a 200 there would time out after
+  // two minutes on a worker that is answering perfectly.
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
   for (;;) {
     if (exitedWith) {
@@ -362,8 +377,8 @@ export async function bootWorker({ vars = {} } = {}) {
       throw new Error(`wrangler dev exited during boot (${JSON.stringify(exitedWith)})\n${log}`);
     }
     try {
-      const res = await fetch(`${baseUrl}/check`);
-      if (res.status === 200) {
+      const res = await fetch(`${baseUrl}/check`, { redirect: 'manual' });
+      if (res.status === 200 || res.status === 301) {
         await res.arrayBuffer();
         return worker;
       }
