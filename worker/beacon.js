@@ -432,8 +432,17 @@ function handleWellKnownVar(request, env, varName) {
  * `ALLOW_PLAIN_HTTP`, and nothing else ever does. It is deliberately NOT in
  * `wrangler.toml`, so it cannot reach production by being forgotten there — the
  * default, and anything a deploy leaves out, is REDIRECT.
+ *
+ * `0`, `false`, `no` and `off` read as OFF, and that is not decoration. A bare
+ * "non-empty is on" test makes `ALLOW_PLAIN_HTTP = "false"` in a dashboard mean
+ * ON — someone turning the exemption off would hand the envelope back to plain
+ * HTTP, which is precisely the vulnerability this function exists to close. The
+ * same rule `freeTierDaily()` follows: a misconfigured var fails towards the
+ * safe answer.
  */
-const plainHttpAllowed = (env) => String(env?.ALLOW_PLAIN_HTTP ?? '').trim() !== '';
+const PLAIN_HTTP_OFF = new Set(['', '0', 'false', 'no', 'off']);
+const plainHttpAllowed = (env) =>
+  !PLAIN_HTTP_OFF.has(String(env?.ALLOW_PLAIN_HTTP ?? '').trim().toLowerCase());
 
 export default {
   // `ctx` is threaded through for exactly one thing: ctx.waitUntil, which lets
