@@ -734,6 +734,7 @@ the fourth**:
 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served, and nothing settles |
 | set | yes | HTTP 400/413/422, no verdict | **402** + `invalidReason: facilitator-http-<status>` — the request was refused, not the facilitator down; recorded and counted like any other refusal |
 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served unverified, recorded |
+| set | yes | HTTP 429 — throttling **us** | **200**, served unverified exactly as above (`facilitator-http-429` in the ledger) — and the hit counts against `REJECTED_PAYMENTS_DAILY`, so fifty of them and the caller is 429'd until midnight UTC |
 | set | yes | `isValid`, but the input will not convert | **400** — verified and **never settled**, so not charged |
 | set | yes | `isValid`, past 5,000 served calls today | **429** + `Retry-After` — the runaway bound, not a price gate |
 | unset | either | *not asked* | **429** naming the missing receiving address, `free_tier_daily: 0`, and **no `Retry-After`** |
@@ -768,7 +769,12 @@ Four rows deserve saying out loud:
   of these is written to `settlements` with the precise reason, so the choice is
   auditable rather than invisible. If that table fills up with
   `facilitator-*` rows, the dependency is broken and revenue is quietly zero —
-  see [Operator queries](#operator-queries-kc-cur).
+  see [Operator queries](#operator-queries-kc-cur). **One of them is bounded
+  rather than free forever**: a facilitator **429** is throttling *our* key, so
+  the serve stands — but the hit counts against `REJECTED_PAYMENTS_DAILY`, and
+  after fifty the same caller is answered 429 until midnight UTC instead of
+  being served free for as long as the throttle lasts. 5xx, timeouts and our
+  own misconfiguration stay uncounted.
 
 **The 429s are not one refusal**, and the two on the payment path want opposite
 advice:
@@ -1088,14 +1094,74 @@ on the same daily-salted IP hash the paid ceiling uses — same table, no schema
 change, and rotating a user-agent mints no fresh allowance. Past 50, a further
 payment header from that caller is answered **429 with `Retry-After`** to
 midnight UTC **without calling the facilitator at all**, and that refusal writes
-nothing: no `settlements` row, no `events` row, no quota. Only refusals the
-facilitator itself returned are counted — a header we could not decode and a
-network we never offered are rejected without asking anyone, and a facilitator
-**outage** is not the caller being wrong (those calls are served free, see
-below). A legitimate buyer never reaches this bound, because its payments verify;
-a rejected payment still buys nothing against the paid ceiling either way. The
-`verify_ok = 0` breakdown under [Reading the ledger](#reading-the-ledger) is
-still how you see it happening.
+nothing: no `settlements` row, no `events` row, no quota. Only round trips the
+facilitator itself answered are counted — a header we could not decode and a
+network we never offered are rejected without asking anyone. A rejected payment
+still buys nothing against the paid ceiling either way. The `verify_ok = 0`
+breakdown under [Reading the ledger](#reading-the-ledger) is still how you see
+it happening.
+
+**A legitimate buyer used to be unable to reach this bound. Since 2026-09-19 it
+can — but only through us.** Nothing a good buyer does counts against it: its
+payments verify, and verified payments are counted by nothing here. What counts
+on its behalf is a **CDP throttle**, which is our key being rate-limited and not
+its payment being refused. Fifty throttled calls — every one of them served
+**free** — and that buyer is answered 429 until midnight UTC.
+
+**And the lockout outlives the throttle.** The counter is per UTC day, not per
+outage, so a throttle that clears at 09:00 leaves the caller refused for the
+rest of the day. That is the trade, stated rather than hidden: fifty free
+conversions first, then a refusal that may outlast its cause, against the
+alternative of an unbounded free tier keyed on somebody else's outage. The
+counter is deliberately **not** split in two — one bound, one key, one thing to
+reason about — so the price of that simplicity is this paragraph. A run of
+`error = 'facilitator-http-429'` rows in `settlements` is how an operator sees
+it happening, and the fix is upstream (the key's rate limits), not a bigger
+number here.
+
+**Fifty is a floor, not a ceiling, under concurrency — and that now matters for
+free serves too.** The bound is read (`rejectedPaymentsToday`) and claimed
+(`claimConvertQuota`) in two statements rather than one, so a burst of requests
+arriving together can all pass the read before any of their claims land, and
+overshoot it by roughly the width of the burst. The claim itself saturates — the
+guarded upsert increments only while `used < 50` — so the counter never runs
+away; what overshoots is the number of calls let through. That was cheap when
+every overshooting call was a 402 costing one facilitator round trip. With
+throttled calls now counted, an overshoot is a handful of extra **conversions
+served free**. Still bounded by `PAID_DAILY` and by the burst's own width, and
+still the right trade against serialising every payment path on one counter —
+but it is a different unit than it was, so it is said here rather than
+discovered from a bill.
+
+**A facilitator 429 is served *and* counted — the one outage that is
+(since 2026-09-19).** A 429 on verify is CDP throttling **our** key, so nobody's
+payment was refused and the availability-first serve stands exactly as it does
+for a 5xx: the conversion goes out, `x-payment-verified: false`,
+`x-payment-error: facilitator-unreachable`, and a `settlements` row with
+`error = 'facilitator-http-429'`. What changed is that the hit now claims
+against `REJECTED_PAYMENTS_DAILY` as well.
+
+The reason is that the other bounds cannot see this one either. While the
+throttle lasts, every payment a caller presents costs a round trip and is served
+**free**, and the only ceiling in its way is `PAID_DAILY` at 5,000 served calls
+a day per IP — which is not a bound on free conversions in any useful sense. So
+a caller that keeps presenting payments through a throttle now gets fifty free
+serves and is then answered **429 with `Retry-After`** until midnight UTC,
+rather than being served free indefinitely.
+
+**5xx, timeouts, dead sockets, 401/403, 404/405 and an unconfigured Worker stay
+uncounted**, and that is the line: a 429 is an answer, and the rest are our
+dependency having a bad day or our own configuration being wrong. Bounding a
+caller for either of those would be the same mistake mirrored. Both halves are
+pinned in `test/x402-settlement.test.mjs` — the 429 increments the counter, the
+503 does not.
+
+The trade is the same shape as the one below: a caller genuinely buying through
+a long CDP throttle gets fifty free conversions and is then turned away until
+midnight rather than continuing to be served. At these prices that is the
+cheaper failure than an unbounded free tier keyed on somebody else's outage, and
+`error = 'facilitator-http-429'` rows in the ledger are how you see it happening
+while it happens.
 
 ### Migration — the payment_seen table (existing databases)
 
@@ -1273,7 +1339,7 @@ from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
 | --- | --- |
 | `x-payment-verified: true` | the facilitator returned `isValid`. Never inferred from a header |
 | `x-payment-verified: false` | nothing was checked — see `x-payment-error` |
-| `x-payment-error: facilitator-unreachable` | timeout, network failure, or a 5xx / 401 / 403 / 404 / 429 from the facilitator — nobody could be asked. A 400 / 413 / 422 with no verdict body is NOT this: it is the caller's request being refused, and is answered 402 (see below) |
+| `x-payment-error: facilitator-unreachable` | timeout, network failure, or a 5xx / 401 / 403 / 404 / 429 from the facilitator — nobody could be asked. A 400 / 413 / 422 with no verdict body is NOT this: it is the caller's request being refused, and is answered 402 (see below). The **429** answers identically but is the one of these that counts against `REJECTED_PAYMENTS_DAILY` — see [Settlement](#settlement-live) |
 | `x-payment-error: facilitator-unconfigured` | no CDP credentials on this Worker. Operator fault, not caller fault |
 | `x-pricing: pending` | served without a verified payment |
 
@@ -1297,7 +1363,7 @@ while CDP was up; one scanner took six that morning. Now a 400, 413 or 422
 without a verdict is answered **402** with `invalidReason:
 facilitator-http-<status>`, writes a `settlements` row with that reason and
 `verify_ok = 0`, and counts against `REJECTED_PAYMENTS_DAILY` like any other
-refusal the facilitator returned. 401/403 (our credentials), 404/405 (our
+round trip the facilitator answered. 401/403 (our credentials), 404/405 (our
 URL), 429 and every 5xx are still nobody's payment being refused and still
 serve unverified. The trade: if a Worker bug ever makes CDP 400 a *good*
 payment, buyers see 402 instead of a free conversion, and because the round
@@ -1305,6 +1371,16 @@ trip was made it counts against `REJECTED_PAYMENTS_DAILY` — fifty of them and
 the buyer is 429 until midnight UTC. The refusal alert does not fire on this
 reason (the facilitator recovered no payer), so the `settlements` rows with
 `error = 'facilitator-http-400'` and a named `payer` are what tell you.
+
+**And a 429 is served but counted (since 2026-09-19).** It stays on the
+availability-first side — CDP is throttling our key, not refusing anyone's
+payment, so the conversion goes out with `x-payment-error:
+facilitator-unreachable` and a `facilitator-http-429` ledger row — but the hit
+claims against `REJECTED_PAYMENTS_DAILY`, because otherwise a caller presenting
+payments through a throttle is served free for as long as the throttle lasts and
+nothing bounds it. Fifty, then 429 until midnight UTC. The full reasoning, and
+the list of statuses that deliberately stay uncounted, is under
+[Settlement](#settlement-live).
 
 ### Reading the ledger
 

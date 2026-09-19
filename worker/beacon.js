@@ -31,10 +31,13 @@
 //      OPTIONAL, env-gated: setting FREE_TIER_DAILY = N restores a free tier of
 //      N calls / caller / UTC day on the same counter and the same key. Unset
 //      (the production default) means every call is a paid call.
-//   1d the invalid-payment bound, REJECTED_PAYMENTS_DAILY facilitator-REJECTED
-//      payments / caller / UTC day                                     [below]
+//   1d the invalid-payment bound, REJECTED_PAYMENTS_DAILY facilitator round
+//      trips that bought nothing / caller / UTC day                    [below]
 //      Same key as 1c, namespaced `reject:`, so a rejected payment costs a
 //      facilitator round trip that nothing else counts — until it does not.
+//      It counts a refusal the facilitator RETURNED, and a 429 throttling our
+//      key (which is still served free). Not a 5xx, not a timeout: those are
+//      our dependency's bad day, not the caller's.
 //   2  global fail-closed, 200,000 events / UTC day                    [below]
 //   3  the residual — priced, not bounded by mechanism; detective controls
 //      are the $25 billing alert plus the route-disable runbook in README.md
@@ -103,10 +106,25 @@ const PAID_DAILY = 5000;
 // facilitator round trip, and a rejected payment is answered 402 — which writes
 // no `events` row, so rung 2 does not see it, and claims nothing against
 // PAID_DAILY, which is deliberately claimed only AFTER a verify says yes. That
-// left the round trips themselves unbounded. This counts the refusals the
-// facilitator ITSELF returned: a client refused 50 times in one day is broken or
-// hostile, and the bound must never touch a legitimate buyer, whose payments
-// verify and are counted by nothing here.
+// left the round trips themselves unbounded. This counts the round trips the
+// facilitator ITSELF answered and we got nothing billable out of: a refusal it
+// returned, or (since 2026-09-19) a 429 throttling our key, where the call is
+// still SERVED free under availability-first. A client refused 50 times in one
+// day is broken or hostile, and a client still presenting payments after fifty
+// throttled serves is taking conversions for nothing.
+//
+// IT USED TO BE TRUE THAT THIS COULD NEVER TOUCH A LEGITIMATE BUYER. It is not
+// any more, and the change is worth stating rather than leaving as a comment
+// that has quietly gone false. A good buyer's payments verify, so nothing it
+// does can count against this bound — but a CDP throttle counts on its behalf.
+// Fifty throttled calls (all of them served free) and that buyer is refused
+// until midnight UTC, and the refusal OUTLIVES the throttle: the counter is per
+// UTC day, not per outage, so a throttle that clears at 09:00 still leaves the
+// caller locked out for the rest of the day. The trade is deliberate. The
+// alternative is an unbounded free tier keyed on somebody else's outage, and
+// fifty free conversions first is a gentler failure than that; a run of
+// `facilitator-http-429` rows in `settlements` is how an operator sees it
+// happening and fixes the key limits upstream.
 const REJECTED_PAYMENTS_DAILY = 50;
 
 /**
@@ -239,6 +257,21 @@ const SETTLE_TIMEOUT_MS = 20_000;
 // 404/405 (our URL), 429 (the facilitator throttling us), and every 5xx.
 // Those are still nobody's payment being refused, and stay availability-first.
 const FACILITATOR_CALLER_FAULT_STATUSES = new Set([400, 413, 422]);
+
+// THE ONE OUTAGE THAT IS STILL COUNTED, added 2026-09-19.
+//
+// A 429 from the facilitator is CDP throttling OUR key. Nobody's payment was
+// refused, so the availability-first serve stands and the caller is not told to
+// pay again — but the request DID consume a facilitator round trip, and while
+// we are throttled every further presented payment consumes another one and is
+// served free. Unbounded, that is a caller taking conversions for nothing for as
+// long as the throttle lasts, and none of the other bounds can see it: an
+// unverified serve claims PAID_DAILY, but at 5,000/day/IP that is not a bound on
+// this at all. So a 429 counts against REJECTED_PAYMENTS_DAILY, which turns
+// "free forever while throttled" into "free fifty times, then 429 until midnight
+// UTC". 5xx and timeouts stay uncounted: there the round trip bought nothing and
+// the fault is upstream in a way retrying may fix within the minute.
+const FACILITATOR_THROTTLED_STATUS = 429;
 
 // CDP bearer tokens are minted per call and live 120 s, matching @coinbase/cdp-sdk.
 const CDP_JWT_TTL_SECONDS = 120;
@@ -932,6 +965,16 @@ async function handleConvert(request, env, path, ctx) {
         // rather than turned away for our dependency's outage — and the
         // response says plainly that nothing was checked.
         outcome = { kind: 'unverified', presented, error: publicReason(verdict.unavailable) };
+        // …AND THE ROUND TRIP IS COUNTED WHEN THERE WAS ONE. Only a 429 carries
+        // `checked` on this branch (see FACILITATOR_THROTTLED_STATUS): the
+        // facilitator answered, so the call cost us a round trip and the serve
+        // was free. Counting it is what stops "CDP is throttling our key" from
+        // meaning "this caller converts for nothing until the throttle lifts" —
+        // past REJECTED_PAYMENTS_DAILY the same caller is answered 429 before
+        // the facilitator is asked again. A 5xx, a timeout and an unconfigured
+        // Worker are NOT counted: bounding a caller for our own bad day would be
+        // the same mistake in the other direction.
+        if (verdict.checked) await claimRejectedPaymentSafely(db, day, ipHash);
         await recordSettlementSafely(db, {
           now,
           tool: id,
@@ -1890,7 +1933,16 @@ function presentedPayment(request) {
  *   { verified: true, payload, payer }   isValid — serve, then settle
  *   { rejected: true, reason, message }  no — 402. `checked: true` when the
  *                                        facilitator is the one that said it
- *   { unavailable: '<reason>' }          we could not ask — serve, unverified
+ *   { unavailable: '<reason>' }          we could not ask — serve, unverified.
+ *                                        `checked: true` on a 429, the one
+ *                                        outage that still cost a round trip
+ *                                        the caller made us spend
+ *
+ * `checked` therefore means exactly one thing wherever it appears: A
+ * FACILITATOR ROUND TRIP HAPPENED AND CAME BACK. It is what
+ * REJECTED_PAYMENTS_DAILY counts, and it is deliberately a flag on the verdict
+ * rather than a match on the reason string — the facilitator owns that
+ * vocabulary and may add to it at any time.
  */
 async function verifyPayment(env, payment, requirements) {
   const decoded = payment?.decoded;
@@ -1940,7 +1992,25 @@ async function verifyPayment(env, payment, requirements) {
         payer,
       };
     }
-    return { unavailable: call.reason, payer };
+    // AN OUTAGE, SERVED — and counted when it is a 429. `checked` means "this
+    // cost a facilitator round trip", which a throttle did: CDP answered, it
+    // just answered "not you, not now". The serve stands because nobody's
+    // payment was refused, and the count stands because a caller that keeps
+    // presenting payments while we are throttled would otherwise take
+    // conversions free for as long as the throttle lasts. Every other status
+    // here — 401/403/404/405, 5xx, a timeout, a dead socket — stays uncounted:
+    // see FACILITATOR_THROTTLED_STATUS.
+    // `checked` is SPREAD IN rather than set to a boolean, so the property is
+    // absent on every verdict that did not earn it instead of present-and-false.
+    // Both readers test it for truthiness, so the two spellings behave the same
+    // today — this is about what the object claims: a verdict carrying
+    // `checked: false` reads as "we asked and it did not count", which is not
+    // what a timeout or a dead socket is.
+    return {
+      unavailable: call.reason,
+      payer,
+      ...(call.status === FACILITATOR_THROTTLED_STATUS ? { checked: true } : {}),
+    };
   }
 
   const data = call.data;
