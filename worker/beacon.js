@@ -413,12 +413,58 @@ function handleWellKnownVar(request, env, varName) {
   });
 }
 
+/**
+ * Is plain HTTP allowed on this deployment? Unset means no, which is the point.
+ *
+ * THE GATE IS A VAR AND NOT A HOSTNAME, and that is a measurement rather than a
+ * preference. `wrangler dev` rewrites BOTH the request URL and the `Host`
+ * header to the first matching route in `wrangler.toml`, so a request made to
+ * `http://127.0.0.1:8799/check` arrives inside the Worker as
+ * `http://toolshed.lemon-agent.dev/check`, `Host: toolshed.lemon-agent.dev`
+ * (measured 2026-09-19, wrangler 4.42.2). Local dev and a plain-HTTP
+ * production request are therefore BYTE-IDENTICAL to this code: neither
+ * "exempt loopback" nor "redirect only the production zone" can be written,
+ * because both sides of both tests see the same string. `cf-connecting-ip` is
+ * no help either — the suite sets it per virtual caller on purpose (README
+ * § cf-connecting-ip).
+ *
+ * So the exemption is explicit: the test harness and `npm run dev:worker` pass
+ * `ALLOW_PLAIN_HTTP`, and nothing else ever does. It is deliberately NOT in
+ * `wrangler.toml`, so it cannot reach production by being forgotten there — the
+ * default, and anything a deploy leaves out, is REDIRECT.
+ */
+const plainHttpAllowed = (env) => String(env?.ALLOW_PLAIN_HTTP ?? '').trim() !== '';
+
 export default {
   // `ctx` is threaded through for exactly one thing: ctx.waitUntil, which lets
   // /convert answer the caller and settle the payment afterwards. Nothing on
   // the /b path uses it.
   async fetch(request, env, ctx) {
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+
+    // NEVER A PAYMENT ENVELOPE OVER PLAIN HTTP, and this runs before anything
+    // is priced, before any D1 is read, before the method is even looked at.
+    //
+    // Cloudflare hands a Worker the scheme the visitor actually used, so until
+    // this existed `http://toolshed.lemon-agent.dev/convert/md-html` was
+    // answered 402 with the whole x402 envelope in the clear — confirmed
+    // 2026-09-18 by an outside agent and reproduced from the shell. That
+    // envelope carries the `payTo` a client is about to sign a USDC transfer
+    // authorization against, so anything on the path could rewrite it and be
+    // paid instead of us, and the buyer would have no way to know. There is
+    // nothing in such a request worth answering: the reply is 301 to the same
+    // URL over https, an empty body, and no `PAYMENT-REQUIRED` header.
+    //
+    // This is the Worker-side BELT. The suspenders are zone-level — Cloudflare
+    // → lemon-agent.dev → SSL/TLS → Edge Certificates → **Always Use HTTPS** —
+    // which also covers the paths this Worker is not routed for. See README
+    // § Deploy runbook; the two are deliberately independent.
+    if (url.protocol === 'http:' && !plainHttpAllowed(env)) {
+      url.protocol = 'https:';
+      return Response.redirect(url.toString(), 301);
+    }
+
+    const path = url.pathname;
     const surface = SURFACES[path];
     if (surface) return handleSurface(request, surface, env, path);
     if (path === '/check') return handleCheck(request, env);

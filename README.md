@@ -195,6 +195,14 @@ npm run dev:worker &             # the Worker on :8787 (miniflare, local D1)
 npx serve dist -l 4173           # the page on :4173
 ```
 
+**`npm run dev:worker` passes `--var ALLOW_PLAIN_HTTP:1`, and it has to.** The
+Worker answers every plain-HTTP request with a 301 to https before anything else
+happens (see [HTTPS only](#https-only)), and a local dev server is plain HTTP
+with no TLS to redirect to. The var is the exemption; it is never set in
+`wrangler.toml` and never in production. A `wrangler dev` invocation of your own
+needs it too, or the demo will bounce you at the first request — and, depending
+on how wrangler resolves the zone routes, bounce you at **production**.
+
 Three build constants are env-overridable: `BEACON_URL` (what the inline beacon
 posts to), `SITE_HOST` (the hostname printed in the page's file `curl` lines,
 and the `resource` the Worker names in its x402 envelope) and `API_HOST` (the
@@ -296,6 +304,21 @@ work, so it stays cheap and open.
 ```text
 (http.host eq "toolshed.lemon-agent.dev" and
  (http.request.uri.path eq "/b" or starts_with(http.request.uri.path, "/convert/")))
+```
+
+**Step 3a, the zone's HTTPS toggle — OWNER DASHBOARD ACTION, added
+2026-09-19.** Cloudflare → `lemon-agent.dev` → **SSL/TLS** → **Edge
+Certificates** → **Always Use HTTPS: on**. It is the suspenders to the
+Worker's own belt: the Worker 301s plain HTTP on the paths it is routed for, and
+this catches everything else on the zone, the Pages-served page included. Do
+both — a 402 envelope carries the `payTo` a buyer is about to sign against, and
+one served in the clear is one anything on the path can rewrite. See
+[HTTPS only](#https-only) for the measurement and what it cost.
+
+Check it from outside afterwards; the answer must be a redirect, never a 402:
+
+```bash
+curl -sI -X POST http://toolshed.lemon-agent.dev/convert/md-html | head -3
 ```
 
 Commands for steps 4–5, once the owner has picked the hostname:
@@ -670,6 +693,7 @@ reached.
 | `PAYTO` | yes | the receiving address (USDC on Base) named in the 402 envelope. **Unset = there is nowhere to pay**, so unpaid calls answer 429 instead of 402. |
 | `PAYTO_SOLANA` | yes | the base58 receiving address for USDC on Solana. **Unset = the Solana rail is off** and every envelope is Base-only, byte for byte as before. Set, and each envelope carries a second `accepts` entry at the same price. Needs the CDP credentials too — without them the fee-payer read fails and the rail stays off silently. Non-secret: it is a public receive address, and it lives in `wrangler.toml`. See [The Solana rail](#the-solana-rail). |
 | `FREE_TIER_DAILY` | yes | free conversions per caller per UTC day. **Unset = 0 = off**, which is the production default. This var is the **only runtime authority** — the Worker does not read the compiled constant — so setting it takes effect on the next request and `GET /check` reports it immediately, with no rebuild. Anything unparseable, negative or below 1 reads as 0: a misconfigured var must fail towards charging, never towards giving the service away. |
+| `ALLOW_PLAIN_HTTP` | yes | **local development only.** Unset — the production default — means every request whose scheme is `http:` is answered **301** to the same URL over https, before anything is priced and before any D1 is read; see [HTTPS only](#https-only). Set to anything non-empty and plain HTTP is served normally, which is what `npm run dev:worker` and the test harness need. Deliberately **not** in `wrangler.toml`, so it cannot reach production by being forgotten there. |
 | `FACILITATOR_URL` | yes | the x402 facilitator base URL. Defaults to `https://api.cdp.coinbase.com/platform/v2/x402`; overridden only by the test suite, which points it at a local mock. |
 | `CDP_API_KEY_ID` | yes | CDP API key id. A **Worker secret**, not a var. |
 | `CDP_API_KEY_SECRET` | yes | CDP API key secret (base64 Ed25519). A **Worker secret**. Without both keys nothing can be verified, and paid calls are served with `x-payment-error: facilitator-unconfigured`. |
@@ -707,6 +731,56 @@ Set the two secrets with `wrangler secret put`, never in `wrangler.toml`:
 npx wrangler secret put CDP_API_KEY_ID
 npx wrangler secret put CDP_API_KEY_SECRET
 ```
+
+### HTTPS only
+
+**A 402 envelope must never go out in the clear, and since 2026-09-19 it
+cannot.** Any request this Worker receives whose scheme is `http:` is answered
+**301** to the same URL over `https:` — empty body, no `PAYMENT-REQUIRED`
+header, no envelope — *before* anything is priced, before any D1 is read and
+before the method is even checked.
+
+**Why it matters more here than on an ordinary site.** The envelope carries
+`payTo`: the address a client is about to sign an EIP-3009 USDC transfer
+authorization against. Served over plain HTTP, anything on the path can rewrite
+it and be paid instead of us, and the buyer has no way to tell — they would sign
+a perfectly valid payment to someone else's wallet. Confirmed on **2026-09-18**
+by an outside agent and reproduced from the shell:
+`http://toolshed.lemon-agent.dev/convert/md-html` answered 402 with the whole
+envelope and no redirect.
+
+**Two independent controls, and neither is the other's fallback.**
+
+| | |
+| --- | --- |
+| **the belt** | the Worker's own redirect, above. Covers every path this Worker is routed for, and travels with the code, so a zone rebuild cannot lose it |
+| **the suspenders** | Cloudflare → `lemon-agent.dev` → **SSL/TLS** → **Edge Certificates** → **Always Use HTTPS**. A dashboard toggle, so it also covers the paths this Worker is *not* routed for — the Pages-served page included |
+
+**The exemption is a var, not a hostname, and that is a measurement.** The
+obvious gate — exempt loopback, redirect everything else — cannot be written,
+because what `wrangler dev` shows the Worker depends on how it was started.
+Measured 2026-09-19, wrangler 4.42.2, same repo and same `wrangler.toml`:
+
+| invocation | what the Worker sees |
+| --- | --- |
+| `npx wrangler dev --local --port 8799` (what § Local demo runs) | `http://toolshed.lemon-agent.dev/check`, `Host: toolshed.lemon-agent.dev` — the URL *and* the Host header rewritten to the `wrangler.toml` route |
+| the test harness's boot, with `--env-file` and `--persist-to` | `http://127.0.0.1:<port>/check` |
+
+So on a developer's machine the local dev server can be **byte-identical** to a
+plain-HTTP production request inside this code, and a hostname gate would
+redirect the documented local demo — to production, over a scheme it cannot
+serve. The gate is therefore the explicit `ALLOW_PLAIN_HTTP` var: set by the
+test harness and by `npm run dev:worker`, absent everywhere else, and absent is
+**redirect**. Four assertions in `test/surfaces.test.mjs` boot one worker with
+it cleared and one with it set: the paid route 301s with no envelope in body or
+header, a machine surface 301s too, the query string survives, five plain-HTTP
+POSTs write **zero** rows to `events` / `convert_quota` / `settlements`, and the
+exempt worker still answers the 402 with its `payTo`.
+
+`scripts/test-live.mjs` re-checks the deployed origin, because a scheme is the
+one thing the local suite cannot see: `wrangler dev` serves plain HTTP and
+nothing else, so "what a stranger gets when they type `http://`" only exists
+against production. That row costs nothing — a redirect serves no conversion.
 
 ### Behaviour, exactly as implemented
 
@@ -836,7 +910,7 @@ Set it for a local test without editing the file. Nothing has to be spent first
 — the very first call answers the envelope:
 
 ```bash
-npx wrangler dev --local --port 8787 --var PAYTO:0xTEST
+npx wrangler dev --local --port 8787 --var ALLOW_PLAIN_HTTP:1 --var PAYTO:0xTEST
 curl -isX POST http://localhost:8787/convert/md-html --data-binary '# hi'
 ```
 
@@ -844,7 +918,7 @@ To exercise the *other* configuration locally, add the tier var — and clear th
 counter between runs, because it is per caller per UTC day:
 
 ```bash
-npx wrangler dev --local --port 8787 --var PAYTO:0xTEST --var FREE_TIER_DAILY:3
+npx wrangler dev --local --port 8787 --var ALLOW_PLAIN_HTTP:1 --var PAYTO:0xTEST --var FREE_TIER_DAILY:3
 npx wrangler d1 execute DB --local --command "DELETE FROM convert_quota;"
 ```
 

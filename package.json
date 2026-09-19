@@ -11,7 +11,7 @@
     "build": "node build.mjs",
     "build:demo": "BEACON_URL=${BEACON_URL:-http://localhost:8787/b} SITE_HOST=${SITE_HOST:-localhost:4173} API_HOST=${API_HOST:-localhost:8787} node build.mjs",
     "db:local": "wrangler d1 execute DB --local --file worker/schema.sql -y",
-    "dev:worker": "wrangler dev --local --port 8787",
+    "dev:worker": "wrangler dev --local --port 8787 --var ALLOW_PLAIN_HTTP:1",
     "mcp": "node mcp/server.mjs",
     "serve": "serve dist -l 4173",
     "test": "node test/run.mjs",
