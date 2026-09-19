@@ -366,10 +366,13 @@ export async function bootWorker({ vars = {} } = {}) {
 
   // Readiness: /check is the cheapest route in the Worker — no D1, no rungs.
   //
-  // A 301 counts as ready too, and only one configuration produces one: a
-  // worker booted with ALLOW_PLAIN_HTTP cleared, which 301s every plain-HTTP
-  // request including this probe. Waiting for a 200 there would time out after
-  // two minutes on a worker that is answering perfectly.
+  // A REDIRECT COUNTS AS READY TOO, and only one configuration produces one: a
+  // worker booted without ALLOW_PLAIN_HTTP, which redirects every plain-HTTP
+  // request to https including this probe. Waiting for a 200 there times out
+  // after two minutes against a worker that is answering perfectly — measured,
+  // by changing the redirect from 301 to 308 and forgetting this line. The
+  // whole 3xx range is accepted rather than one status, so the next change to
+  // the redirect's code does not silently cost two minutes a boot.
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
   for (;;) {
     if (exitedWith) {
@@ -378,7 +381,7 @@ export async function bootWorker({ vars = {} } = {}) {
     }
     try {
       const res = await fetch(`${baseUrl}/check`, { redirect: 'manual' });
-      if (res.status === 200 || res.status === 301) {
+      if (res.status === 200 || (res.status >= 300 && res.status < 400)) {
         await res.arrayBuffer();
         return worker;
       }

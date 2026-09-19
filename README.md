@@ -196,7 +196,7 @@ npx serve dist -l 4173           # the page on :4173
 ```
 
 **`npm run dev:worker` passes `--var ALLOW_PLAIN_HTTP:1`, and it has to.** The
-Worker answers every plain-HTTP request with a 301 to https before anything else
+Worker answers every plain-HTTP request with a 308 to https before anything else
 happens (see [HTTPS only](#https-only)), and a local dev server is plain HTTP
 with no TLS to redirect to. The var is the exemption; it is never set in
 `wrangler.toml` and never in production. A `wrangler dev` invocation of your own
@@ -309,7 +309,7 @@ work, so it stays cheap and open.
 **Step 3a, the zone's HTTPS toggle — OWNER DASHBOARD ACTION, added
 2026-09-19.** Cloudflare → `lemon-agent.dev` → **SSL/TLS** → **Edge
 Certificates** → **Always Use HTTPS: on**. It is the suspenders to the
-Worker's own belt: the Worker 301s plain HTTP on the paths it is routed for, and
+Worker's own belt: the Worker 308s plain HTTP on the paths it is routed for, and
 this catches everything else on the zone, the Pages-served page included. Do
 both — a 402 envelope carries the `payTo` a buyer is about to sign against, and
 one served in the clear is one anything on the path can rewrite. See
@@ -320,6 +320,27 @@ Check it from outside afterwards; the answer must be a redirect, never a 402:
 ```bash
 curl -sI -X POST http://toolshed.lemon-agent.dev/convert/md-html | head -3
 ```
+
+A **308** means the Worker answered; a **301** means the zone toggle got there
+first. Both are passes for this check, and they are not interchangeable
+evidence — see the `plain_http` field under [HTTPS only](#https-only) for how to
+tell whether the Worker-side belt is still on underneath the toggle.
+
+**Step 3b, HSTS — OWNER DASHBOARD ACTION, zone level.** Cloudflare →
+`lemon-agent.dev` → **SSL/TLS** → **Edge Certificates** → **HTTP Strict
+Transport Security (HSTS)**. Always Use HTTPS fixes the request that already
+went out in the clear; HSTS stops the next one being made at all, which is the
+half a redirect cannot do — the first plain-HTTP request still leaves the
+client before anything can answer it.
+
+**It is set on the zone and NOT as a header in this Worker**, deliberately.
+`includeSubDomains` is a decision for every host on `lemon-agent.dev`, not for
+the one route family this Worker happens to own, and a Worker that stamped the
+header would be making that call for surfaces it does not serve — with a
+`max-age` that browsers then honour for months and no way to reach the ones that
+already cached it. Turn it on where it is actually scoped, and mind the usual
+HSTS caveat: the policy is sticky by design, so raise `max-age` in steps and be
+sure every subdomain can serve https before ticking `includeSubDomains`.
 
 Commands for steps 4–5, once the owner has picked the hostname:
 
@@ -693,7 +714,7 @@ reached.
 | `PAYTO` | yes | the receiving address (USDC on Base) named in the 402 envelope. **Unset = there is nowhere to pay**, so unpaid calls answer 429 instead of 402. |
 | `PAYTO_SOLANA` | yes | the base58 receiving address for USDC on Solana. **Unset = the Solana rail is off** and every envelope is Base-only, byte for byte as before. Set, and each envelope carries a second `accepts` entry at the same price. Needs the CDP credentials too — without them the fee-payer read fails and the rail stays off silently. Non-secret: it is a public receive address, and it lives in `wrangler.toml`. See [The Solana rail](#the-solana-rail). |
 | `FREE_TIER_DAILY` | yes | free conversions per caller per UTC day. **Unset = 0 = off**, which is the production default. This var is the **only runtime authority** — the Worker does not read the compiled constant — so setting it takes effect on the next request and `GET /check` reports it immediately, with no rebuild. Anything unparseable, negative or below 1 reads as 0: a misconfigured var must fail towards charging, never towards giving the service away. |
-| `ALLOW_PLAIN_HTTP` | yes | **local development only.** Unset — the production default — means every request whose scheme is `http:` is answered **301** to the same URL over https, before anything is priced and before any D1 is read; see [HTTPS only](#https-only). Set to anything that is not `0`, `false`, `no` or `off` and plain HTTP is served normally, which is what `npm run dev:worker` and the test harness need — those four read as **off**, so `ALLOW_PLAIN_HTTP = "false"` in a dashboard cannot accidentally mean "allowed". Deliberately **not** in `wrangler.toml`, so it cannot reach production by being forgotten there. |
+| `ALLOW_PLAIN_HTTP` | yes | **local development only.** Unset — the production default — means every request whose scheme is `http:` is answered **308** to the same URL over https, before anything is priced and before any D1 is read; see [HTTPS only](#https-only). **Only `1`, `true` and `yes` turn it on**, trimmed and compared lowercased — an allow-list, so anything else, including `0`, `false`, `' '` and a misspelling, reads as **off** and redirects. A deny-list would have made `ALLOW_PLAIN_HTTP = "false"` in a dashboard mean *allowed*, which is the footgun pointing at the vulnerability this closes. `npm run dev:worker` and the test harness set it to `1`. Deliberately **not** in `wrangler.toml`, so it cannot reach production by being forgotten there. |
 | `FACILITATOR_URL` | yes | the x402 facilitator base URL. Defaults to `https://api.cdp.coinbase.com/platform/v2/x402`; overridden only by the test suite, which points it at a local mock. |
 | `CDP_API_KEY_ID` | yes | CDP API key id. A **Worker secret**, not a var. |
 | `CDP_API_KEY_SECRET` | yes | CDP API key secret (base64 Ed25519). A **Worker secret**. Without both keys nothing can be verified, and paid calls are served with `x-payment-error: facilitator-unconfigured`. |
@@ -736,7 +757,7 @@ npx wrangler secret put CDP_API_KEY_SECRET
 
 **A 402 envelope must never go out in the clear, and since 2026-09-19 it
 cannot.** Any request this Worker receives whose scheme is `http:` is answered
-**301** to the same URL over `https:` — empty body, no `PAYMENT-REQUIRED`
+**308** to the same URL over `https:` — empty body, no `PAYMENT-REQUIRED`
 header, no envelope — *before* anything is priced, before any D1 is read and
 before the method is even checked.
 
@@ -754,7 +775,36 @@ envelope and no redirect.
 | | |
 | --- | --- |
 | **the belt** | the Worker's own redirect, above. Covers every path this Worker is routed for, and travels with the code, so a zone rebuild cannot lose it |
-| **the suspenders** | Cloudflare → `lemon-agent.dev` → **SSL/TLS** → **Edge Certificates** → **Always Use HTTPS**. A dashboard toggle, so it also covers the paths this Worker is *not* routed for — the Pages-served page included |
+| **the suspenders** | Cloudflare → `lemon-agent.dev` → **SSL/TLS** → **Edge Certificates** → **Always Use HTTPS**, with **HSTS** beside it. Dashboard toggles, so they also cover the paths this Worker is *not* routed for — the Pages-served page included. HSTS is the only one of the three that stops the plain-HTTP request being *made*; the other two can only answer it once it has already left. See [Deploy runbook](#deploy-runbook) steps 3a and 3b |
+
+**Why 308 and not 301.** penny402 shipped the same fix on 2026-09-15 with a
+301, which is right for its case — dropping `www.` on a GET. Every paid route
+here is **POST-only**, and 301 and 302 both permit a client to re-issue the
+request as a GET *without its body*, which turns "retry over https" into a 405
+with the buyer's file gone. 308 is the redirect that requires the method and
+body be preserved.
+
+**No HSTS header is set by this Worker**, on purpose: `includeSubDomains` is a
+decision for every host on the zone rather than for the one route family this
+Worker owns, and a `max-age` a browser honours for months is not something to
+stamp on from a route handler. It belongs on the zone — runbook step 3b.
+
+**Telling the belt from the suspenders.** Once Always Use HTTPS is on, an
+`http://` probe is answered by the zone before it reaches this Worker, so a
+passing `curl` proves the toggle is on and says **nothing** about whether the
+code would also have redirected — and if the toggle were ever turned off, that
+probe would keep passing right up until it silently did not. `GET /check`
+therefore publishes `plain_http`, which is the Worker answering for itself:
+
+```bash
+curl -s https://toolshed.lemon-agent.dev/check | jq -r .plain_http
+# redirect   <- the belt is on: this Worker would 308 a plain-HTTP request
+# allowed    <- ALLOW_PLAIN_HTTP is set on this deployment; only the zone is holding the line
+```
+
+`scripts/test-live.mjs` asserts both: that the `http://` twin redirects and
+carries no envelope (reporting *which* of the two answered, by status), and
+separately that `plain_http` reads `redirect`.
 
 **The exemption is a var, not a hostname, and that is a measurement.** The
 obvious gate — exempt loopback, redirect everything else — cannot be written,
@@ -771,11 +821,29 @@ plain-HTTP production request inside this code, and a hostname gate would
 redirect the documented local demo — to production, over a scheme it cannot
 serve. The gate is therefore the explicit `ALLOW_PLAIN_HTTP` var: set by the
 test harness and by `npm run dev:worker`, absent everywhere else, and absent is
-**redirect**. Four assertions in `test/surfaces.test.mjs` boot one worker with
-it cleared and one with it set: the paid route 301s with no envelope in body or
-header, a machine surface 301s too, the query string survives, five plain-HTTP
-POSTs write **zero** rows to `events` / `convert_quota` / `settlements`, and the
-exempt worker still answers the 402 with its `payTo`.
+**redirect**. Ten assertions in `test/surfaces.test.mjs` cover it, across a
+worker with the var cleared and one with it set: the paid route 308s with no
+envelope in body or header, a machine surface 308s too, the query string
+survives, `false` / `0` / `' '` are each rejected as permission, the var is
+absent from `wrangler.toml`, `/check` publishes the policy, and the exempt
+worker still answers the 402 with its `payTo`.
+
+The store assertion is **differential**, because "nothing was written" passes
+just as happily when the counting is broken: the same five-request loop runs
+against both workers on `POST /b`, a route that provably writes one `events`
+row per accepted beacon. The exempt worker's counts must move; the strict
+worker's must not, and neither must the paid route's.
+
+**The redirect's authority cannot be asserted locally.** `wrangler dev` rewrites
+the `Location` header's host and port to its own before a client sees it
+(measured 2026-09-19: the Worker emitted
+`https://toolshed.lemon-agent.dev/llms.txt?x=1`, curl received
+`https://127.0.0.1:8796/llms.txt?x=1`). So the suite asserts the parts that
+survive that proxy — the scheme, the path and the query — and
+`scripts/test-live.mjs` checks the authority against the real origin. The Worker
+builds the target by stripping a trailing `:<port>` off the host rather than
+mutating `url.port`, so the result does not depend on one URL implementation's
+setter semantics.
 
 `scripts/test-live.mjs` re-checks the deployed origin, because a scheme is the
 one thing the local suite cannot see: `wrangler dev` serves plain HTTP and
