@@ -970,8 +970,14 @@ async function handleConvert(request, env, path, ctx) {
         try {
           claimed = await claimPaymentOnce(db, paymentHash, now, id);
         } catch (err) {
-          // Nothing was written, so there is nothing to hand back on a later
-          // exit: `abandon` must not try to delete a row that never existed.
+          // The claim is DROPPED rather than held, so `abandon` does not try to
+          // release a row this request has no reason to believe it owns. Almost
+          // always nothing was written. The one case that leaves litter is a
+          // write that COMMITTED and then failed on the way back — that row is
+          // then unreleasable and its authorization is spent, which is the rarer
+          // half of a store already misbehaving. Releasing regardless would be
+          // worse: on a racing replay it would hand a live payment to whoever
+          // else was holding it.
           paymentHash = null;
           claimed = null; // neither owned nor replayed — degraded
           claimFailure = `claim-failed:${oneLineMessage(err).slice(0, 80)}`;

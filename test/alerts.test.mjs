@@ -457,6 +457,11 @@ describe('a call served without verification is its own alarm', () => {
     facilitator.reset();
     telegram.reset();
     facilitator.verifiedAs(THIRD_PARTY_PAYER);
+    // The restore is read back out of sqlite_master rather than retyped, so a
+    // column added to payment_seen in worker/schema.sql cannot leave this suite
+    // putting back a table shaped differently from the one it dropped — which
+    // would surface as a confusing failure in whichever test ran next.
+    const [ddl] = await worker.d1("SELECT sql FROM sqlite_master WHERE name = 'payment_seen';");
     await worker.d1('DROP TABLE payment_seen;');
 
     try {
@@ -482,9 +487,7 @@ describe('a call served without verification is its own alarm', () => {
         'a verified payment was announced as never having been checked'
       );
     } finally {
-      await worker.d1(
-        'CREATE TABLE IF NOT EXISTS payment_seen (hash TEXT PRIMARY KEY, created_at INTEGER, route TEXT);'
-      );
+      await worker.d1(`${ddl.sql};`);
     }
   });
 });

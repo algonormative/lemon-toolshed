@@ -340,6 +340,14 @@ broken. A deployment with no D1 binding, or one whose D1 cannot be read,
 answers `{"missing": null, "error": "…"}` rather than throwing — a self-check
 that took the endpoint down would be worse than the outage it reports.
 
+**It answers "present", not "correctly shaped".** The check is one
+`sqlite_master` lookup by name, so a table that exists but was created by hand
+without its primary key or a column reads as healthy here while the Worker
+degrades on every call. Apply `worker/schema.sql` rather than typing a
+`CREATE TABLE` from memory, and if `/check` says `{"missing":[]}` while
+`settlements` is filling with `claim-failed:` rows, the shape is what to go and
+look at.
+
 ### Migration — the conversion-quota table (existing databases)
 
 `worker/schema.sql` is all `CREATE TABLE IF NOT EXISTS`, so re-running the whole
@@ -1370,6 +1378,15 @@ reason (the facilitator recovered no payer), so the `settlements` rows with
 `error = 'facilitator-http-400'` and a named `payer` are what tell you.
 
 ### Reading the ledger
+
+**`verify_ok = 1, settle_ok = 0` now covers two stories**, and the `error`
+column is what tells them apart: a settlement that failed after a served
+conversion (the accepted exposure, `error` is the facilitator's `errorReason`),
+and a verified payment whose single-use claim could not be written (`error`
+starts `claim-failed:` — see [Migration — the payment_seen
+table](#migration--the-payment_seen-table-existing-databases)). A "revenue that
+did not arrive" sum wants both; a "settlement is broken" investigation wants
+only the first. Filter on the prefix.
 
 ```bash
 # the last few payment attempts

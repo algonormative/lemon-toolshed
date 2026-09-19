@@ -193,8 +193,24 @@ async function paymentHeaderV2(apiClient, tool, { ip, from = CLAIMED_PAYER, nonc
   ).toString('base64');
 }
 
-const settlements = () =>
-  worker.d1('SELECT ts, tool, payer, amount, verify_ok, settle_ok, tx_hash, error FROM settlements ORDER BY ts, rowid;');
+const LEDGER_SQL =
+  'SELECT ts, tool, payer, amount, verify_ok, settle_ok, tx_hash, error FROM settlements ORDER BY ts, rowid;';
+
+const settlements = () => worker.d1(LEDGER_SQL);
+
+/** awaitSettlement, against a worker this file booted for one test. */
+async function awaitOn(handle, predicate, what, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = await handle.d1(LEDGER_SQL);
+    const hit = rows.find(predicate);
+    if (hit) return hit;
+    if (Date.now() > deadline) {
+      throw new Error(`no settlements row matching ${what} within ${timeoutMs} ms; saw ${JSON.stringify(rows)}`);
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
 
 /** Settlement runs in ctx.waitUntil, so the ledger is polled rather than read. */
 async function awaitSettlement(predicate, what, timeoutMs = 15_000) {
@@ -1513,7 +1529,11 @@ describe('the single-use claim cannot fail closed', () => {
     });
     try {
       const scratchApi = client(scratch);
-      // The migration that was never run, reproduced exactly.
+      // The migration that was never run, reproduced exactly. The DDL is read
+      // back out of sqlite_master rather than retyped, so a column added to
+      // payment_seen in worker/schema.sql cannot leave the restore below
+      // putting back a differently shaped table.
+      const [ddl] = await scratch.d1("SELECT sql FROM sqlite_master WHERE name = 'payment_seen';");
       await scratch.d1('DROP TABLE payment_seen;');
 
       const res = await scratchApi.convert('md-html', '# hi\n', {
@@ -1557,7 +1577,7 @@ describe('the single-use claim cannot fail closed', () => {
       // AND THE GUARD COMES BACK WHEN THE TABLE DOES. The degrade is for the
       // broken deployment only — a replay must still be refused the moment the
       // migration lands.
-      await scratch.d1('CREATE TABLE IF NOT EXISTS payment_seen (hash TEXT PRIMARY KEY, created_at INTEGER, route TEXT);');
+      await scratch.d1(`${ddl.sql};`);
       const header = paymentHeader();
       const replayIp = ips.pinned(41);
       const call = () =>
@@ -1566,6 +1586,16 @@ describe('the single-use claim cannot fail closed', () => {
       const replay = await call();
       assert.equal(replay.status, 402, `a replay answered ${replay.status}: ${replay.text}`);
       assert.equal(replay.json().invalidReason, 'payment_already_used');
+
+      // THE POSITIVE CONTROL FOR THE NEGATIVE ABOVE. "nothing settled" would
+      // also pass against a broken settle path or a mistyped mock key, so the
+      // same counter has to move once the claim works again.
+      await awaitOn(
+        scratch,
+        (r) => r.settle_ok === 1,
+        'a settlement after the table came back'
+      );
+      assert.ok(scratchMock.hitsOn('settle').length > 0, 'settle never fired even with the table back');
     } finally {
       await scratch.stop();
       await scratchMock.stop();

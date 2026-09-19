@@ -110,7 +110,10 @@ describe('a database missing a table names it', () => {
  */
 async function ddlFor(table) {
   const rows = await worker.d1(
-    `SELECT sql FROM sqlite_master WHERE tbl_name = '${table}' AND sql IS NOT NULL;`
+    // The table before its indexes: an index cannot be created on a table that
+    // is not back yet, and sqlite_master's natural order is not a contract.
+    `SELECT sql FROM sqlite_master WHERE tbl_name = '${table}' AND sql IS NOT NULL ` +
+      `ORDER BY (type = 'table') DESC;`
   );
   assert.ok(rows.length >= 1, `no CREATE statement for ${table} — is it in worker/schema.sql?`);
   return rows.map((row) => `${row.sql};`);
