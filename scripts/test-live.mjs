@@ -718,6 +718,81 @@ await test(`POST /convert/md-html rejects ${BIG_INPUT_BYTES / 1024} KB with 413`
   return body.error.slice(0, 60);
 });
 
+await test('the http:// twin of a paid route redirects to https with no envelope', async () => {
+  // THE PAYTO MUST NEVER GO OUT IN THE CLEAR. An x402 402 served over plain HTTP
+  // carries the address a client is about to sign a USDC transfer authorization
+  // against, so anything on the path can rewrite it and be paid instead. Found
+  // against production on 2026-09-18 by an outside agent and reproduced from the
+  // shell. Two independent things should now prevent it — the Worker's own
+  // redirect, and the zone's Always Use HTTPS setting — and this row does not
+  // care which one answered: it fails if the envelope comes back at all.
+  //
+  // It is checked HERE rather than in `npm test` because the local suite cannot
+  // see a scheme. `wrangler dev` serves plain HTTP and nothing else, so what is
+  // being asserted — what a stranger gets when they type http:// — only exists
+  // against the deployed origin. Still free: a redirect serves no conversion.
+  if (!BASE.startsWith('https://')) return 'skipped — this run is not against an https origin';
+
+  const url = `${BASE.replace(/^https:/, 'http:')}/convert/md-html`;
+  // Paced like every other request — this one cannot go through `paced()`
+  // because that helper always prefixes BASE, and the whole point here is the
+  // other scheme.
+  //
+  // It counts as a REQUEST but NOT as a conversion request: the cost estimate
+  // below prices convert calls as work the Worker did, and a redirect issued
+  // before the route is even resolved does none. Counting it there would
+  // inflate the per-conversion figures with a call that never reached a
+  // converter.
+  const wait = PACE_MS - (Date.now() - lastRequestAt);
+  if (wait > 0) await sleep(wait);
+  requestCount += 1;
+  const res = await fetch(url, { method: 'POST', body: '# hi\n', redirect: 'manual' });
+  lastRequestAt = Date.now();
+
+  // Any redirect passes, because two different things can answer first and
+  // they do not agree on the code: the Worker sends 308 (method-preserving,
+  // which matters because this is a POST), and the zone's Always Use HTTPS
+  // sends 301. Which one answered is reported rather than asserted — the claim
+  // here is only that the envelope did not come back.
+  assert(
+    res.status >= 300 && res.status < 400,
+    `http:// answered ${res.status} instead of a redirect — THE ENVELOPE MAY BE GOING OUT IN THE CLEAR`
+  );
+  const location = res.headers.get('location') || '';
+  assert(location.startsWith('https://'), `the redirect points at ${location || '(nothing)'}, not https`);
+  assert(
+    res.headers.get('payment-required') === null,
+    'the plain-HTTP answer carried the v2 PAYMENT-REQUIRED envelope'
+  );
+  const body = await res.text();
+  assert(!body.includes('payTo'), 'the plain-HTTP answer carried the v1 envelope in its body');
+  const who = res.status === 308 ? 'the Worker' : 'the zone (or a proxy)';
+  return `${res.status} -> ${location} (${who})`;
+});
+
+await test("GET /check reports the Worker's own plain-HTTP policy", async () => {
+  // THE BELT, CHECKED WITHOUT THE SUSPENDERS. The row above cannot tell them
+  // apart on its own: with Always Use HTTPS on, the zone redirects an http://
+  // probe before it ever reaches this Worker, so a passing redirect proves the
+  // toggle is on and says nothing about whether the code would also have
+  // redirected. If the toggle were later turned off, that row would keep
+  // passing right up until it silently did not. This field is the Worker
+  // answering for itself, read over https where it is reachable.
+  const res = await get('/check');
+  assert(res.status === 200, `expected 200, got ${res.status}`);
+  const body = await res.json();
+  assert(
+    body.plain_http === 'redirect' || body.plain_http === 'allowed',
+    `/check published plain_http ${JSON.stringify(body.plain_http)} — expected 'redirect' or 'allowed'`
+  );
+  assert(
+    body.plain_http === 'redirect',
+    'THE WORKER WOULD SERVE PLAIN HTTP: ALLOW_PLAIN_HTTP is set on this deployment, so the ' +
+      'Worker-side belt is off and only the zone toggle is keeping the envelope off port 80'
+  );
+  return "plain_http: 'redirect'";
+});
+
 await test('POST /b accepts a visit beacon with 204', async () => {
   const res = await post('/b', JSON.stringify({ t: 'visit' }), { 'content-type': 'text/plain' });
   assert(res.status === 204, `expected 204, got ${res.status}`);

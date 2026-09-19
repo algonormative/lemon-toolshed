@@ -413,12 +413,96 @@ function handleWellKnownVar(request, env, varName) {
   });
 }
 
+/**
+ * Is plain HTTP allowed on this deployment? Unset means no, which is the point.
+ *
+ * THE GATE IS A VAR AND NOT A HOSTNAME, and that is a measurement rather than a
+ * preference. `wrangler dev` rewrites BOTH the request URL and the `Host`
+ * header to the first matching route in `wrangler.toml`, so a request made to
+ * `http://127.0.0.1:8799/check` arrives inside the Worker as
+ * `http://toolshed.lemon-agent.dev/check`, `Host: toolshed.lemon-agent.dev`
+ * (measured 2026-09-19, wrangler 4.42.2). Local dev and a plain-HTTP
+ * production request are therefore BYTE-IDENTICAL to this code: neither
+ * "exempt loopback" nor "redirect only the production zone" can be written,
+ * because both sides of both tests see the same string. `cf-connecting-ip` is
+ * no help either — the suite sets it per virtual caller on purpose (README
+ * § cf-connecting-ip).
+ *
+ * So the exemption is explicit: the test harness and `npm run dev:worker` pass
+ * `ALLOW_PLAIN_HTTP`, and nothing else ever does. It is deliberately NOT in
+ * `wrangler.toml`, so it cannot reach production by being forgotten there — the
+ * default, and anything a deploy leaves out, is REDIRECT.
+ *
+ * ONLY `1`, `true` and `yes` TURN IT ON — an allow-list, trimmed and compared
+ * lowercased, and everything else including unset, `''`, `' '`, `0` and `false`
+ * is OFF. A deny-list ("non-empty means on") would make
+ * `ALLOW_PLAIN_HTTP = "false"` in a dashboard mean ON, so the person turning the
+ * exemption off would hand the envelope back to plain HTTP — precisely the
+ * vulnerability this function exists to close. An allow-list cannot fail that
+ * way: anything unrecognised, misspelled or half-typed lands on REDIRECT. Same
+ * rule `freeTierDaily()` follows, which is that a misconfigured var fails
+ * towards the safe answer rather than the convenient one.
+ */
+const PLAIN_HTTP_ON = new Set(['1', 'true', 'yes']);
+const plainHttpAllowed = (env) => PLAIN_HTTP_ON.has(String(env?.ALLOW_PLAIN_HTTP ?? '').trim().toLowerCase());
+
 export default {
   // `ctx` is threaded through for exactly one thing: ctx.waitUntil, which lets
   // /convert answer the caller and settle the payment afterwards. Nothing on
   // the /b path uses it.
   async fetch(request, env, ctx) {
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+
+    // NEVER A PAYMENT ENVELOPE OVER PLAIN HTTP, and this runs before anything
+    // is priced, before any D1 is read, before the method is even looked at.
+    //
+    // Cloudflare hands a Worker the scheme the visitor actually used, so until
+    // this existed `http://toolshed.lemon-agent.dev/convert/md-html` was
+    // answered 402 with the whole x402 envelope in the clear — confirmed
+    // 2026-09-18 by an outside agent and reproduced from the shell. That
+    // envelope carries the `payTo` a client is about to sign a USDC transfer
+    // authorization against, so anything on the path could rewrite it and be
+    // paid instead of us, and the buyer would have no way to know. There is
+    // nothing in such a request worth answering: the reply is a redirect to the
+    // same URL over https, an empty body, and no `PAYMENT-REQUIRED` header.
+    //
+    // 308, NOT 301, AND THAT IS THE ONE PLACE THIS DIFFERS FROM penny402's
+    // version of the same fix (74057db, 2026-09-15). penny402 sends 301, which
+    // is right for its motivating case — dropping `www.` on a GET. Ours is a
+    // POST: every paid route on this service is POST-only, and 301 and 302
+    // both permit a client to re-issue the request as a GET without its body,
+    // which turns "retry over https" into a 405 with the buyer's file gone. 308
+    // is the one redirect that REQUIRES the method and body be preserved, so a
+    // retrying client lands on the same POST it meant to make.
+    //
+    // THE PORT IS DROPPED WITH THE SCHEME. A plain-HTTP request can name :80 or
+    // a dev port, and carrying either onto https points the client at something
+    // that is not listening. The target is built rather than mutated — a
+    // trailing `:<digits>` stripped off `url.host`, which an IPv6 literal with
+    // no port cannot match because it ends in `]` — so the result does not
+    // depend on how a given URL implementation treats the `port` setter.
+    // pathname + search is the whole of what a client sent; a fragment never
+    // leaves the browser.
+    //
+    // NONE OF THAT IS OBSERVABLE THROUGH `wrangler dev`, which rewrites the
+    // Location header's authority to its own before the client sees it
+    // (measured 2026-09-19: the Worker emitted
+    // `https://toolshed.lemon-agent.dev/llms.txt?x=1` and curl received
+    // `https://127.0.0.1:8796/llms.txt?x=1`). So the local suite asserts the
+    // scheme, the path and the query — the parts that survive the proxy — and
+    // scripts/test-live.mjs checks the authority against the real origin.
+    //
+    // This is the Worker-side BELT. The suspenders are zone-level — Cloudflare
+    // → lemon-agent.dev → SSL/TLS → Edge Certificates → **Always Use HTTPS**,
+    // and HSTS beside it — which also covers the paths this Worker is not
+    // routed for. See README § Deploy runbook; the two are deliberately
+    // independent, and neither is the other's fallback.
+    if (url.protocol === 'http:' && !plainHttpAllowed(env)) {
+      const host = url.host.replace(/:\d+$/, '');
+      return Response.redirect(`https://${host}${url.pathname}${url.search}`, 308);
+    }
+
+    const path = url.pathname;
     const surface = SURFACES[path];
     if (surface) return handleSurface(request, surface, env, path);
     if (path === '/check') return handleCheck(request, env);
@@ -555,6 +639,14 @@ function handleCheck(request, env) {
   return json(
     {
       query: { from: from ?? null, to: to ?? null },
+      // What this Worker does with a plain-HTTP request, published so the belt
+      // can be checked WITHOUT the suspenders. `Always Use HTTPS` on the zone
+      // would redirect an http:// probe before it ever reached this code, so a
+      // passing curl proves the zone is on and says nothing about whether the
+      // Worker would also have redirected. This field is the Worker answering
+      // for itself: 'redirect' is the production value, 'allowed' means
+      // ALLOW_PLAIN_HTTP is set and this is a dev box. See § HTTPS only.
+      plain_http: plainHttpAllowed(env) ? 'allowed' : 'redirect',
       // Which x402 versions a caller can pay these tools in. Published because
       // /check is the machine front door and the answer decides which header a
       // client reads the envelope out of — see the dual-stack note under

@@ -31,7 +31,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parse as tomlParse } from 'smol-toml';
 import { XMLParser } from 'fast-xml-parser';
 import { marked } from 'marked';
-import { bootWorker, client, CATALOG } from './harness.mjs';
+import { bootWorker, client, CATALOG, PAYTO_TEST } from './harness.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = join(ROOT, 'dist');
@@ -465,5 +465,224 @@ describe('CONVERTERS descriptions', () => {
     for (const e of CATALOG.filter((c) => c.hosted && c.hosted.status === 'live')) {
       assert.ok(ids.has(e.id), `${e.id} is hosted live but has no CONVERTERS entry`);
     }
+  });
+});
+
+// ------------------------------------------------------------------ https only
+
+describe('plain HTTP is redirected before anything is priced', () => {
+  // An x402 402 served over plain HTTP carries a `payTo` in the clear — the
+  // address a client is about to sign a USDC transfer authorization against —
+  // so anything on the path can rewrite it and be paid instead of us, and the
+  // buyer has no way to know. Confirmed against production on 2026-09-18 by an
+  // outside agent and reproduced from the shell:
+  // `http://toolshed.lemon-agent.dev/convert/md-html` answered 402 with the
+  // whole envelope and no redirect.
+  //
+  // TWO WORKERS, AND THE REASON IS A MEASUREMENT. The obvious gate — exempt
+  // loopback, redirect everything else — cannot be written, because what
+  // `wrangler dev` shows the Worker depends on how it was started. Measured
+  // 2026-09-19 on wrangler 4.42.2, same repo, same wrangler.toml:
+  //
+  //   npx wrangler dev --local --port 8799          request.url and the Host
+  //     (what README § Local demo runs, and what        header both read
+  //      picks up the repo's .env)                      http://toolshed.lemon-agent.dev/…
+  //   the harness boot, with --env-file and         request.url reads
+  //     --persist-to                                    http://127.0.0.1:<port>/…
+  //
+  // So on the owner's machine the local dev server is BYTE-IDENTICAL to a
+  // plain-HTTP production request inside this code, and a hostname gate would
+  // redirect the documented local demo away from a server that has no TLS to
+  // redirect to. The gate is therefore the explicit ALLOW_PLAIN_HTTP var, which
+  // the harness sets for every other worker and these tests deliberately clear.
+  //
+  // For the same reason the assertions below build the expected `Location` from
+  // the worker's own base URL rather than naming a host: the claim is "the same
+  // URL, over https", whichever host this boot happens to present.
+  //
+  // PAYTO IS SET ON BOTH. Without a receiving address a paid route answers 429
+  // ("nowhere to pay") instead of the 402, and then "no envelope went out in
+  // the clear" would be true for a reason that has nothing to do with the
+  // redirect. With it, the same request on the exempt worker is a 402 carrying
+  // a payTo — which is the production shape, and the actual vulnerability.
+  let strict;
+  let exempt;
+  let exemptApi;
+
+  before(async () => {
+    [strict, exempt] = await Promise.all([
+      bootWorker({ vars: { PAYTO: PAYTO_TEST, ALLOW_PLAIN_HTTP: '' } }),
+      bootWorker({ vars: { PAYTO: PAYTO_TEST } }),
+    ]);
+    exemptApi = client(exempt);
+  });
+
+  after(async () => {
+    await strict?.stop();
+    await exempt?.stop();
+  });
+
+  const call = (worker, path, { method = 'GET' } = {}) =>
+    fetch(`${worker.baseUrl}${path}`, { method, redirect: 'manual' });
+
+  /**
+   * Assert a redirect target WITHOUT pinning its authority.
+   *
+   * The authority cannot be asserted through this harness: `wrangler dev`
+   * rewrites the Location header's host and port to its own before the client
+   * sees it (measured 2026-09-19 — the Worker emitted
+   * `https://toolshed.lemon-agent.dev/llms.txt?x=1` and curl received
+   * `https://127.0.0.1:8796/llms.txt?x=1`). An assertion on the full string
+   * would therefore be testing the dev proxy, and the earlier version of this
+   * helper was pinning the proxy's port as though it were ours.
+   *
+   * What survives the proxy — and what the claim actually is — is the SCHEME
+   * and the path with its query. scripts/test-live.mjs checks the authority
+   * against the real origin, where there is no proxy in the way.
+   */
+  const assertRedirectTo = (location, path) => {
+    assert.ok(location, 'the redirect carried no Location header');
+    const target = new URL(location);
+    assert.equal(target.protocol, 'https:', `the redirect points at ${location}, not https`);
+    assert.equal(`${target.pathname}${target.search}`, path, `the redirect points at ${location}`);
+  };
+
+  test('a POST to a paid route over http is 308ed to https with no envelope', async () => {
+    // 308 rather than 301: every paid route here is POST-only, and 301/302 let
+    // a client re-issue the request as a GET without its body — which turns
+    // "retry over https" into a 405 with the buyer's file gone. 308 is the one
+    // redirect that requires the method and body be preserved.
+    const res = await call(strict, '/convert/md-html', { method: 'POST' });
+    assert.equal(res.status, 308, `a paid route answered ${res.status} over plain HTTP`);
+    assertRedirectTo(res.headers.get('location'), '/convert/md-html');
+    assert.equal(res.headers.get('payment-required'), null, 'THE V2 ENVELOPE WENT OUT IN THE CLEAR');
+    const body = await res.text();
+    assert.ok(!body.includes('payTo'), 'THE V1 ENVELOPE WENT OUT IN THE CLEAR');
+    assert.equal(body, '', 'the redirect carried a body');
+  });
+
+  test('a GET to a free surface over http is 308ed too', async () => {
+    // Not only the paid routes: a machine surface read over http is a catalog
+    // an intermediary can rewrite, and the fix is one rule, not a list.
+    const res = await call(strict, '/llms.txt');
+    assert.equal(res.status, 308);
+    assertRedirectTo(res.headers.get('location'), '/llms.txt');
+  });
+
+  test('the query string survives the redirect', async () => {
+    // /check is the route whose whole meaning is in its query string, and the
+    // wrangler.toml pattern carries a wildcard for exactly that reason.
+    const res = await call(strict, '/check?from=markdown&to=html');
+    assert.equal(res.status, 308);
+    assertRedirectTo(res.headers.get('location'), '/check?from=markdown&to=html');
+  });
+
+  test('the redirect is decided before any D1 is touched — differentially', async () => {
+    // The ordering claim, measured rather than read, AND with the arm that
+    // proves the measurement can move. "Nothing was written" is a weak
+    // assertion on its own: it also passes when the counting is broken, when
+    // the route writes nothing anyway, or when the probe never arrived. So the
+    // SAME loop runs against both workers on a route that provably writes —
+    // POST /b, one events row per accepted beacon — and the two have to differ:
+    // the exempt worker's counts move, the strict worker's do not.
+    //
+    // Serially: three concurrent `wrangler d1 execute` processes against one
+    // --persist-to directory answer "internal error" (seen here first time out).
+    const counts = async (worker) => {
+      const out = [];
+      for (const table of ['events', 'convert_quota', 'settlements']) {
+        out.push(Number((await worker.d1(`SELECT COUNT(*) AS n FROM ${table};`))[0].n));
+      }
+      return out.join('/');
+    };
+    const beacon = (worker) =>
+      fetch(`${worker.baseUrl}/b`, {
+        method: 'POST',
+        body: JSON.stringify({ t: 'visit' }),
+        headers: { 'content-type': 'text/plain', 'cf-connecting-ip': '198.18.39.9' },
+        redirect: 'manual',
+      });
+
+    // THE CONTROL: the exempt worker runs the same five and the store moves.
+    const exemptBefore = await counts(exempt);
+    for (let i = 0; i < 5; i++) {
+      const res = await beacon(exempt);
+      assert.equal(res.status, 204, `the beacon answered ${res.status} on the exempt worker`);
+    }
+    const exemptAfter = await counts(exempt);
+    assert.notEqual(exemptAfter, exemptBefore, 'POST /b wrote nothing even where it is allowed to — the probe is blind');
+
+    // THE CLAIM: the same five over plain HTTP on the strict worker write zero.
+    const strictBefore = await counts(strict);
+    for (let i = 0; i < 5; i++) {
+      const res = await beacon(strict);
+      assert.equal(res.status, 308, `a plain-HTTP beacon answered ${res.status} instead of a redirect`);
+    }
+    assert.equal(await counts(strict), strictBefore, 'a plain-HTTP request reached the store');
+
+    // And the paid route, which is the one that matters, on the same terms.
+    const paidBefore = await counts(strict);
+    for (let i = 0; i < 5; i++) await call(strict, '/convert/md-html', { method: 'POST' });
+    assert.equal(await counts(strict), paidBefore, 'a plain-HTTP paid call reached the store');
+  });
+
+  // ONLY '1', 'true' and 'yes' TURN THE EXEMPTION ON. The values below are the
+  // ones a person reaches for when they mean to turn it OFF, and under a
+  // deny-list ("non-empty means on") every one of them would have meant ON —
+  // handing the envelope back to plain HTTP, which is the exact vulnerability
+  // this branch closes. An allow-list cannot fail that way. `{}` — the var
+  // absent altogether — is the `strict` worker every test above uses.
+  for (const value of ['false', '0', ' ']) {
+    test(`ALLOW_PLAIN_HTTP=${JSON.stringify(value)} is not permission`, async () => {
+      const off = await bootWorker({ vars: { PAYTO: PAYTO_TEST, ALLOW_PLAIN_HTTP: value } });
+      try {
+        const res = await fetch(`${off.baseUrl}/convert/md-html`, { method: 'POST', redirect: 'manual' });
+        assert.equal(res.status, 308, `ALLOW_PLAIN_HTTP=${JSON.stringify(value)} was read as permission`);
+        assert.equal(res.headers.get('payment-required'), null, 'THE V2 ENVELOPE WENT OUT IN THE CLEAR');
+        const check = await (await fetch(`${off.baseUrl}/check`, { redirect: 'manual' })).status;
+        assert.equal(check, 308, '/check answered instead of redirecting');
+      } finally {
+        await off.stop();
+      }
+    });
+  }
+
+  test('the var is not in wrangler.toml, so it cannot reach production by being forgotten', async () => {
+    // The whole safety argument in one grep. ALLOW_PLAIN_HTTP is a dev-only
+    // exemption; committed into [vars] it would ship with every deploy and the
+    // redirect would be off in production with nothing to notice it.
+    const toml = readFileSync(join(ROOT, 'wrangler.toml'), 'utf8');
+    assert.ok(!toml.includes('ALLOW_PLAIN_HTTP'), 'ALLOW_PLAIN_HTTP is committed in wrangler.toml');
+  });
+
+  test('/check publishes the Worker\'s own plain-HTTP policy', async () => {
+    // So the BELT can be checked without the SUSPENDERS. `Always Use HTTPS` on
+    // the zone redirects an http:// probe before it reaches this Worker at all,
+    // so a passing curl proves the zone toggle is on and says nothing about
+    // whether the code would also have redirected. This field is the Worker
+    // answering for itself, and scripts/test-live.mjs reads it over https.
+    //
+    // ONLY THE 'allowed' VALUE IS OBSERVABLE HERE, and that is a property of
+    // the harness rather than a gap in the field: `wrangler dev` serves plain
+    // HTTP only, so a worker that reports 'redirect' redirects /check too and
+    // cannot be asked. The other half is asserted against production, where
+    // /check is reachable over https. What IS pinned locally is that the field
+    // and the behaviour come from the same predicate — the workers that report
+    // 'allowed' are exactly the ones that answer rather than redirect.
+    assert.equal((await (await fetch(`${strict.baseUrl}/check`, { redirect: 'manual' })).status), 308);
+    assert.equal((await (await api.get('/check')).json()).plain_http, 'allowed');
+    assert.equal((await (await exemptApi.get('/check')).json()).plain_http, 'allowed');
+  });
+
+  test('the same worker with the exemption still answers the envelope', async () => {
+    // THE POSITIVE CONTROL. Without it every assertion above would also pass
+    // against a Worker that had stopped serving the 402 at all — and it is the
+    // half that proves the local-dev exemption is what keeps this suite, and
+    // README § Local demo, working over http.
+    const res = await exemptApi.convert('md-html', '# hi\n', { ip: '198.18.39.1' });
+    assert.equal(res.status, 402, `the paid route answered ${res.status} on the exempt worker: ${res.text}`);
+    assert.ok(res.json().accepts[0].payTo, 'the 402 carried no payTo');
+    assert.ok(res.headers.get('payment-required'), 'the 402 carried no v2 envelope');
+    assert.equal((await api.get('/llms.txt')).status, 200, 'the shared worker stopped serving over http');
   });
 });
