@@ -1096,11 +1096,42 @@ payment header from that caller is answered **429 with `Retry-After`** to
 midnight UTC **without calling the facilitator at all**, and that refusal writes
 nothing: no `settlements` row, no `events` row, no quota. Only round trips the
 facilitator itself answered are counted — a header we could not decode and a
-network we never offered are rejected without asking anyone. A legitimate buyer
-never reaches this bound, because its payments verify; a rejected payment still
-buys nothing against the paid ceiling either way. The `verify_ok = 0` breakdown
-under [Reading the ledger](#reading-the-ledger) is still how you see it
-happening.
+network we never offered are rejected without asking anyone. A rejected payment
+still buys nothing against the paid ceiling either way. The `verify_ok = 0`
+breakdown under [Reading the ledger](#reading-the-ledger) is still how you see
+it happening.
+
+**A legitimate buyer used to be unable to reach this bound. Since 2026-09-19 it
+can — but only through us.** Nothing a good buyer does counts against it: its
+payments verify, and verified payments are counted by nothing here. What counts
+on its behalf is a **CDP throttle**, which is our key being rate-limited and not
+its payment being refused. Fifty throttled calls — every one of them served
+**free** — and that buyer is answered 429 until midnight UTC.
+
+**And the lockout outlives the throttle.** The counter is per UTC day, not per
+outage, so a throttle that clears at 09:00 leaves the caller refused for the
+rest of the day. That is the trade, stated rather than hidden: fifty free
+conversions first, then a refusal that may outlast its cause, against the
+alternative of an unbounded free tier keyed on somebody else's outage. The
+counter is deliberately **not** split in two — one bound, one key, one thing to
+reason about — so the price of that simplicity is this paragraph. A run of
+`error = 'facilitator-http-429'` rows in `settlements` is how an operator sees
+it happening, and the fix is upstream (the key's rate limits), not a bigger
+number here.
+
+**Fifty is a floor, not a ceiling, under concurrency — and that now matters for
+free serves too.** The bound is read (`rejectedPaymentsToday`) and claimed
+(`claimConvertQuota`) in two statements rather than one, so a burst of requests
+arriving together can all pass the read before any of their claims land, and
+overshoot it by roughly the width of the burst. The claim itself saturates — the
+guarded upsert increments only while `used < 50` — so the counter never runs
+away; what overshoots is the number of calls let through. That was cheap when
+every overshooting call was a 402 costing one facilitator round trip. With
+throttled calls now counted, an overshoot is a handful of extra **conversions
+served free**. Still bounded by `PAID_DAILY` and by the burst's own width, and
+still the right trade against serialising every payment path on one counter —
+but it is a different unit than it was, so it is said here rather than
+discovered from a bill.
 
 **A facilitator 429 is served *and* counted — the one outage that is
 (since 2026-09-19).** A 429 on verify is CDP throttling **our** key, so nobody's

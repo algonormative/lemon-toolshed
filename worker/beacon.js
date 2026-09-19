@@ -111,9 +111,20 @@ const PAID_DAILY = 5000;
 // returned, or (since 2026-09-19) a 429 throttling our key, where the call is
 // still SERVED free under availability-first. A client refused 50 times in one
 // day is broken or hostile, and a client still presenting payments after fifty
-// throttled serves is taking conversions for nothing. The bound must never
-// touch a legitimate buyer, whose payments verify and are counted by nothing
-// here.
+// throttled serves is taking conversions for nothing.
+//
+// IT USED TO BE TRUE THAT THIS COULD NEVER TOUCH A LEGITIMATE BUYER. It is not
+// any more, and the change is worth stating rather than leaving as a comment
+// that has quietly gone false. A good buyer's payments verify, so nothing it
+// does can count against this bound — but a CDP throttle counts on its behalf.
+// Fifty throttled calls (all of them served free) and that buyer is refused
+// until midnight UTC, and the refusal OUTLIVES the throttle: the counter is per
+// UTC day, not per outage, so a throttle that clears at 09:00 still leaves the
+// caller locked out for the rest of the day. The trade is deliberate. The
+// alternative is an unbounded free tier keyed on somebody else's outage, and
+// fifty free conversions first is a gentler failure than that; a run of
+// `facilitator-http-429` rows in `settlements` is how an operator sees it
+// happening and fixes the key limits upstream.
 const REJECTED_PAYMENTS_DAILY = 50;
 
 /**
@@ -1989,7 +2000,17 @@ async function verifyPayment(env, payment, requirements) {
     // conversions free for as long as the throttle lasts. Every other status
     // here — 401/403/404/405, 5xx, a timeout, a dead socket — stays uncounted:
     // see FACILITATOR_THROTTLED_STATUS.
-    return { unavailable: call.reason, payer, checked: call.status === FACILITATOR_THROTTLED_STATUS };
+    // `checked` is SPREAD IN rather than set to a boolean, so the property is
+    // absent on every verdict that did not earn it instead of present-and-false.
+    // Both readers test it for truthiness, so the two spellings behave the same
+    // today — this is about what the object claims: a verdict carrying
+    // `checked: false` reads as "we asked and it did not count", which is not
+    // what a timeout or a dead socket is.
+    return {
+      unavailable: call.reason,
+      payer,
+      ...(call.status === FACILITATOR_THROTTLED_STATUS ? { checked: true } : {}),
+    };
   }
 
   const data = call.data;
