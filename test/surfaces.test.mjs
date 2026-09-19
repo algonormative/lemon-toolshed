@@ -573,6 +573,21 @@ describe('plain HTTP is redirected before anything is priced', () => {
     assert.equal(await counts(), before, 'a plain-HTTP request reached the store');
   });
 
+  test('a var that reads as OFF is off — "false" does not mean allowed', async () => {
+    // The footgun the value parsing exists for: with a bare "non-empty is on"
+    // test, ALLOW_PLAIN_HTTP = "false" in a dashboard would turn the exemption
+    // ON and hand the envelope back to plain HTTP — the exact vulnerability
+    // this branch closes. A misconfigured var has to fail towards the redirect.
+    const off = await bootWorker({ vars: { PAYTO: PAYTO_TEST, ALLOW_PLAIN_HTTP: 'false' } });
+    try {
+      const res = await fetch(`${off.baseUrl}/convert/md-html`, { method: 'POST', redirect: 'manual' });
+      assert.equal(res.status, 301, `ALLOW_PLAIN_HTTP="false" was read as permission: ${res.status}`);
+      assert.equal(res.headers.get('payment-required'), null, 'THE V2 ENVELOPE WENT OUT IN THE CLEAR');
+    } finally {
+      await off.stop();
+    }
+  });
+
   test('the same worker with the exemption still answers the envelope', async () => {
     // THE POSITIVE CONTROL. Without it every assertion above would also pass
     // against a Worker that had stopped serving the 402 at all — and it is the
