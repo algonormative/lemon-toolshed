@@ -290,8 +290,10 @@ with `scripts/probe-ua.sh`.
 **Step 6, the rung-0 expression.** The original rule matched `/b` alone. It has
 to be widened, because `/convert/*` executes rungs 1 and 2 *inside* the Worker —
 a request they reject is already billed, and a conversion costs more CPU than a
-beacon does. `/check` is deliberately left out: it touches no D1 and does no
-work, so it stays cheap and open.
+beacon does. `/check` is deliberately left out: it does no work and writes
+nothing, so it stays cheap and open. (Since 2026-09-19 it performs exactly one
+read — the schema self-check's single `sqlite_master` query — which is a
+metadata lookup, claims no quota and changes none of that reasoning.)
 
 ```text
 (http.host eq "toolshed.lemon-agent.dev" and
@@ -304,10 +306,47 @@ Commands for steps 4–5, once the owner has picked the hostname:
 npm ci                                                  # wrangler bundles the Worker's deps
 npm run build                                           # regenerates worker/catalog.generated.js
 npx wrangler d1 create lemon_toolshed                   # copy the id into wrangler.toml
-npx wrangler d1 execute DB --remote --file worker/schema.sql
+npx wrangler d1 execute DB --remote --file worker/schema.sql   # THE SCHEMA GOES FIRST
 npx wrangler deploy                                     # routes are live in wrangler.toml
+curl -s https://toolshed.lemon-agent.dev/check | jq .schema    # must print {"missing":[]}
 node scripts/test-live.mjs                              # smoke-test the deployed API
 ```
+
+**The schema goes first, and the self-check comes after the deploy — both on
+purpose.** `worker/schema.sql` is all `CREATE TABLE IF NOT EXISTS`, so applying
+it to a live database is safe and re-applying it is a no-op; deploying a Worker
+that writes a table the database does not have is not. That is not
+hypothetical — it is [what happened on
+2026-09-07](#migration--the-payment_seen-table-existing-databases). So the
+migration runs first, and then the deployed Worker is asked whether it agrees
+with the database it is actually bound to:
+
+```bash
+curl -s https://toolshed.lemon-agent.dev/check | jq .schema
+# {"missing":[]}                 <- healthy
+# {"missing":["payment_seen"]}   <- the migration was not run against THIS database
+```
+
+`GET /check` enumerates every table the Worker's own SQL touches —
+`convert_quota`, `counters`, `events`, `payment_seen`, `salt`, `settlements` —
+and reports which of them the bound D1 lacks, in **one** `sqlite_master` query
+with no per-table probing, so the route stays as cheap as it was.
+
+`blocklist` and `daily_aggregates` are deliberately **not** in that list: no
+code path in the Worker reads or writes either (they are operator surfaces —
+see [Operator queries](#operator-queries-kc-cur)), so their absence cannot take
+the service down, and reporting them would make a healthy deployment look
+broken. A deployment with no D1 binding, or one whose D1 cannot be read,
+answers `{"missing": null, "error": "…"}` rather than throwing — a self-check
+that took the endpoint down would be worse than the outage it reports.
+
+**It answers "present", not "correctly shaped".** The check is one
+`sqlite_master` lookup by name, so a table that exists but was created by hand
+without its primary key or a column reads as healthy here while the Worker
+degrades on every call. Apply `worker/schema.sql` rather than typing a
+`CREATE TABLE` from memory, and if `/check` says `{"missing":[]}` while
+`settlements` is filling with `claim-failed:` rows, the shape is what to go and
+look at.
 
 ### Migration — the conversion-quota table (existing databases)
 
@@ -731,6 +770,7 @@ the fourth**:
 | set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool. **No salt read, no quota claim, no D1 write of any kind** |
 | set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable, or nothing shaped like a payment, to send |
 | set | yes | `isValid` | **200**, the conversion, `x-payment-verified: true`, and settlement runs after the response |
+| set | yes | `isValid`, but the single-use claim will not write | **200**, the conversion, `x-payment-verified: true` + `x-payment-error: claim-unavailable` + `x-pricing: pending` — served, **never settled**, owner paged. See [Migration — the payment_seen table](#migration--the-payment_seen-table-existing-databases) |
 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served, and nothing settles |
 | set | yes | HTTP 400/413/422, no verdict | **402** + `invalidReason: facilitator-http-<status>` — the request was refused, not the facilitator down; recorded and counted like any other refusal |
 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served unverified, recorded |
@@ -1114,20 +1154,50 @@ missing. The one table, if you would rather be explicit about it:
 npx wrangler d1 execute DB --remote --command "CREATE TABLE IF NOT EXISTS payment_seen (hash TEXT PRIMARY KEY, created_at INTEGER, route TEXT);"
 ```
 
-Unlike [`settlements`](#migration--the-settlements-table-existing-databases),
-a missing `payment_seen` table is **not** best-effort. The claim is the `INSERT`
-itself, it runs on every verified paid call between the facilitator's yes and
-the conversion, and it carries no catch of its own — so a missing table throws
-into the enclosing `try` in `handleConvert` and the route takes its fail-closed
-exit: **503** `{"error": "conversion is unavailable"}`, refusal class
-`unavailable`, the same answer a missing `convert_quota` produces. Paid calls
-therefore fail closed until the table exists. Nothing else is affected: the 402
-envelope, a free tier if one is configured, and every refusal that happens
-before verify are all decided earlier and never touch the table. So the
-forgotten migration looks like "nobody can buy a conversion", not like
-"payments are unmetered" — run the migration, then check it landed:
+> **It used to fail closed, and that cost eleven days.** Until 2026-09-19 the
+> claim carried no catch of its own, so a missing table threw into the
+> enclosing `try` in `handleConvert` and the route took its fail-closed exit:
+> **503** `{"error": "conversion is unavailable"}`, refusal class `unavailable`.
+> The claim shipped on **2026-09-07** and this migration was never run against
+> the production database, so from then until **2026-09-18** every REAL payment
+> — verified, funded, correct — was answered 503, while unpayable junk headers
+> carried on being served free. The service had no way to say so, because the
+> migration is a separate command from the deploy and nothing asked. Both
+> halves of that are now fixed: the claim degrades instead of refusing (below),
+> and `GET /check` answers the question (see [Deploy
+> runbook](#deploy-runbook)).
+
+**A claim that cannot be written now degrades rather than refusing.** A buyer
+whose payment the facilitator verified must never be turned away because *our*
+table is missing — availability-first is the property's rule, and it applies
+hardest when the fault is entirely ours. So an `INSERT` that throws is caught
+where it happens, and the call:
+
+- is **served**, with `x-payment-verified: true` (the facilitator really did
+  say yes), `x-payment-error: claim-unavailable` and `x-pricing: pending`;
+- writes a `settlements` row with `verify_ok = 1`, `settle_ok = 0` and
+  `error = 'claim-failed:<the sqlite message, first 80 characters>'` — the
+  documented "served, never settled" shape;
+- **settles nothing.** Without the claim the authorization has no single-use
+  guarantee at all, and charging for a call we cannot bound is the wrong side
+  to err on;
+- pages the owner on the same deferred slot the served-unverified path uses,
+  worded so the first line says the *claim* failed and the payment did not —
+  🚨 `LOST CONVERSION — … — payment VERIFIED, single-use claim FAILED: …`.
+
+A **duplicate is not an error** on this path and never was: the claim is an
+`ON CONFLICT … DO NOTHING`, so a replayed authorization comes back empty
+without throwing and is still answered 402 `payment_already_used`. Only a real
+store failure reaches the degrade.
+
+**The degrade is a safety net, not a state to sit in.** While it is firing the
+same authorization can buy conversions over and over and none of them is
+billed, which is the amplification this table exists to stop. Run the
+migration, then check it landed — from the deployed Worker, which is the copy
+that matters:
 
 ```bash
+curl -s https://toolshed.lemon-agent.dev/check | jq .schema     # {"missing":[]}
 npx wrangler d1 execute DB --remote --command "SELECT name FROM sqlite_master WHERE name = 'payment_seen';"
 ```
 
@@ -1275,7 +1345,8 @@ from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
 | `x-payment-verified: false` | nothing was checked — see `x-payment-error` |
 | `x-payment-error: facilitator-unreachable` | timeout, network failure, or a 5xx / 401 / 403 / 404 / 429 from the facilitator — nobody could be asked. A 400 / 413 / 422 with no verdict body is NOT this: it is the caller's request being refused, and is answered 402 (see below) |
 | `x-payment-error: facilitator-unconfigured` | no CDP credentials on this Worker. Operator fault, not caller fault |
-| `x-pricing: pending` | served without a verified payment |
+| `x-payment-error: claim-unavailable` | the facilitator verified the payment and the single-use claim could not be written — so the conversion was served and **nothing will settle**. Operator fault, and it rides alongside `x-payment-verified: true`, because the payment really was checked. See [Migration — the payment_seen table](#migration--the-payment_seen-table-existing-databases) |
+| `x-pricing: pending` | nothing settled for this call, and nothing will |
 
 On the **402** rather than on a served call, two more: `PAYMENT-REQUIRED`
 carrying the base64 v2 envelope, and `cache-control: no-store`, because an
@@ -1307,6 +1378,15 @@ reason (the facilitator recovered no payer), so the `settlements` rows with
 `error = 'facilitator-http-400'` and a named `payer` are what tell you.
 
 ### Reading the ledger
+
+**`verify_ok = 1, settle_ok = 0` now covers two stories**, and the `error`
+column is what tells them apart: a settlement that failed after a served
+conversion (the accepted exposure, `error` is the facilitator's `errorReason`),
+and a verified payment whose single-use claim could not be written (`error`
+starts `claim-failed:` — see [Migration — the payment_seen
+table](#migration--the-payment_seen-table-existing-databases)). A "revenue that
+did not arrive" sum wants both; a "settlement is broken" investigation wants
+only the first. Filter on the prefix.
 
 ```bash
 # the last few payment attempts
@@ -1417,6 +1497,7 @@ it should have moved and did not.
 | verified payment, from a wallet in `HOUSE_PAYERS` | 🧪 `test settlement — …` — same facts, quiet framing. It keeps 🧪 when the settlement fails, ending `SETTLE FAILED (<reason>)`: a drill that breaks is a configuration story, not a revenue one |
 | verified payment from a payer **not** in `HOUSE_PAYERS`, settlement **failed** | 🚨 `LOST CONVERSION — $0.004 md-html — payer 0x… — tx none — SETTLE FAILED (<reason>)`. Verified means the caller was served, and the money then did not arrive — as absent as in a refusal, so it wears the same lead rather than 🍋💰 |
 | facilitator-**rejected** payment, where an address was recovered and it is **not** in `HOUSE_PAYERS` | 🚨 `LOST CONVERSION — $0.004 md-html — payer 0x… — rejected: <reason>`. An outside wallet tried to buy and could not: nothing was served, nothing was billed, and a run of these on one reason is a buyer who cannot pay us for a fixable reason |
+| verified payment whose **single-use claim could not be written** | 🚨 `LOST CONVERSION — $0.004 md-html — payer 0x… — payment VERIFIED, single-use claim FAILED: claim-failed:<sqlite message>`. The payment was good and our store was not: the conversion went out, nothing settled, and until it is fixed the same authorization buys conversions unbounded. The body names `GET /check`'s `schema.missing` and `worker/schema.sql`, because a forgotten migration is the cause every time so far |
 | **served without verification** | ⚠️ `SERVED WITHOUT VERIFICATION — … — x-payment-error: <reason>` (` (test payer)` after the headline when the payer is one of ours — the leak is real either way). Visually distinct because it is a different problem: the conversion went out and **nobody paid** |
 | unpaid 402 | **nothing** |
 | malformed `X-PAYMENT` / `PAYMENT-SIGNATURE` — a rejection with **no recoverable payer** | **nothing** |
@@ -1938,6 +2019,7 @@ test/convert-yaml-json.test.mjs   block scalars, anchors, comments, tabs
 test/convert-csv-json.test.mjs    the RFC 4180 battery
 test/convert-html-markdown.test.mjs
 test/protocol.test.mjs            /check, method and routing guards, 413, /b
+test/schema-check.test.mjs        /check's schema block, against a database missing each table
 test/alerts.test.mjs              owner payment alerts: Telegram, email, and the silences
 test/quota.test.mjs               the env-gated free tier and its spoof resistance
 test/tier-off.test.mjs            the PRODUCTION default — 402 first, and it writes nothing
