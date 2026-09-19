@@ -25,8 +25,8 @@
 // would look completely healthy against a mock that only echoes canned answers,
 // and would verify as invalid against the real facilitator, which recovers the
 // signature from what it is handed. So every hit is shape-checked against its
-// own declared version and a mismatch answers 400, which surfaces as an
-// unverified serve and fails whatever test made the call. Drift is meant to be
+// own declared version and a mismatch answers 400, which surfaces as a 402
+// `facilitator-http-400` and fails whatever test made the call. Drift is meant to be
 // loud. (GET /supported carries no payment and is not shape-checked.)
 
 import http from 'node:http';

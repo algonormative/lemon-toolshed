@@ -224,6 +224,22 @@ const DEFAULT_FACILITATOR_URL = 'https://api.cdp.coinbase.com/platform/v2/x402';
 const VERIFY_TIMEOUT_MS = 2_000;
 const SETTLE_TIMEOUT_MS = 20_000;
 
+// The facilitator statuses that mean THE REQUEST WAS BAD rather than THE
+// FACILITATOR WAS DOWN. A verify that comes back with one of these and no
+// verdict body is a rejection of what the caller sent, and is answered 402.
+//
+// Measured 2026-09-18: CDP answers a schema-invalid verify body — a payload
+// with `authorization: {}` or no `payload` at all — with HTTP 400 and a
+// non-verdict error body. Before this set existed that 400 fell into the
+// availability-first bucket, so a well-shaped junk X-PAYMENT header bought a
+// free conversion and paged the owner with "facilitator-unreachable" while
+// CDP was answering in 170 ms. One scanner took six that morning.
+//
+// Deliberately NOT in the set: 401/403 (our credentials — operator fault),
+// 404/405 (our URL), 429 (the facilitator throttling us), and every 5xx.
+// Those are still nobody's payment being refused, and stay availability-first.
+const FACILITATOR_CALLER_FAULT_STATUSES = new Set([400, 413, 422]);
+
 // CDP bearer tokens are minted per call and live 120 s, matching @coinbase/cdp-sdk.
 const CDP_JWT_TTL_SECONDS = 120;
 
@@ -806,7 +822,12 @@ async function handleConvert(request, env, path, ctx) {
         // rejection with nobody behind it is the scanner noise rule four names.
         // Queued through deferWork, exactly as the settle/alert block below is,
         // so the 402 never waits on a notification.
-        if (verdict.payer && !isHousePayer(env, verdict.payer)) {
+        //
+        // NOT on a `facilitator-http-*` rejection: there the facilitator gave no
+        // verdict and recovered nobody, so `verdict.payer` is only what the
+        // caller typed into its own payload — and the header most likely to
+        // carry a typed-in `from` is a scanner's. The ledger row still keeps it.
+        if (verdict.payer && !isHousePayer(env, verdict.payer) && !verdict.reason.startsWith('facilitator-http-')) {
           await deferWork(
             ctx,
             sendPaymentAlert(env, {
@@ -1885,6 +1906,15 @@ async function verifyPayment(env, payment, requirements) {
     };
   }
 
+  // A header that decodes but is not SHAPED like a payment is the caller's bug
+  // too, and it is caught here, before the facilitator is asked — a
+  // `{"hello":"world"}` header must cost us no round trip (found in the wild
+  // 2026-09-18; the facilitator answered it 400, which at the time served the
+  // conversion free). Shape only: scheme, network and a payload object. What
+  // is IN the payload is the facilitator's to judge, not ours.
+  const shape = paymentShapeError(payment);
+  if (shape) return { rejected: true, reason: 'malformed_payment_header', message: shape, payer: null };
+
   const payer = payerOf(decoded);
   if (!env.CDP_API_KEY_ID || !env.CDP_API_KEY_SECRET) {
     // Operator error, not a caller error, and distinct from a network failure
@@ -1893,7 +1923,25 @@ async function verifyPayment(env, payment, requirements) {
   }
 
   const call = await facilitatorCall(env, 'verify', decoded, requirements, VERIFY_TIMEOUT_MS);
-  if (!call.ok) return { unavailable: call.reason, payer };
+  if (!call.ok) {
+    // A 4xx WITHOUT a verdict body is still an answer about the request: the
+    // facilitator read what the caller sent and could not make a payment of
+    // it. That is the caller's fault and a 402, not an outage and a free
+    // serve — see FACILITATOR_CALLER_FAULT_STATUSES for the measured case and
+    // the statuses deliberately left out. CHECKED, because the round trip was
+    // made: a scanner feeding us junk headers is exactly what
+    // REJECTED_PAYMENTS_DAILY is there to bound.
+    if (FACILITATOR_CALLER_FAULT_STATUSES.has(call.status)) {
+      return {
+        rejected: true,
+        checked: true,
+        reason: call.reason,
+        message: `the facilitator rejected the verify request (HTTP ${call.status}) without a verdict — the payment payload did not parse as an x402 payment for this offer`,
+        payer,
+      };
+    }
+    return { unavailable: call.reason, payer };
+  }
 
   const data = call.data;
   if (data?.isValid === true) return { verified: true, payload: decoded, payer: data.payer || payer };
@@ -1914,6 +1962,27 @@ async function verifyPayment(env, payment, requirements) {
   // A 200 that is not a VerifyResponse means the facilitator is broken, which is
   // an outage — not evidence against the payment. Serve, and record it.
   return { unavailable: 'facilitator-error', payer };
+}
+
+/**
+ * The minimum an x402 payment must carry to be worth sending to the
+ * facilitator, or null when it carries it. v1 names scheme and network at the
+ * top level; v2 names them in `accepted`, the offer entry it echoes back.
+ * Both carry a `payload` object — the signed authorization or transaction.
+ */
+function paymentShapeError(payment) {
+  const d = payment.decoded;
+  if (!d.payload || typeof d.payload !== 'object' || Array.isArray(d.payload)) {
+    return 'the payment has no `payload` object — this is not an x402 payment';
+  }
+  const terms = payment.version === 2 ? d.accepted : d;
+  const named = (k) => typeof terms?.[k] === 'string' && terms[k].length > 0;
+  if (!named('scheme') || !named('network')) {
+    return payment.version === 2
+      ? 'an x402 v2 payment names its `scheme` and `network` in `accepted`'
+      : 'an x402 v1 payment names its `scheme` and `network`';
+  }
+  return null;
 }
 
 /**
@@ -2087,7 +2156,11 @@ async function facilitatorCall(env, endpoint, payload, requirements, timeoutMs) 
         /* not JSON — a gateway error page, not a verdict */
       }
       if (body && (body.isValid === false || body.success === false)) return { ok: true, data: body };
-      return { ok: false, reason: `facilitator-http-${res.status}` };
+      // No verdict. `status` rides along so verifyPayment() can tell a 400
+      // (the caller's request was bad) from a 503 (nobody could be asked):
+      // the two want opposite answers, and the reason string alone is what
+      // the ledger keeps, not what the branch should be decided on.
+      return { ok: false, reason: `facilitator-http-${res.status}`, status: res.status };
     }
     return { ok: true, data: await res.json() };
   } catch (err) {

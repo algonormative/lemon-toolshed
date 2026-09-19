@@ -579,12 +579,25 @@ describe('the v2 envelope in the PAYMENT-REQUIRED header', () => {
     const ip = ips.pinned(12);
     const res = await api.convert('md-html', '# hi\n', {
       ip,
-      headers: { 'payment-signature': Buffer.from(JSON.stringify({ x402Version: 2 })).toString('base64') },
+      headers: {
+        // The least a v2 payment can be and still be SHAPED like one (scheme,
+        // network, a payload object) — since 2026-09-18 anything less is
+        // answered 402 malformed_payment_header before the facilitator is
+        // asked, which is the previous test, not this one.
+        'payment-signature': Buffer.from(
+          JSON.stringify({ x402Version: 2, accepted: { scheme: 'exact', network: 'eip155:8453' }, payload: {} })
+        ).toString('base64'),
+      },
     });
     // This phase has no CDP credentials, so the honest answer to a payment we
     // cannot check is the conversion plus `facilitator-unconfigured` — the same
     // availability-first answer a v1 payment gets above. What matters is that
     // it is NOT the 402: the header was seen.
+    assert.notEqual(
+      res.status === 402 ? res.json().invalidReason : null,
+      'malformed_payment_header',
+      'the minimally shaped v2 fixture no longer passes the shape gate — widen the fixture, not the gate'
+    );
     assert.equal(res.status, 200, `a v2 payment header was ignored: ${res.status} ${res.text}`);
     assert.equal(res.headers.get('x-payment-verified'), 'false');
     assert.equal(res.headers.get('x-payment-error'), 'facilitator-unconfigured');

@@ -729,9 +729,10 @@ the fourth**:
 | `PAYTO` | `X-PAYMENT` | facilitator says | response |
 | --- | --- | --- | --- |
 | set | no | *not asked* | **402**, a spec-valid x402 v1 envelope for that tool. **No salt read, no quota claim, no D1 write of any kind** |
-| set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable to send |
+| set | malformed | *not asked* | **402** + `invalidReason: malformed_payment_header` — nothing decodable, or nothing shaped like a payment, to send |
 | set | yes | `isValid` | **200**, the conversion, `x-payment-verified: true`, and settlement runs after the response |
 | set | yes | not valid | **402** + the envelope + `invalidReason` — no conversion served, and nothing settles |
+| set | yes | HTTP 400/413/422, no verdict | **402** + `invalidReason: facilitator-http-<status>` — the request was refused, not the facilitator down; recorded and counted like any other refusal |
 | set | yes | *unreachable* | **200**, `x-payment-verified: false` + `x-payment-error` + `x-pricing: pending` — served unverified, recorded |
 | set | yes | `isValid`, but the input will not convert | **400** — verified and **never settled**, so not charged |
 | set | yes | `isValid`, past 5,000 served calls today | **429** + `Retry-After` — the runaway bound, not a price gate |
@@ -1272,7 +1273,7 @@ from its ticker, and the EIP-712 domain uses the name. (On Base *Sepolia* it is
 | --- | --- |
 | `x-payment-verified: true` | the facilitator returned `isValid`. Never inferred from a header |
 | `x-payment-verified: false` | nothing was checked — see `x-payment-error` |
-| `x-payment-error: facilitator-unreachable` | timeout, network failure, or a non-200 from the facilitator |
+| `x-payment-error: facilitator-unreachable` | timeout, network failure, or a 5xx / 401 / 403 / 404 / 429 from the facilitator — nobody could be asked. A 400 / 413 / 422 with no verdict body is NOT this: it is the caller's request being refused, and is answered 402 (see below) |
 | `x-payment-error: facilitator-unconfigured` | no CDP credentials on this Worker. Operator fault, not caller fault |
 | `x-pricing: pending` | served without a verified payment |
 
@@ -1285,6 +1286,25 @@ terms. There is deliberately no `PAYMENT-RESPONSE` — see
 The **ledger** keeps the precise reason (`facilitator-timeout`,
 `facilitator-http-503`, …) because that is what you debug from; the **header**
 keeps a small stable vocabulary because that is what a client branches on.
+
+**A facilitator 4xx with no verdict body is a rejection, not an outage** (since
+2026-09-18). CDP answers a schema-invalid verify body — `payload: {}`,
+`authorization: {}` — with HTTP 400 and an error body that is not a
+`VerifyResponse`. Before that date the Worker filed every non-200 without a
+verdict under availability-first, so a well-shaped junk `X-PAYMENT` header
+bought a free conversion and paged the owner with `facilitator-unreachable`
+while CDP was up; one scanner took six that morning. Now a 400, 413 or 422
+without a verdict is answered **402** with `invalidReason:
+facilitator-http-<status>`, writes a `settlements` row with that reason and
+`verify_ok = 0`, and counts against `REJECTED_PAYMENTS_DAILY` like any other
+refusal the facilitator returned. 401/403 (our credentials), 404/405 (our
+URL), 429 and every 5xx are still nobody's payment being refused and still
+serve unverified. The trade: if a Worker bug ever makes CDP 400 a *good*
+payment, buyers see 402 instead of a free conversion, and because the round
+trip was made it counts against `REJECTED_PAYMENTS_DAILY` — fifty of them and
+the buyer is 429 until midnight UTC. The refusal alert does not fire on this
+reason (the facilitator recovered no payer), so the `settlements` rows with
+`error = 'facilitator-http-400'` and a named `payer` are what tell you.
 
 ### Reading the ledger
 
