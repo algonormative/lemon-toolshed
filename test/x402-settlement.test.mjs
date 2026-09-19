@@ -1009,6 +1009,127 @@ describe('a facilitator 4xx with no verdict body is a rejection, not an outage',
   });
 });
 
+describe('a facilitator 429 is served, and counted', () => {
+  // THE ONE OUTAGE THAT COUNTS. A 429 is CDP throttling OUR key, so nobody's
+  // payment was refused and the availability-first serve stands. But the round
+  // trip happened and the conversion went out free — and while the throttle
+  // lasts, every further presented payment does the same. Unbounded, that is a
+  // caller converting for nothing for as long as CDP keeps saying no to us, and
+  // no other bound sees it: PAID_DAILY is 5,000 a day per IP. So the hit counts
+  // against REJECTED_PAYMENTS_DAILY and the caller is 429'd after fifty.
+  test('a 429 serves unverified, files facilitator-http-429, and claims the reject counter', async () => {
+    mock.reset();
+    mock.state.verify = { status: 429, body: { errorType: 'rate_limit_exceeded' } };
+
+    // A caller of its own, which has therefore never been counted: the
+    // assertion below is "exactly one", not "one more than before". The key is
+    // derived AFTER the call, because the day's salt is written by the first
+    // request that needs it and this file is runnable on its own.
+    const ip = ips.pinned(42);
+
+    const res = await api.convert('md-html', '# hi\n', {
+      ip,
+      ua: 'settlement-suite/1',
+      headers: { 'x-payment': paymentHeader() },
+    });
+    const rejectKey = `reject:${await ipHashOn(worker, ip)}`;
+
+    // Served: nobody's payment was refused, so the caller is not turned away.
+    assert.equal(res.status, 200, `a throttled facilitator answered ${res.status}: ${res.text}`);
+    assert.ok(res.text.includes('<h1>hi</h1>'), 'the conversion did not run');
+    assert.equal(res.headers.get('x-payment-verified'), 'false');
+    assert.equal(res.headers.get('x-payment-error'), 'facilitator-unreachable');
+    assert.equal(res.headers.get('x-pricing'), 'pending');
+    assert.equal(mock.hitsOn('settle').length, 0, 'an unverified payment was settled');
+
+    // The LEDGER keeps the precise reason; the header keeps the stable one.
+    const row = await awaitSettlement((r) => r.error === 'facilitator-http-429', 'the throttle row');
+    assert.equal(row.verify_ok, 0);
+    assert.equal(row.settle_ok, 0);
+    assert.ok(isSqlNull(row.tx_hash));
+
+    // …and the round trip is counted, which is the whole change.
+    assert.equal(await usedOn(worker, rejectKey), 1, 'a throttled round trip was not counted');
+  });
+
+  test('a 503 is still not counted — the control in the other direction', async () => {
+    // Without this, "the 429 was counted" would also pass against a Worker that
+    // had started counting every outage, which is the same mistake mirrored:
+    // bounding a caller for our dependency's bad day.
+    mock.reset();
+    mock.state.verify = { status: 503, body: { error: 'unavailable' } };
+
+    const ip = ips.pinned(43);
+
+    for (let i = 0; i < 3; i++) {
+      const res = await api.convert('md-html', '# hi\n', {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+      assert.equal(res.status, 200, `an outage-served call answered ${res.status}: ${res.text}`);
+      assert.equal(res.headers.get('x-payment-verified'), 'false');
+    }
+
+    await awaitSettlement((r) => r.error === 'facilitator-http-503', 'the outage row');
+    const rejectKey = `reject:${await ipHashOn(worker, ip)}`;
+    assert.equal(await usedOn(worker, rejectKey), 0, 'a 503 outage was counted against the caller');
+  });
+
+  test('past the bound a throttled caller is 429ed without asking the facilitator', async () => {
+    // The bound actually biting, on its own worker so that parking the counter
+    // at the ceiling cannot disturb the shared one's rows.
+    const scratchMock = await startMockFacilitator();
+    const scratch = await bootWorker({
+      vars: { PAYTO: PAYTO_TEST, FACILITATOR_URL: scratchMock.url, ...fakeCdpCredentials() },
+    });
+    try {
+      const scratchApi = client(scratch);
+      scratchMock.state.verify = { status: 429, body: { errorType: 'rate_limit_exceeded' } };
+      const ip = ips.pinned(44);
+
+      // One throttled serve, so the caller's reject row exists and the day's
+      // salt is written — then park the row one short of the ceiling.
+      const first = await scratchApi.convert('md-html', '# hi\n', {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+      assert.equal(first.status, 200, `the first throttled call answered ${first.status}: ${first.text}`);
+
+      const rejectKey = `reject:${await ipHashOn(scratch, ip)}`;
+      await scratch.d1(
+        `UPDATE convert_quota SET used = ${REJECTED_PAYMENTS_DAILY - 1} WHERE ip_hash = '${rejectKey}';`
+      );
+
+      // The ceiling call: still served, and it takes the last slot.
+      const atCeiling = await scratchApi.convert('md-html', '# hi\n', {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+      assert.equal(atCeiling.status, 200, `the ceiling call answered ${atCeiling.status}: ${atCeiling.text}`);
+      assert.equal(await usedOn(scratch, rejectKey), REJECTED_PAYMENTS_DAILY, 'the ceiling call was not counted');
+
+      // Past it: a plain rate-limit answer, and the facilitator is not asked.
+      const hitsBefore = scratchMock.hits.length;
+      const refused = await scratchApi.convert('md-html', '# hi\n', {
+        ip,
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+      assert.equal(refused.status, 429, `past the bound the answer was ${refused.status}: ${refused.text}`);
+      assert.ok(!refused.text.includes('<h1>'), 'a caller past the bound was still served');
+      assert.ok(!('accepts' in refused.json()), 'a caller that cannot pay its way out was told to pay');
+      assert.ok(Number(refused.headers.get('retry-after')) > 0, 'the resettable bound carried no Retry-After');
+      assert.equal(scratchMock.hits.length, hitsBefore, 'the facilitator was asked past the bound');
+    } finally {
+      await scratch.stop();
+      await scratchMock.stop();
+    }
+  });
+});
+
 describe('the facilitator is unavailable', () => {
   test('a 500 on verify serves the conversion free and says it was not checked', async () => {
     mock.reset();
