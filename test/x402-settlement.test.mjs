@@ -1495,3 +1495,80 @@ describe('the paid ceiling still bounds a verified caller', () => {
     }
   });
 });
+
+describe('the single-use claim cannot fail closed', () => {
+  // THE 2026-09-07 INCIDENT, as a test. The claim shipped, `worker/schema.sql`
+  // was never applied to production, and claimPaymentOnce()'s INSERT threw into
+  // handleConvert's catch — so for eleven days every REAL payment was answered
+  // 503 "conversion is unavailable" while junk headers were still served free.
+  // A buyer whose payment the facilitator verified must never be turned away
+  // for OUR missing table: availability-first is the property's rule, and it
+  // applies hardest when the fault is entirely ours.
+  //
+  // A throwaway worker, because the table is dropped out from under it.
+  test('a claim INSERT that throws serves the conversion and files claim-failed', async () => {
+    const scratchMock = await startMockFacilitator();
+    const scratch = await bootWorker({
+      vars: { PAYTO: PAYTO_TEST, FACILITATOR_URL: scratchMock.url, ...fakeCdpCredentials() },
+    });
+    try {
+      const scratchApi = client(scratch);
+      // The migration that was never run, reproduced exactly.
+      await scratch.d1('DROP TABLE payment_seen;');
+
+      const res = await scratchApi.convert('md-html', '# hi\n', {
+        ip: ips.pinned(40),
+        ua: 'settlement-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+
+      assert.equal(res.status, 200, `a verified payment was refused for our own missing table: ${res.status} ${res.text}`);
+      assert.ok(res.text.includes('<h1>hi</h1>'), 'the conversion did not run');
+      // Verified is verified: the facilitator answered isValid, and only the
+      // claim failed. Saying `false` here would blame the payment.
+      assert.equal(res.headers.get('x-payment-verified'), 'true');
+      assert.equal(res.headers.get('x-payment-error'), 'claim-unavailable');
+      assert.equal(res.headers.get('x-pricing'), 'pending', 'a call that settles nothing was priced as settled');
+
+      const rows = await scratch.d1(
+        'SELECT tool, payer, amount, verify_ok, settle_ok, tx_hash, error FROM settlements ORDER BY ts, rowid;'
+      );
+      assert.equal(rows.length, 1, `expected one ledger row, saw ${JSON.stringify(rows)}`);
+      const [row] = rows;
+      assert.equal(row.tool, 'md-html');
+      assert.equal(row.verify_ok, 1, 'the verify that DID succeed was recorded as a failure');
+      assert.equal(row.settle_ok, 0, 'a payment we could not claim was settled anyway');
+      assert.ok(isSqlNull(row.tx_hash));
+      assert.match(row.error, /^claim-failed:/, `the ledger reason was ${row.error}`);
+      assert.match(row.error, /no such table/i, 'the sqlite message was not carried into the ledger');
+      // Truncated to 80 characters after the prefix, so one broken deploy cannot
+      // write novels into the revenue record.
+      assert.ok(
+        row.error.length <= 'claim-failed:'.length + 80,
+        `the claim-failed reason was not truncated: ${row.error.length} chars`
+      );
+
+      // NOT SETTLED. Without the claim the authorization has no single-use
+      // guarantee, and charging for a call we cannot bound is the wrong side to
+      // err on.
+      await new Promise((r) => setTimeout(r, 1_000));
+      assert.equal(scratchMock.hitsOn('settle').length, 0, 'an unclaimable payment was settled');
+
+      // AND THE GUARD COMES BACK WHEN THE TABLE DOES. The degrade is for the
+      // broken deployment only — a replay must still be refused the moment the
+      // migration lands.
+      await scratch.d1('CREATE TABLE IF NOT EXISTS payment_seen (hash TEXT PRIMARY KEY, created_at INTEGER, route TEXT);');
+      const header = paymentHeader();
+      const replayIp = ips.pinned(41);
+      const call = () =>
+        scratchApi.convert('md-html', '# hi\n', { ip: replayIp, ua: 'settlement-suite/1', headers: { 'x-payment': header } });
+      assert.equal((await call()).status, 200, 'the first presentation was not served after the table came back');
+      const replay = await call();
+      assert.equal(replay.status, 402, `a replay answered ${replay.status}: ${replay.text}`);
+      assert.equal(replay.json().invalidReason, 'payment_already_used');
+    } finally {
+      await scratch.stop();
+      await scratchMock.stop();
+    }
+  });
+});
