@@ -7,7 +7,9 @@
 //                      rungs, same salt, same writes.
 //   GET  /check        availability lookup over the catalog compiled into this
 //                      bundle at build time (worker/catalog.generated.js). No
-//                      fetch, no KV, no D1 — so it is cheap, and it is exempt
+//                      fetch, no KV, and exactly ONE D1 read — the schema
+//                      self-check's single sqlite_master query, which writes
+//                      nothing — so it is still cheap, and it is still exempt
 //                      from the rungs below.
 //   POST /convert/<id> the hosted conversions. Priced per call in USDC via x402,
 //                      metered on their OWN budget — the paid ceiling below —
@@ -500,7 +502,9 @@ async function handleBeacon(request, env, path) {
 
 // ------------------------------------------------------------------ /check
 //
-// A pure in-memory filter over the compiled catalog. No D1, so no rungs.
+// An in-memory filter over the compiled catalog, plus ONE sqlite_master read
+// for the schema self-check (see schemaCheck below). It writes nothing and
+// claims nothing, so there are still no rungs on this route.
 //
 // Matching is field-BOUND: `from` is tested against the have side only, `to`
 // against the need side only. With no parameters at all, the answer is every
@@ -525,7 +529,49 @@ const normaliseAlias = (s) => s.trim().toLowerCase().replace(/^\.+/, '');
 const sideMatches = (prose, aliases, needle, alias) =>
   prose.toLowerCase().includes(needle) || (aliases || []).includes(alias);
 
-function handleCheck(request, env) {
+// ------------------------------------------------- the schema self-check
+//
+// EVERY TABLE THIS WORKER TOUCHES, in one list, compared against the bound D1 on
+// /check. It exists because of a measured 11-day outage: on 2026-09-07 the
+// single-use payment claim shipped and `worker/schema.sql` was never applied to
+// production, so claimPaymentOnce()'s INSERT threw into handleConvert's catch
+// and EVERY real payment was answered 503 "conversion is unavailable" while
+// junk headers were served free. Nothing the deployment said out loud mentioned
+// it: the migration is a separate command from the deploy, and there was no way
+// to ask whether it had been run. Now there is, on the route an operator
+// already curls.
+//
+// THE LIST IS WHAT THIS FILE'S SQL TOUCHES, not what schema.sql defines.
+// `blocklist` and `daily_aggregates` are in the schema and are deliberately
+// absent here because no code path in this Worker reads or writes either — both
+// are operator surfaces (README § Operator queries), so their absence cannot
+// take the service down and reporting them would make a healthy deployment look
+// broken.
+const WORKER_TABLES = ['convert_quota', 'counters', 'events', 'payment_seen', 'salt', 'settlements'];
+
+/**
+ * Which of WORKER_TABLES the bound database does not have.
+ *
+ * ONE `sqlite_master` query and no per-table probing: /check is the machine
+ * front door, it is scanned continuously, and it is the one route deliberately
+ * left out of the edge block rule because it is cheap. It also must never fail
+ * — a self-check that takes the endpoint down is worse than the outage it
+ * reports — so an unbound or unreachable D1 answers `missing: null` plus a
+ * reason rather than throwing.
+ */
+async function schemaCheck(env) {
+  const db = env.DB;
+  if (!db) return { missing: null, error: 'no D1 binding on this deployment' };
+  try {
+    const { results = [] } = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+    const present = new Set(results.map((row) => row.name));
+    return { missing: WORKER_TABLES.filter((name) => !present.has(name)) };
+  } catch (err) {
+    return { missing: null, error: oneLineMessage(err) };
+  }
+}
+
+async function handleCheck(request, env) {
   if (request.method !== 'GET') {
     return json({ error: 'GET only' }, 405, { ...CORS, allow: 'GET' });
   }
@@ -560,6 +606,11 @@ function handleCheck(request, env) {
       // client reads the envelope out of — see the dual-stack note under
       // §tiers & x402. Both, since 2026-08-19.
       x402_versions: [1, 2],
+      // Is the database this Worker is bound to the one its code expects?
+      // `missing: []` is a healthy deployment; anything listed is a migration
+      // that was not run, and on `payment_seen` it means every paid call is
+      // answering 503. See WORKER_TABLES and README § Deploy runbook.
+      schema: await schemaCheck(env),
       matches: matches.map((e) => ({
         id: e.id,
         x: e.x,
@@ -682,6 +733,11 @@ async function handleConvert(request, env, path, ctx) {
   // The single-use claim this request holds, if it took one. Null once it has
   // been handed back — and null on the replay path, which never owned it.
   let paymentHash = null;
+
+  // Why the claim could not be written, when it could not be written at all:
+  // `claim-failed:<sqlite message>`, the ledger's word for a verified payment we
+  // served without ever being able to mark it spent. Null on every healthy call.
+  let claimFailure = null;
 
   /**
    * Hand the payment claim back, then answer.
@@ -893,7 +949,41 @@ async function handleConvert(request, env, path, ctx) {
         // ONLY CHARGED FOR CONVERSIONS THAT ARE SERVED, and a payment consumed
         // is a charge whether or not a settlement followed it.
         paymentHash = await sha256Hex(payment.raw);
-        if (!(await claimPaymentOnce(db, paymentHash, now, id))) {
+
+        // THE CLAIM MUST NOT FAIL CLOSED, and this is the whole reason this
+        // branch has a try of its own. A payment the facilitator has already
+        // said yes to is a buyer who did everything right; turning them away
+        // because OUR table is missing is the same availability failure the
+        // unreachable-facilitator path exists to prevent, and it is worse,
+        // because the fault is entirely ours. Measured: between 2026-09-07 and
+        // 2026-09-18 this INSERT threw into handleConvert's catch on every real
+        // payment — `payment_seen` had never been created on the production D1
+        // — and the service answered 503 to every buyer for eleven days while
+        // continuing to serve junk headers free. Availability-first is the
+        // property's rule, so a claim that cannot be written degrades instead.
+        //
+        // A DUPLICATE IS NOT AN ERROR HERE: claimPaymentOnce uses ON CONFLICT DO
+        // NOTHING, so a replay comes back `false` without throwing. Anything
+        // that throws is a real store failure — a missing table, an unreachable
+        // D1 — and only that reaches the catch. The replay stays a refusal.
+        let claimed;
+        try {
+          claimed = await claimPaymentOnce(db, paymentHash, now, id);
+        } catch (err) {
+          // The claim is DROPPED rather than held, so `abandon` does not try to
+          // release a row this request has no reason to believe it owns. Almost
+          // always nothing was written. The one case that leaves litter is a
+          // write that COMMITTED and then failed on the way back — that row is
+          // then unreleasable and its authorization is spent, which is the rarer
+          // half of a store already misbehaving. Releasing regardless would be
+          // worse: on a racing replay it would hand a live payment to whoever
+          // else was holding it.
+          paymentHash = null;
+          claimed = null; // neither owned nor replayed — degraded
+          claimFailure = `claim-failed:${oneLineMessage(err).slice(0, 80)}`;
+        }
+
+        if (claimed === false) {
           // Not ours to release: the request that owns it is the one that
           // claimed it, and releasing here would hand a live payment back to
           // whoever replayed it.
@@ -907,25 +997,57 @@ async function handleConvert(request, env, path, ctx) {
           return paymentAlreadyUsed(offer, conv);
         }
 
-        outcome = { kind: 'paid', presented };
-        settle = {
-          requirements,
-          facRequirements,
-          version: payment.version,
-          // The rail this payment is on, for the alert's explorer link. It is
-          // taken from the requirements we SELECTED, never from the payload —
-          // the caller does not get to relabel which chain it paid on.
-          network: facRequirements.network,
-          payload: verdict.payload,
-          payer: verdict.payer,
-          tool: id,
-          // Carried through for the analytics event settleAndRecord() fires, and
-          // for nothing else: it is read only for its user-agent and country
-          // headers, exactly as everywhere else this Worker hands a request to
-          // analytics. The body has already been consumed by the time that runs.
-          request,
-          priceUsd: shed.price_usd,
-        };
+        if (claimed === null) {
+          // SERVED, and deliberately NOT SETTLED. The conversion goes out
+          // because the buyer paid for it; the settlement is skipped because
+          // without the claim this authorization has no single-use guarantee at
+          // all, and charging for a call we cannot bound is the wrong side to
+          // err on — the ledger row records the whole thing as the documented
+          // "served, never settled" exposure instead. The owner is paged on the
+          // same deferred slot the served-unverified path uses, and the wording
+          // says the CLAIM failed rather than the payment: the facilitator said
+          // yes, our store did not.
+          outcome = { kind: 'degraded', presented, error: 'claim-unavailable' };
+          await recordSettlementSafely(db, {
+            now,
+            tool: id,
+            payer: verdict.payer,
+            amount: requirements.maxAmountRequired,
+            verifyOk: 1,
+            settleOk: 0,
+            txHash: null,
+            error: claimFailure,
+          });
+          alert = {
+            kind: 'claim-failed',
+            tool: id,
+            payer: verdict.payer,
+            amount: requirements.maxAmountRequired,
+            network: facRequirements.network,
+            error: claimFailure,
+          };
+        } else {
+          outcome = { kind: 'paid', presented };
+          settle = {
+            requirements,
+            facRequirements,
+            version: payment.version,
+            // The rail this payment is on, for the alert's explorer link. It is
+            // taken from the requirements we SELECTED, never from the payload —
+            // the caller does not get to relabel which chain it paid on.
+            network: facRequirements.network,
+            payload: verdict.payload,
+            payer: verdict.payer,
+            tool: id,
+            // Carried through for the analytics event settleAndRecord() fires,
+            // and for nothing else: it is read only for its user-agent and
+            // country headers, exactly as everywhere else this Worker hands a
+            // request to analytics. The body has already been consumed by the
+            // time that runs.
+            request,
+            priceUsd: shed.price_usd,
+          };
+        }
       } else {
         // UNREACHABLE / UNCONFIGURED. Availability-first: the price is a signal
         // until the payment infrastructure is reliable, so the caller is served
@@ -1202,6 +1324,16 @@ function servedHeaders({ kind, presented, remaining, error }) {
     if (presented) headers['x-payment-verified'] = 'false';
   } else if (kind === 'paid') {
     headers['x-payment-verified'] = 'true';
+  } else if (kind === 'degraded') {
+    // VERIFIED, SERVED, AND NOT CHARGED. The facilitator returned isValid — so
+    // the "nothing is ever fake-verified" invariant holds and this really is a
+    // `true` — but the single-use claim could not be written, so nothing was
+    // settled and nothing will be. All three facts go out rather than one:
+    // `false` here would say the payment was never checked, which is the one
+    // thing that did work.
+    headers['x-payment-verified'] = 'true';
+    headers['x-payment-error'] = error;
+    headers['x-pricing'] = 'pending';
   } else {
     // Served, unverified — a payment was presented and could not be checked.
     headers['x-payment-verified'] = 'false';
@@ -2479,6 +2611,10 @@ function isHousePayer(env, payer) {
  *                             facilitator refused the payment, or it verified
  *                             and then failed to settle. Money that did not
  *                             arrive, which is why it is not a 💰.
+ *   🚨 LOST CONVERSION … claim FAILED …   the payment verified and our own
+ *                             single-use claim could not be written, so the
+ *                             conversion went out unbilled and unbounded. Also
+ *                             money that did not arrive, and OUR fault.
  */
 function alertHeadline(env, alert) {
   const amount = formatUsdc(alert.amount);
@@ -2498,6 +2634,19 @@ function alertHeadline(env, alert) {
     return (
       `⚠️ SERVED WITHOUT VERIFICATION${house ? ' (test payer)' : ''} — ` +
       `${amount} ${alert.tool} — payer ${payer} — x-payment-error: ${alert.error}`
+    );
+  }
+
+  if (alert.kind === 'claim-failed') {
+    // A DIFFERENT SENTENCE ON PURPOSE. The payment was fine — the facilitator
+    // checked it and said yes — and OUR store could not record it, so the
+    // headline must not read as "the buyer's payment failed". It is the line
+    // that would have named the 2026-09-07 migration in the first hour, so it
+    // says the store, and it keeps 🚨 because it is unbounded free serving until
+    // someone fixes it.
+    return (
+      `${LOST_CONVERSION}${house ? ' (test payer)' : ''} — ${amount} ${alert.tool} — payer ${payer} — ` +
+      `payment VERIFIED, single-use claim FAILED: ${alert.error}`
     );
   }
 
@@ -2539,6 +2688,18 @@ function alertMessage(env, alert) {
     lines.push('This conversion was SERVED and the payment was never checked, so');
     lines.push('nobody paid for it. Serving anyway is deliberate (availability-first');
     lines.push('at these prices), but a run of these is the paid rail quietly down.');
+  } else if (alert.kind === 'claim-failed') {
+    lines.push('checked  yes — the facilitator returned isValid');
+    lines.push(`claim    FAILED — ${alert.error}`);
+    lines.push('settled  NO — a payment we cannot mark spent is not charged for');
+    lines.push('');
+    lines.push('THE PAYMENT WAS GOOD AND OUR STORE WAS NOT. The single-use claim');
+    lines.push('(payment_seen) could not be written, so the conversion was served');
+    lines.push('anyway — availability-first — and nothing was settled. Until this is');
+    lines.push('fixed the same authorization can buy conversions over and over, and');
+    lines.push('none of them is billed. The usual cause is a migration that was not');
+    lines.push('run: check GET /check for a `schema.missing` entry, then apply');
+    lines.push('worker/schema.sql to the live database (README § Deploy runbook).');
   } else {
     lines.push('checked  yes — the facilitator returned isValid');
     lines.push(

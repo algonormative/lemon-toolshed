@@ -446,6 +446,50 @@ describe('a call served without verification is its own alarm', () => {
       `a call that was never served raised a leak alert: ${JSON.stringify(telegram.sends().map((h) => h.text))}`
     );
   });
+
+  test('a claim the store could not write says so, and does not blame the payment', async () => {
+    // The 2026-09-07 incident's missing sentence. `payment_seen` was never
+    // created on production, so the claim INSERT threw and every paid call
+    // 503'd for eleven days with nothing saying why. The conversion is now
+    // served anyway — availability-first, and the fault is ours — and THIS is
+    // the line that would have named the migration in the first hour. It must
+    // not read as "the buyer's payment failed", because the payment verified.
+    facilitator.reset();
+    telegram.reset();
+    facilitator.verifiedAs(THIRD_PARTY_PAYER);
+    // The restore is read back out of sqlite_master rather than retyped, so a
+    // column added to payment_seen in worker/schema.sql cannot leave this suite
+    // putting back a table shaped differently from the one it dropped — which
+    // would surface as a confusing failure in whichever test ran next.
+    const [ddl] = await worker.d1("SELECT sql FROM sqlite_master WHERE name = 'payment_seen';");
+    await worker.d1('DROP TABLE payment_seen;');
+
+    try {
+      const res = await api.convert('md-html', '# hi\n', {
+        ip: ips.pinned(7),
+        ua: 'alerts-suite/1',
+        headers: { 'x-payment': paymentHeader() },
+      });
+      assert.equal(res.status, 200, `a verified payment was refused for our own missing table: ${res.text}`);
+      assert.equal(res.headers.get('x-payment-verified'), 'true');
+      assert.equal(res.headers.get('x-payment-error'), 'claim-unavailable');
+
+      const hit = await awaitTelegram(telegram, () => true, 'the claim-failure alert');
+      assert.match(hit.text, /claim FAILED/, 'the alert does not say the claim failed');
+      assert.match(hit.text, /no such table/i, 'the alert does not carry the store error');
+      assert.match(hit.text, /VERIFIED/, 'the alert does not say the payment itself was good');
+      assert.match(hit.text, /schema\.missing|schema\.sql/, 'the alert does not say where to look');
+      assert.match(hit.text, /md-html/);
+      // It is not either of the other two stories.
+      assert.ok(!/THIRD PARTY PAID/.test(hit.text), 'an unbillable serve was announced as a sale');
+      assert.ok(
+        !/SERVED WITHOUT VERIFICATION/.test(hit.text),
+        'a verified payment was announced as never having been checked'
+      );
+    } finally {
+      await worker.d1(`${ddl.sql};`);
+    }
+  });
 });
 
 // ------------------------------------------------------------------ lost conversions

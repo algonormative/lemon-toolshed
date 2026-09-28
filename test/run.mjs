@@ -68,6 +68,16 @@ const PHASES = [
     files: ['test/surfaces.test.mjs'],
   },
   {
+    // STANDALONE because it DROPs tables out from under the running Worker and
+    // puts them back: on a shared phase worker, whichever suite ran next would
+    // fail for reasons that had nothing to do with it. No dev vars — /check
+    // reports the schema whatever the payment configuration is.
+    name: 'schema self-check (/check against a database missing a table)',
+    standalone: true,
+    note: 'boots its own worker: tables are dropped and restored on its own fresh D1',
+    files: ['test/schema-check.test.mjs'],
+  },
+  {
     // STANDALONE, same shape as machine surfaces above and for a sharper
     // reason: the registry ownership files are answered out of env vars whose
     // values are fixed for the life of a `wrangler dev` process, and the suite
