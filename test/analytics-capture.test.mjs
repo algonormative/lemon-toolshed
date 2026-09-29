@@ -253,6 +253,31 @@ describe('every event in the funnel reaches PostHog from a booted worker', () =>
     assert.equal(posthog.hits.length, 1, `expected one capture, saw ${JSON.stringify(posthog.hits.map((h) => h.event))}`);
   });
 
+  // A GET or HEAD probe is the same quote as an unpaid POST — the terms go out
+  // from the same builder, so the funnel must count them the same way.
+  for (const [method, n] of [['GET', 6], ['HEAD', 7]]) {
+    test(`an unpaid ${method} 402 captures one quote issued`, async () => {
+      posthog.reset();
+      facilitator.reset();
+      const caller = ip(n);
+
+      const res = await paid.request('/convert/md-html', { method, ip: caller, ua: UA });
+      assert.equal(res.status, 402);
+      await res.arrayBuffer();
+
+      const hit = await awaitCapture(posthog, EVENTS.quoteIssued);
+      assertEnvelope(hit, { distinctId: edgeId(caller), house: false });
+      const props = hit.body.properties;
+      assert.equal(props.path, '/convert/md-html');
+      assert.equal(props.tool, 'md-html');
+      assert.equal(props.price_usd, 0.004, 'the quote does not carry the catalog price');
+
+      await settleFor();
+      assert.equal(posthog.hits.length, 1, `expected one capture, saw ${JSON.stringify(posthog.hits.map((h) => h.event))}`);
+      assert.equal(facilitator.hits.length, 0, 'a GET quote reached the facilitator');
+    });
+  }
+
   test('a refusal captures one call refused, with a closed-vocabulary reason', async () => {
     posthog.reset();
     facilitator.reset();

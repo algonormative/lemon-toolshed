@@ -122,7 +122,7 @@ export function shouldCapture(event, request, _properties = {}, env = {}) {
  * vigilance. test/analytics.test.mjs asserts both halves.
  */
 export const REFUSAL_REASONS = [
-  'method-not-allowed', // 405 — anything but POST
+  'method-not-allowed', // 405 — not POST/GET/HEAD, or a payment presented on GET/HEAD
   'unknown-tool', // 404 — no hosted entry with that id
   'not-implemented', // 501 — listed with no converter behind it
   'body-too-large', // 413 — declared or actual, over MAX_CONVERT_BODY

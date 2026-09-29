@@ -504,11 +504,12 @@ export default {
     // 308, NOT 301, AND THAT IS THE ONE PLACE THIS DIFFERS FROM penny402's
     // version of the same fix (74057db, 2026-09-15). penny402 sends 301, which
     // is right for its motivating case — dropping `www.` on a GET. Ours is a
-    // POST: every paid route on this service is POST-only, and 301 and 302
-    // both permit a client to re-issue the request as a GET without its body,
-    // which turns "retry over https" into a 405 with the buyer's file gone. 308
-    // is the one redirect that REQUIRES the method and body be preserved, so a
-    // retrying client lands on the same POST it meant to make.
+    // POST: every paid route on this service sells only on POST, and 301 and
+    // 302 both permit a client to re-issue the request as a GET without its
+    // body, which turns "retry over https" into a terms-only 402 (a 405 if a
+    // payment rode along) with the buyer's file gone. 308 is the one redirect
+    // that REQUIRES the method and body be preserved, so a retrying client
+    // lands on the same POST it meant to make.
     //
     // THE PORT IS DROPPED WITH THE SCHEME. A plain-HTTP request can name :80 or
     // a dev port, and carrying either onto https points the client at something
@@ -759,12 +760,56 @@ async function handleCheck(request, env) {
   );
 }
 
+// GET/HEAD on /convert/<id>: the terms, never a sale.
+//
+// Siblings (10x402, kino402, penny402) answer a GET probe with a terms-only
+// 402, and README promises a spec-valid 402 on the first unauthenticated
+// request — which a crawler's first request usually is, and usually a GET. So
+// an unpaid GET gets exactly the envelope an unpaid POST gets: the same
+// overQuota() → paymentRequired() builder, so the `accepts` cannot drift
+// between verbs, and the same meterOffer() so the quote is counted.
+//
+// tier is pinned to 0 on purpose. A GET carries no body, so there is nothing
+// the free tier could ever convert for it; on a FREE_TIER_DAILY deployment the
+// honest answer to "what does this cost" is still the terms, not a "free tier
+// is N per day" 429 that describes an allowance a GET cannot use. It also keeps
+// this path off D1 entirely — no salt, no quota claim, no events row.
+//
+// A payment presented on GET/HEAD is REFUSED UNSETTLED: no verify, no settle,
+// no facilitator call, no ledger row. There is no conversion to deliver for
+// it, so settling would take money for nothing, and verifying would spend a
+// facilitator round trip on a request we already know we will not serve.
+async function askTerms(env, ctx, request, entry, conv, { presented, shed, refuse, allow }) {
+  const head = request.method === 'HEAD';
+  // HEAD mirrors GET's status and headers with no body (RFC 9110 §9.3.2); the
+  // payment-required header survives, which is all a v2 client reads anyway.
+  const bodiless = (res) => (head ? new Response(null, { status: res.status, headers: res.headers }) : res);
+
+  if (presented) {
+    return bodiless(
+      refuse(
+        'method-not-allowed',
+        json({ error: 'sells on POST — a payment on GET is refused unsettled' }, 405, { allow })
+      )
+    );
+  }
+
+  const price = entry.hosted.price;
+  const offer = await overQuota(env, entry, conv, { payTo: env.PAYTO || '', tier: 0 });
+  return bodiless(meterOffer(env, ctx, request, offer, shed, { tier: 0, price }));
+}
+
 // ------------------------------------------------------------------ /convert
 //
 // Order of checks is the reject discipline, cheapest first: method, then whether
 // the id exists, then the declared size, then — for the unpaid call, which is
 // now the common one — the 402 envelope. All of that happens before the
 // rate-limit round trip, the body read and the conversion itself.
+//
+// "Method" is a classification, not a gate. POST is the only verb that buys.
+// GET and HEAD are ASKING — a crawler, an indexer or a cautious buyer probing
+// the price before sending a file — and they get the same 402 terms a bare
+// POST would, from the same code path. Every other verb is a 405.
 //
 // The 402 sits AFTER the size check and BEFORE any store access on purpose:
 // rejecting on a declared content-length is cheaper than building an envelope,
@@ -786,10 +831,17 @@ async function handleConvert(request, env, path, ctx) {
     return response;
   };
 
-  if (request.method !== 'POST') {
+  // A 405's Allow must name every method the resource supports (RFC 9110
+  // §15.5.6), and GET/HEAD are supported now — they answer the terms. A client
+  // that reads only Allow would otherwise conclude the terms are unreachable.
+  // The error text is what tells a buyer that POST is the verb that buys.
+  const ALLOW = 'POST, GET, HEAD';
+  const asking = request.method === 'GET' || request.method === 'HEAD';
+
+  if (request.method !== 'POST' && !asking) {
     return refuse(
       'method-not-allowed',
-      json({ error: 'POST the input as the request body' }, 405, { allow: 'POST' })
+      json({ error: 'POST the input as the request body' }, 405, { allow: ALLOW })
     );
   }
 
@@ -804,17 +856,19 @@ async function handleConvert(request, env, path, ctx) {
     return refuse('not-implemented', json({ error: `conversion "${id}" is listed but not implemented` }, 501));
   }
 
+  // "Presented" spans both protocol versions and stays header-cheap: the value
+  // is not decoded here, only counted, because this runs in front of the 402
+  // fast path where the whole point is to do nothing.
+  const presented = !!(request.headers.get(PAYMENT_HEADER_V2) || request.headers.get(PAYMENT_HEADER_V1));
+
+  if (asking) return askTerms(env, ctx, request, entry, conv, { presented, shed, refuse, allow: ALLOW });
+
   const declared = Number(request.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > MAX_CONVERT_BODY) return refuse('body-too-large', tooLarge());
 
   // The paid tier needs BOTH halves: an address to pay to, and a payment
-  // presented. Either alone leaves the caller unpaid.
-  //
-  // "Presented" spans both protocol versions and stays header-cheap: the value
-  // is not decoded here, only counted, because this runs in front of the 402
-  // fast path where the whole point is to do nothing.
+  // presented (computed above). Either alone leaves the caller unpaid.
   const payTo = env.PAYTO || '';
-  const presented = !!(request.headers.get(PAYMENT_HEADER_V2) || request.headers.get(PAYMENT_HEADER_V1));
   const tier = freeTierDaily(env);
 
   // THE 402 IS THE FRONT DOOR, and answering it is the cheapest thing this

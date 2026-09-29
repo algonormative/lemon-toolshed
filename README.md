@@ -818,10 +818,10 @@ envelope and no redirect.
 
 **Why 308 and not 301.** penny402 shipped the same fix on 2026-09-15 with a
 301, which is right for its case — dropping `www.` on a GET. Every paid route
-here is **POST-only**, and 301 and 302 both permit a client to re-issue the
-request as a GET *without its body*, which turns "retry over https" into a 405
-with the buyer's file gone. 308 is the redirect that requires the method and
-body be preserved.
+here sells only on **POST**, and 301 and 302 both permit a client to re-issue
+the request as a GET *without its body*, which turns "retry over https" into a
+terms-only 402 (or, with a payment attached, a 405) with the buyer's file gone.
+308 is the redirect that requires the method and body be preserved.
 
 **No HSTS header is set by this Worker**, on purpose: `includeSubDomains` is a
 decision for every host on the zone rather than for the one route family this
@@ -897,9 +897,22 @@ purpose: rejecting on a declared `content-length` is cheaper than constructing
 an envelope, so a caller sending 300 KB is told the size is the problem rather
 than asked to pay for a call that could never have run.
 
+**`GET` and `HEAD` ask for the terms; only `POST` buys.** A crawler's or a
+cautious buyer's first request is usually a GET, and the siblings (10x402,
+kino402, penny402) answer it with a terms-only 402 — so an unpaid GET on
+`/convert/<id>` gets the same 402 an unpaid POST gets (same `accepts`, same
+`PAYMENT-REQUIRED` header, counted as a quote), and HEAD the same status and
+headers with no body. The free tier never serves a GET — there is no body to
+convert — so a `FREE_TIER_DAILY` deployment still answers GET with the terms.
+A GET or HEAD that *carries* a payment header is a **405** "sells on POST — a
+payment on GET is refused unsettled": no facilitator call, no ledger row, no
+D1 at all.
+
 | checked | when it fires | answer |
 | --- | --- | --- |
-| method | anything but `POST` | **405** + `Allow: POST` |
+| method | anything but `POST`, `GET` or `HEAD` | **405** + `Allow: POST, GET, HEAD` |
+| method | `GET`/`HEAD` with no payment header | the unpaid-POST answer below (**402** with `PAYTO` set), after the id and implementation checks |
+| method | `GET`/`HEAD` with `X-PAYMENT` or `PAYMENT-SIGNATURE` | **405**, refused unsettled — the facilitator is never asked |
 | id | no hosted entry with that id | **404**, pointing at `GET /check` |
 | implementation | listed `live` with no converter behind it | **501** |
 | declared size | `content-length` over 256 KB | **413** — before the envelope, before any D1, before the body is read |

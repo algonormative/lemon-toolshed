@@ -191,8 +191,57 @@ describe('the 402 is the front door', () => {
     assert.equal(unknown.status, 404);
     assert.match(unknown.json().error, /\/check/);
 
-    const wrongMethod = await api.request('/convert/md-html', { method: 'GET' });
+    const wrongMethod = await api.request('/convert/md-html', { method: 'PUT', body: 'x' });
     assert.equal(wrongMethod.status, 405);
+    assert.ok(!wrongMethod.headers.get('payment-required'), 'a 405 carried payment terms');
+
+    // An unknown id stays a 404 on GET too — the terms path resolves the entry
+    // before it offers anything.
+    const unknownGet = await api.request('/convert/not-a-real-tool', { method: 'GET', ip: ips.next() });
+    assert.equal(unknownGet.status, 404);
+    assert.ok(!unknownGet.headers.get('payment-required'), 'an unknown id on GET was offered terms');
+  });
+});
+
+// A crawler, an indexer or a cautious buyer asks with GET before it sends a
+// file. README promises a spec-valid 402 on the first unauthenticated request,
+// and the siblings (10x402, kino402, penny402) answer that GET with terms — so
+// the GET 402 must be the POST 402, rail for rail. Compared against a live POST
+// rather than a fixture, so the two verbs cannot drift apart unnoticed.
+describe('GET and HEAD answer the same terms as POST', () => {
+  const v2Of = (res) => JSON.parse(Buffer.from(res.headers.get('payment-required'), 'base64').toString('utf8'));
+
+  test('every live tool answers an unpaid GET and HEAD with the POST envelope', async () => {
+    assert.equal(HOSTED_IDS.length, 19, 'the catalog changed size — this suite asserts over every paid route');
+    for (const id of HOSTED_IDS) {
+      const post = await api.convert(id, INPUTS[id], { ip: ips.next(), ua: 'tier-off-suite/1' });
+      assert.equal(post.status, 402, `${id}: POST did not 402: ${post.status}`);
+
+      const get = await api.request(`/convert/${id}`, { method: 'GET', ip: ips.next(), ua: 'tier-off-suite/1' });
+      assert.equal(get.status, 402, `${id}: an unpaid GET answered ${get.status}`);
+      assert.ok(get.headers.get('payment-required'), `${id}: the GET 402 has no PAYMENT-REQUIRED header`);
+      const getBody = await get.json();
+      assert.equal(getBody.x402Version, 1);
+      assert.deepEqual(getBody.accepts, post.json().accepts, `${id}: v1 accepts differ between GET and POST`);
+      assert.deepEqual(v2Of(get).accepts, v2Of(post).accepts, `${id}: v2 accepts differ between GET and POST`);
+
+      const head = await api.request(`/convert/${id}`, { method: 'HEAD', ip: ips.next(), ua: 'tier-off-suite/1' });
+      assert.equal(head.status, 402, `${id}: an unpaid HEAD answered ${head.status}`);
+      assert.equal(await head.text(), '', `${id}: HEAD returned a body`);
+      assert.ok(head.headers.get('payment-required'), `${id}: the HEAD 402 has no PAYMENT-REQUIRED header`);
+      assert.deepEqual(v2Of(head).accepts, v2Of(post).accepts, `${id}: v2 accepts differ between HEAD and POST`);
+    }
+  });
+
+  test('a GET quote touches no store', async () => {
+    const before = (await worker.d1('SELECT COUNT(*) AS n FROM events;'))[0].n;
+    for (let i = 0; i < 5; i++) {
+      const res = await api.request('/convert/md-html', { method: 'GET', ip: ips.next() });
+      assert.equal(res.status, 402);
+      await res.arrayBuffer();
+    }
+    const after = (await worker.d1('SELECT COUNT(*) AS n FROM events;'))[0].n;
+    assert.equal(after, before, 'a GET quote wrote an events row');
   });
 });
 
