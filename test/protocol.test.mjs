@@ -230,11 +230,28 @@ describe('GET /check', () => {
 });
 
 describe('POST /convert routing', () => {
-  test('GET /convert/<id> is a 405 that says which method to use', async () => {
-    const res = await api.request('/convert/md-html', { method: 'GET' });
+  test('a verb other than POST/GET/HEAD is a 405 that says which method to use', async () => {
+    const res = await api.request('/convert/md-html', { method: 'PUT', body: 'x' });
     assert.equal(res.status, 405);
-    assert.equal(res.headers.get('allow'), 'POST');
+    assert.equal(res.headers.get('allow'), 'POST, GET, HEAD');
     assert.match((await res.json()).error, /POST the input/);
+  });
+
+  test('GET /convert/<id> asks for terms, and the free tier never serves it', async () => {
+    // This worker has the free tier ON and no PAYTO. A GET carries no body, so
+    // there is nothing to convert: it must not be served, must not spend the
+    // caller's allowance, and must not answer the "free tier is N per day" 429
+    // that describes an allowance a GET cannot use. With no receiving address
+    // the terms are the no-payto 429, exactly what an unpaid POST would get on
+    // a tier-off deployment with PAYTO unset.
+    const before = (await worker.d1('SELECT COUNT(*) AS n FROM events;'))[0].n;
+    const res = await api.request('/convert/md-html', { method: 'GET', ip: ips.next() });
+    assert.equal(res.status, 429);
+    const body = await res.json();
+    assert.match(body.error, /no receiving address configured/);
+    assert.equal(res.headers.get('x-free-tier-remaining'), null, 'a GET reported a free-tier allowance');
+    const after = (await worker.d1('SELECT COUNT(*) AS n FROM events;'))[0].n;
+    assert.equal(after, before, 'a GET wrote an events row');
   });
 
   test('an unknown id is a 404 that points at /check', async () => {

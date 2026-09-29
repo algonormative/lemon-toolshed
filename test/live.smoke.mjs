@@ -219,12 +219,14 @@ await check('POST /convert/md-html answers correctly for whatever tier this call
 //
 // Refusals, not conversions: none of these reaches the free-tier counter.
 
-await check('POST /check is a 405 and GET /convert/md-html is a 405', async () => {
+await check('POST /check is a 405 and PUT /convert/md-html is a 405', async () => {
   const post = await fetch(`${BASE}/check`, { method: 'POST' });
   assert(post.status === 405, `POST /check answered ${post.status}`);
-  const get = await fetch(`${BASE}/convert/md-html`);
-  assert(get.status === 405, `GET /convert/md-html answered ${get.status}`);
-  assert(get.headers.get('allow') === 'POST', 'the 405 does not say which method to use');
+  // GET on /convert asks for terms now (a 402, or the no-payto 429), so the
+  // wrong-verb probe is PUT. The Allow header lists every supported verb.
+  const put = await fetch(`${BASE}/convert/md-html`, { method: 'PUT', body: 'x' });
+  assert(put.status === 405, `PUT /convert/md-html answered ${put.status}`);
+  assert(put.headers.get('allow') === 'POST, GET, HEAD', 'the 405 does not say which methods to use');
   return 'both refused, with Allow headers';
 });
 

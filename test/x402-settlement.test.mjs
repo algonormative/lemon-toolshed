@@ -311,6 +311,48 @@ describe('an unpaid call never reaches the facilitator', () => {
   });
 });
 
+// GET and HEAD are how a buyer ASKS; only POST buys. A payment carried on a
+// GET has no conversion to deliver against it, so it must be refused before
+// the facilitator is ever reached — verifying would spend a round trip on a
+// request we will not serve, and settling would take money for nothing.
+describe('a payment on GET is refused unsettled', () => {
+  test('an unpaid GET is the 402 and never reaches the facilitator', async () => {
+    mock.reset();
+    const res = await api.request('/convert/md-html', { method: 'GET', ip: ips.pinned(50), ua: 'settlement-suite/1' });
+    assert.equal(res.status, 402, `expected the 402 terms on GET, got ${res.status}`);
+    assert.ok(res.headers.get('payment-required'), 'the GET 402 has no PAYMENT-REQUIRED header');
+    await res.arrayBuffer();
+    assert.equal(mock.hits.length, 0, `an unpaid GET reached the facilitator: ${JSON.stringify(mock.hits)}`);
+  });
+
+  test('GET or HEAD with a v1 or v2 payment header is a 405 with zero facilitator calls and no ledger row', async () => {
+    const before = (await settlements()).length;
+    const v2 = await paymentHeaderV2(api, 'md-html', { ip: ips.pinned(51) });
+    mock.reset();
+
+    const cases = [
+      ['GET', { 'x-payment': paymentHeader() }],
+      ['GET', { 'payment-signature': v2 }],
+      ['HEAD', { 'x-payment': paymentHeader() }],
+    ];
+    for (const [method, headers] of cases) {
+      const res = await api.request('/convert/md-html', { method, ip: ips.pinned(52), ua: 'settlement-suite/1', headers });
+      const text = await res.text();
+      const label = `${method} ${Object.keys(headers)[0]}`;
+      assert.equal(res.status, 405, `${label}: expected 405, got ${res.status}: ${text}`);
+      assert.equal(res.headers.get('payment-required'), null, `${label}: a refused payment was re-offered terms`);
+      if (method === 'HEAD') assert.equal(text, '', 'HEAD returned a body');
+      else assert.match(JSON.parse(text).error, /sells on POST — a payment on GET is refused unsettled/);
+    }
+
+    // Settlement would run in ctx.waitUntil, so give a wrongly-queued one time
+    // to land before counting.
+    await new Promise((r) => setTimeout(r, 1_500));
+    assert.equal(mock.hits.length, 0, `a payment on GET reached the facilitator: ${JSON.stringify(mock.hits)}`);
+    assert.equal((await settlements()).length, before, 'a payment on GET wrote a settlements row');
+  });
+});
+
 describe('verify says yes', () => {
   test('the conversion is served, marked verified, and settles afterwards', async () => {
     mock.reset();
