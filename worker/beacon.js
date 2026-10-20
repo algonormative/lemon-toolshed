@@ -824,7 +824,6 @@ async function askTerms(env, ctx, request, entry, conv, { presented, shed, refus
 // scope and untouched.
 const SITE_ORIGIN = 'https://toolshed.lemon-agent.dev';
 const CONVERT_ALLOW = 'POST, GET, HEAD, OPTIONS';
-const PAYMENT_CORS_HEADERS = 'content-type, x-payment, payment-signature';
 const SEE_ALSO = [
   { name: 'kino402', url: 'https://kino402.com', what: 'video and speech generation over x402' },
 ];
@@ -886,20 +885,10 @@ async function handleConvert(request, env, path, ctx) {
   // and it changes no behaviour.
   const id = path.slice('/convert/'.length);
 
-  // CORS PREFLIGHT / capability probe: 204, no body, the verbs in Allow. Not a
-  // refusal, so no analytics event. CORS headers match what the rest of the
-  // worker already emits (allow-origin *), plus the payment headers a browser
-  // client would send.
+  // Capability probe: 204, no body, the verbs in Allow. Not a refusal, so no
+  // analytics event. No CORS headers: /convert emits none on any response.
   if (request.method === 'OPTIONS') {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        ...CORS,
-        allow: CONVERT_ALLOW,
-        'access-control-allow-methods': CONVERT_ALLOW,
-        'access-control-allow-headers': PAYMENT_CORS_HEADERS,
-      },
-    });
+    return new Response(null, { status: 204, headers: { allow: CONVERT_ALLOW } });
   }
 
   // PATH FORGIVENESS: an id that differs from a hosted id only by case or a
@@ -911,7 +900,7 @@ async function handleConvert(request, env, path, ctx) {
       const search = new URL(request.url).search;
       return new Response(null, {
         status: 308,
-        headers: { location: `${SITE_ORIGIN}/convert/${canonical}${search}`, ...CORS },
+        headers: { location: `${SITE_ORIGIN}/convert/${canonical}${search}` },
       });
     }
   }

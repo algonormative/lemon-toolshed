@@ -247,9 +247,7 @@ describe('POST /convert routing', () => {
     assert.equal(res.status, 204);
     assert.equal(await res.text(), '');
     assert.equal(res.headers.get('allow'), 'POST, GET, HEAD, OPTIONS');
-    assert.equal(res.headers.get('access-control-allow-methods'), 'POST, GET, HEAD, OPTIONS');
-    assert.match(res.headers.get('access-control-allow-headers'), /x-payment/);
-    assert.match(res.headers.get('access-control-allow-headers'), /payment-signature/);
+    assert.equal(res.headers.get('access-control-allow-origin'), null, '/convert emits no CORS');
     const after = (await worker.d1('SELECT COUNT(*) AS n FROM events;'))[0].n;
     assert.equal(after, before);
   });
