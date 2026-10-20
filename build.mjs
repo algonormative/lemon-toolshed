@@ -2217,6 +2217,11 @@ const wellKnownX402 = {
         url: 'https://10x402.com',
         relation: 'sibling: x402 conformance linting',
       },
+      {
+        name: 'kino402',
+        url: 'https://kino402.com',
+        relation: 'sibling: video and speech generation over x402',
+      },
     ],
   },
   // One entry per HOSTED LIVE tool — the same list openapi.json's convert paths

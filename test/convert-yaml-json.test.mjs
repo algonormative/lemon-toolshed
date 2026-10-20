@@ -76,6 +76,10 @@ describe('yaml-json — constructs json-yaml never emits', () => {
     const res = await toJson('a: *missing\n');
     assert.equal(res.status, 400, res.text);
     assert.match(res.json().error, /not valid YAML/);
+    const body = res.json();
+    assert.equal(body.field, 'body');
+    assert.equal(body.docs, 'https://toolshed.lemon-agent.dev/check');
+    assert.equal(body.see_also[0].name, 'kino402');
   });
 
   test('comments are stripped', async () => {

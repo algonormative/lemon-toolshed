@@ -789,7 +789,7 @@ async function askTerms(env, ctx, request, entry, conv, { presented, shed, refus
     return bodiless(
       refuse(
         'method-not-allowed',
-        json({ error: 'sells on POST — a payment on GET is refused unsettled' }, 405, { allow })
+        json(refusalBody('sells on POST — a payment on GET is refused unsettled', 'method'), 405, { allow })
       )
     );
   }
@@ -816,11 +816,105 @@ async function askTerms(env, ctx, request, entry, conv, { presented, shed, refus
 // and building an envelope is cheaper than deriving a caller identity for a
 // call that is not going to be served.
 
+// ------------------------------------------------------------------ estate error contract
+//
+// Every non-payment 4xx JSON body on /convert carries the same machine-readable
+// pointers (vault-6eppa): `field` names the input at fault, `docs` the free
+// machine catalog, `see_also` the estate sibling. The 402 envelope is out of
+// scope and untouched.
+const SITE_ORIGIN = 'https://toolshed.lemon-agent.dev';
+const CONVERT_ALLOW = 'POST, GET, HEAD, OPTIONS';
+const PAYMENT_CORS_HEADERS = 'content-type, x-payment, payment-signature';
+const SEE_ALSO = [
+  { name: 'kino402', url: 'https://kino402.com', what: 'video and speech generation over x402' },
+];
+
+const refusalBody = (error, field, extra = {}) => ({
+  error,
+  field,
+  ...extra,
+  docs: `${SITE_ORIGIN}/check`,
+  see_also: SEE_ALSO,
+});
+
+// Plain Levenshtein; ids are short.
+function editDistance(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// ONE closest hosted id within edit distance 2, or null when there is none or
+// the best is tied. Never applied by the server — a suggestion only.
+function closestHostedId(raw) {
+  const needle = raw.toLowerCase();
+  let best = null;
+  let bestD = 3;
+  let tie = false;
+  for (const id of HOSTED.keys()) {
+    const d = editDistance(needle, id);
+    if (d < bestD) { best = id; bestD = d; tie = false; }
+    else if (d === bestD) tie = true;
+  }
+  return best && !tie ? best : null;
+}
+
+function unknownToolBody(id) {
+  const slash = id.indexOf('/');
+  const head = slash === -1 ? id : id.slice(0, slash);
+  const extra = { expected: `one of: ${[...HOSTED.keys()].join(', ')}` };
+  // Extra segments after a valid id: name the URL they meant.
+  const canonical = HOSTED.has(head) ? head : HOSTED.has(head.toLowerCase()) ? head.toLowerCase() : null;
+  if (slash !== -1 && canonical) {
+    extra.did_you_mean = `${SITE_ORIGIN}/convert/${canonical}`;
+  } else {
+    const near = closestHostedId(head);
+    if (near) extra.did_you_mean = near;
+  }
+  return refusalBody(`no hosted conversion with id "${id}" — see GET /check`, 'path', extra);
+}
+
 async function handleConvert(request, env, path, ctx) {
   // The id is read before the method check purely so the 405 can say WHICH tool
   // was addressed with the wrong verb. It is a string slice; it costs nothing
   // and it changes no behaviour.
   const id = path.slice('/convert/'.length);
+
+  // CORS PREFLIGHT / capability probe: 204, no body, the verbs in Allow. Not a
+  // refusal, so no analytics event. CORS headers match what the rest of the
+  // worker already emits (allow-origin *), plus the payment headers a browser
+  // client would send.
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        ...CORS,
+        allow: CONVERT_ALLOW,
+        'access-control-allow-methods': CONVERT_ALLOW,
+        'access-control-allow-headers': PAYMENT_CORS_HEADERS,
+      },
+    });
+  }
+
+  // PATH FORGIVENESS: an id that differs from a hosted id only by case or a
+  // trailing slash redirects to the canonical URL. 308 keeps method and body,
+  // and the 402's resource URL stays the canonical one.
+  if (!HOSTED.has(id)) {
+    const canonical = id.replace(/\/+$/, '').toLowerCase();
+    if (canonical && HOSTED.has(canonical)) {
+      const search = new URL(request.url).search;
+      return new Response(null, {
+        status: 308,
+        headers: { location: `${SITE_ORIGIN}/convert/${canonical}${search}`, ...CORS },
+      });
+    }
+  }
 
   // The properties every analytics event on this route carries. `entry` is not
   // known yet, so the price is filled in below once it is; a refusal that
@@ -835,19 +929,19 @@ async function handleConvert(request, env, path, ctx) {
   // §15.5.6), and GET/HEAD are supported now — they answer the terms. A client
   // that reads only Allow would otherwise conclude the terms are unreachable.
   // The error text is what tells a buyer that POST is the verb that buys.
-  const ALLOW = 'POST, GET, HEAD';
+  const ALLOW = CONVERT_ALLOW;
   const asking = request.method === 'GET' || request.method === 'HEAD';
 
   if (request.method !== 'POST' && !asking) {
     return refuse(
       'method-not-allowed',
-      json({ error: 'POST the input as the request body' }, 405, { allow: ALLOW })
+      json(refusalBody('POST the input as the request body', 'method'), 405, { allow: ALLOW })
     );
   }
 
   const entry = HOSTED.get(id);
   if (!entry) {
-    return refuse('unknown-tool', json({ error: `no hosted conversion with id "${id}" — see GET /check` }, 404));
+    return refuse('unknown-tool', json(unknownToolBody(id), 404));
   }
   shed.price_usd = entryPriceUsd(entry);
 
@@ -1310,10 +1404,10 @@ async function handleConvert(request, env, path, ctx) {
     if (buf.byteLength > MAX_CONVERT_BODY) return abandon(refuse('body-too-large', tooLarge()));
     input = new TextDecoder().decode(buf);
   } catch {
-    return abandon(refuse('bad-input', json({ error: 'could not read the request body' }, 400)));
+    return abandon(refuse('bad-input', json(refusalBody('could not read the request body', 'body'), 400)));
   }
   if (!input.trim()) {
-    return abandon(refuse('bad-input', json({ error: 'the request body is empty' }, 400)));
+    return abandon(refuse('bad-input', json(refusalBody('the request body is empty', 'body'), 400)));
   }
 
   let output;
@@ -1324,11 +1418,11 @@ async function handleConvert(request, env, path, ctx) {
     // job: a ConvertError's message is written for a human and quotes the
     // caller's own file back at them, so the class is what ships and the prose
     // stays in the response body where the caller asked for it.
-    if (err instanceof ConvertError) return abandon(refuse('bad-input', json({ error: err.message }, 400)));
+    if (err instanceof ConvertError) return abandon(refuse('bad-input', json(refusalBody(err.message, 'body'), 400)));
     // Never surface a stack trace. Anything unexpected is still the input's
     // most likely cause, so it is reported as a bad request, not as a crash.
     return abandon(
-      refuse('bad-input', json({ error: `could not convert the input: ${oneLineMessage(err)}` }, 400))
+      refuse('bad-input', json(refusalBody(`could not convert the input: ${oneLineMessage(err)}`, 'body'), 400))
     );
   }
 

@@ -233,8 +233,53 @@ describe('POST /convert routing', () => {
   test('a verb other than POST/GET/HEAD is a 405 that says which method to use', async () => {
     const res = await api.request('/convert/md-html', { method: 'PUT', body: 'x' });
     assert.equal(res.status, 405);
-    assert.equal(res.headers.get('allow'), 'POST, GET, HEAD');
-    assert.match((await res.json()).error, /POST the input/);
+    assert.equal(res.headers.get('allow'), 'POST, GET, HEAD, OPTIONS');
+    const body = await res.json();
+    assert.match(body.error, /POST the input/);
+    assert.equal(body.field, 'method');
+    assert.equal(body.docs, 'https://toolshed.lemon-agent.dev/check');
+    assert.equal(body.see_also.length, 1);
+  });
+
+  test('OPTIONS /convert/<id> is a 204 with no body and no refusal event', async () => {
+    const before = (await worker.d1('SELECT COUNT(*) AS n FROM events;'))[0].n;
+    const res = await api.request('/convert/md-html', { method: 'OPTIONS', ip: ips.next() });
+    assert.equal(res.status, 204);
+    assert.equal(await res.text(), '');
+    assert.equal(res.headers.get('allow'), 'POST, GET, HEAD, OPTIONS');
+    assert.equal(res.headers.get('access-control-allow-methods'), 'POST, GET, HEAD, OPTIONS');
+    assert.match(res.headers.get('access-control-allow-headers'), /x-payment/);
+    assert.match(res.headers.get('access-control-allow-headers'), /payment-signature/);
+    const after = (await worker.d1('SELECT COUNT(*) AS n FROM events;'))[0].n;
+    assert.equal(after, before);
+  });
+
+  test('case and trailing-slash variants 308 to the canonical URL', async () => {
+    for (const [variant, search] of [['MD-HTML', ''], ['md-html/', ''], ['Md-Html/', '?a=1']]) {
+      const res = await fetch(api.url(`/convert/${variant}${search}`), { method: 'POST', body: 'x', redirect: 'manual' });
+      assert.equal(res.status, 308, variant);
+      const loc = new URL(res.headers.get('location'));
+      assert.equal(loc.pathname, '/convert/md-html');
+      assert.equal(loc.search, search);
+    }
+  });
+
+  test('an unknown id carries field, expected, docs and see_also; a near-miss gets did_you_mean', async () => {
+    const far = (await api.convert('zzzzzzzz', 'x', { ip: ips.next() })).json();
+    assert.equal(far.field, 'path');
+    assert.match(far.expected, /^one of: .*md-html/);
+    assert.equal(far.docs, 'https://toolshed.lemon-agent.dev/check');
+    assert.equal(far.see_also[0].name, 'kino402');
+    assert.equal(far.did_you_mean, undefined);
+
+    const near = (await api.convert('md-htm', 'x', { ip: ips.next() })).json();
+    assert.equal(near.did_you_mean, 'md-html');
+  });
+
+  test('extra path segments after a valid id name the correct URL', async () => {
+    const res = await api.convert('yaml-json/.well-known/agent.json', 'x', { ip: ips.next() });
+    assert.equal(res.status, 404);
+    assert.equal(res.json().did_you_mean, 'https://toolshed.lemon-agent.dev/convert/yaml-json');
   });
 
   test('GET /convert/<id> asks for terms, and the free tier never serves it', async () => {
