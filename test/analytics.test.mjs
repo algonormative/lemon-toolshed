@@ -224,7 +224,7 @@ describe('unpaid-quote sampling', () => {
   it('keeps an unpaid quote with sample_rate when the draw is under 1/N, drops it otherwise', () => {
     const props = {};
     assert.equal(send(env(0.05), EVENTS.quoteIssued, unpaid(), props), true);
-    assert.equal(props.sample_rate, 10);
+    assert.equal('sample_rate' in props, false, "the caller's shared object is never marked");
     assert.equal(send(env(0.5), EVENTS.quoteIssued, unpaid(), {}), false);
   });
 
