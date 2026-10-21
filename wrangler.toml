@@ -111,11 +111,6 @@ routes = [
 # production dependency in the bundle. See README § "x402 v2 — dual-stack".
 #
 # [vars]
-# Keep 1 in N unpaid `x402 quote issued` events (estate sampling contract,
-# 2026-10-21). Kept events carry sample_rate: N. Paid-request events, refusals,
-# settlements and served events are never sampled; the timed firehose
-# (ANALYTICS_FULL_CAPTURE_UNTIL) switches sampling off. Unset/<1 = no sampling.
-ANALYTICS_SAMPLE_RATE = "10"
 
 # PAYTO = "0x..."            # receiving address for USDC on Base
 # PAYTO_SOLANA = "..."       # OPTIONAL. Base58 receiving address for USDC on
@@ -212,6 +207,9 @@ ANALYTICS_SAMPLE_RATE = "10"
 # as FACILITATOR_URL above. It is deliberately not set here.
 
 [vars]
+# Estate analytics sampling (vault-3u6jl): keep 1 in N of the sampled
+# classes; unset or < 1 = no sampling. See README.
+ANALYTICS_SAMPLE_RATE = "10"
 # The house's own wallets, so the owner's $0.001 test buys read as "🧪 test
 # settlement" rather than as a sale. Any payer NOT listed here gets the loud
 # "🍋💰 THIRD PARTY PAID" message — the event this whole channel exists for,
