@@ -32,6 +32,7 @@ import {
   quoteIssued,
   refusalReason,
   shouldCapture,
+  sampleRate,
   toolServed,
   usdOf,
 } from '../worker/analytics.js';
@@ -202,6 +203,60 @@ describe('narrow CarbonMonitor suppression', () => {
   it('an active deadline restores the exact monitor through shouldCapture', () => {
     const env = { ANALYTICS_FULL_CAPTURE_UNTIL: '2999-01-01T00:00:00Z' };
     assert.equal(shouldCapture(EVENTS.quoteIssued, monitor(), {}, env), true);
+  });
+});
+
+describe('unpaid-quote sampling', () => {
+  const unpaid = () => new Request('https://toolshed.lemon-agent.dev/convert/md-html', { headers: { 'user-agent': 'x/1' } });
+  const paid = () => new Request('https://toolshed.lemon-agent.dev/convert/md-html', { headers: { 'x-payment': 'p' } });
+  const env = (r, extra = {}) => ({ ANALYTICS_SAMPLE_RATE: '10', __sampleRandom: () => r, ...extra });
+  const send = (e, event, request, props = {}) => shouldCapture(event, request, props, e);
+
+  it('is off when the rate is unset, empty, non-numeric or below 1', () => {
+    for (const v of [undefined, '', 'abc', '0', '0.5', '-3']) {
+      const props = {};
+      assert.equal(send({ ANALYTICS_SAMPLE_RATE: v, __sampleRandom: () => 0.99 }, EVENTS.quoteIssued, unpaid(), props), true);
+      assert.equal('sample_rate' in props, false);
+    }
+    assert.equal(sampleRate({ ANALYTICS_SAMPLE_RATE: '10.9' }), 10);
+  });
+
+  it('keeps an unpaid quote with sample_rate when the draw is under 1/N, drops it otherwise', () => {
+    const props = {};
+    assert.equal(send(env(0.05), EVENTS.quoteIssued, unpaid(), props), true);
+    assert.equal('sample_rate' in props, false, "the caller's shared object is never marked");
+    assert.equal(send(env(0.5), EVENTS.quoteIssued, unpaid(), {}), false);
+  });
+
+  it('a dropped quote makes no network call; a kept one ships sample_rate', async () => {
+    const calls = stubFetch();
+    await quoteIssued({ POSTHOG_PROJECT_TOKEN: 't', ...env(0.5) }, null, unpaid(), SHED);
+    assert.equal(calls.length, 0);
+    await quoteIssued({ POSTHOG_PROJECT_TOKEN: 't', ...env(0.05) }, null, unpaid(), SHED);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].body.properties.sample_rate, 10);
+  });
+
+  it('never samples paid-request events, refusals, settlements or served events', async () => {
+    const e = env(0.5);
+    assert.equal(send(e, EVENTS.quoteIssued, paid()), true);
+    assert.equal(send({ ...e, ANALYTICS_SAMPLE_RATE: '10' }, EVENTS.quoteIssued, new Request('https://x', { headers: { 'payment-signature': 's' } })), true);
+    for (const event of [EVENTS.callRefused, EVENTS.paymentSettled, EVENTS.toolServed]) {
+      const props = {};
+      assert.equal(send(e, event, unpaid(), props), true);
+      assert.equal('sample_rate' in props, false);
+    }
+    const calls = stubFetch();
+    await callRefused({ POSTHOG_PROJECT_TOKEN: 't', ...e }, null, unpaid(), { ...SHED, reason: 'method-not-allowed' });
+    assert.equal(calls.length, 1);
+    assert.equal('sample_rate' in calls[0].body.properties, false);
+  });
+
+  it('is disabled while the timed full capture is active', () => {
+    const props = {};
+    assert.equal(send(env(0.5, { ANALYTICS_FULL_CAPTURE_UNTIL: '2999-01-01T00:00:00Z' }), EVENTS.quoteIssued, unpaid(), props), true);
+    assert.equal('sample_rate' in props, false);
+    assert.equal(send(env(0.5, { ANALYTICS_MONITOR_FILTER: 'off' }), EVENTS.quoteIssued, unpaid()), true);
   });
 });
 

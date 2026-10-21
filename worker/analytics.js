@@ -98,12 +98,45 @@ export function fullCaptureEnabled(env, now = Date.now()) {
   return env?.ANALYTICS_MONITOR_FILTER === 'off';
 }
 
-export function shouldCapture(event, request, _properties = {}, env = {}) {
+/**
+ * The sampling denominator N from `ANALYTICS_SAMPLE_RATE`. Unset, empty,
+ * non-numeric or < 1 means 1 (no sampling); a fraction is floored.
+ */
+export function sampleRate(env) {
+  const n = Math.floor(Number(env?.ANALYTICS_SAMPLE_RATE));
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
+/**
+ * The one capture gate: should this event be sent at all?
+ *
+ * Order: the timed full-capture override wins over everything (sampling is OFF
+ * while `npm run analytics:firehose` is active); then the routine-monitor
+ * filter; then sampling. Sampling applies to ONE class only: `x402 quote
+ * issued` on a request with no payment header. Refusals, settlements, served
+ * events and anything on a paid request are never sampled. A kept sampled event
+ * is marked `sample_rate: N` by capture(), on a COPY of its properties — the
+ * caller's object is shared across one request's events and must not carry the
+ * mark onto the next one (counts become
+ * `sum(coalesce(toFloat(properties.sample_rate), 1))`). The random source is
+ * `env.__sampleRandom` (tests only), never a global stub.
+ */
+export function shouldCapture(event, request, properties = {}, env = {}) {
   if (fullCaptureEnabled(env)) return true;
-  if (!request || !ROUTINE_MONITOR_UAS.includes(request.headers?.get?.('user-agent') || '')) return true;
-  if (request.headers?.get?.('x-payment') || request.headers?.get?.('payment-signature')) return true;
-  if (event === EVENTS.quoteIssued) return false;
-  return true;
+  const paid = Boolean(request?.headers?.get?.('x-payment') || request?.headers?.get?.('payment-signature'));
+  if (request && !paid && ROUTINE_MONITOR_UAS.includes(request.headers?.get?.('user-agent') || '')
+      && event === EVENTS.quoteIssued) return false;
+  const n = sampledRate(event, request, env);
+  if (n === 1) return true;
+  const random = typeof env?.__sampleRandom === 'function' ? env.__sampleRandom : Math.random;
+  return random() < 1 / n;
+}
+
+/** N for an event of the one sampled class (an unpaid quote), else 1. */
+export function sampledRate(event, request, env = {}) {
+  if (event !== EVENTS.quoteIssued || fullCaptureEnabled(env)) return 1;
+  if (request?.headers?.get?.('x-payment') || request?.headers?.get?.('payment-signature')) return 1;
+  return sampleRate(env);
 }
 
 /**
@@ -271,7 +304,9 @@ export function capture(env, ctx, event, properties = {}, request = null) {
   // that is allowed to be abandoned, because an unhandled rejection inside a
   // waitUntil is a Worker-level error and this file is not permitted to cause
   // one.
-  const work = send(env, event, properties, request).catch(() => {});
+  const n = sampledRate(event, request, env);
+  const marked = n > 1 ? { ...properties, sample_rate: n } : properties;
+  const work = send(env, event, marked, request).catch(() => {});
 
   // Deferred when there is a ctx, awaitable when there is not — the same shape
   // as beacon.js's own deferWork(), and correctness over latency when a direct

@@ -111,6 +111,12 @@ routes = [
 # production dependency in the bundle. See README § "x402 v2 — dual-stack".
 #
 # [vars]
+# Keep 1 in N unpaid `x402 quote issued` events (estate sampling contract,
+# 2026-10-21). Kept events carry sample_rate: N. Paid-request events, refusals,
+# settlements and served events are never sampled; the timed firehose
+# (ANALYTICS_FULL_CAPTURE_UNTIL) switches sampling off. Unset/<1 = no sampling.
+ANALYTICS_SAMPLE_RATE = "10"
+
 # PAYTO = "0x..."            # receiving address for USDC on Base
 # PAYTO_SOLANA = "..."       # OPTIONAL. Base58 receiving address for USDC on
 #                            # Solana. UNSET = the Solana rail is off and every
