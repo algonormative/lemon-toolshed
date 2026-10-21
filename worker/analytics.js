@@ -98,11 +98,38 @@ export function fullCaptureEnabled(env, now = Date.now()) {
   return env?.ANALYTICS_MONITOR_FILTER === 'off';
 }
 
-export function shouldCapture(event, request, _properties = {}, env = {}) {
+/**
+ * The sampling denominator N from `ANALYTICS_SAMPLE_RATE`. Unset, empty,
+ * non-numeric or < 1 means 1 (no sampling); a fraction is floored.
+ */
+export function sampleRate(env) {
+  const n = Math.floor(Number(env?.ANALYTICS_SAMPLE_RATE));
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
+/**
+ * The one capture gate: should this event be sent at all?
+ *
+ * Order: the timed full-capture override wins over everything (sampling is OFF
+ * while `npm run analytics:firehose` is active); then the routine-monitor
+ * filter; then sampling. Sampling applies to ONE class only: `x402 quote
+ * issued` on a request with no payment header. Refusals, settlements, served
+ * events and anything on a paid request are never sampled. A kept sampled event
+ * is stamped `sample_rate: N` on `properties` (counts become
+ * `sum(coalesce(toFloat(properties.sample_rate), 1))`). The random source is
+ * `env.__sampleRandom` (tests only), never a global stub.
+ */
+export function shouldCapture(event, request, properties = {}, env = {}) {
   if (fullCaptureEnabled(env)) return true;
-  if (!request || !ROUTINE_MONITOR_UAS.includes(request.headers?.get?.('user-agent') || '')) return true;
-  if (request.headers?.get?.('x-payment') || request.headers?.get?.('payment-signature')) return true;
-  if (event === EVENTS.quoteIssued) return false;
+  const paid = Boolean(request?.headers?.get?.('x-payment') || request?.headers?.get?.('payment-signature'));
+  if (request && !paid && ROUTINE_MONITOR_UAS.includes(request.headers?.get?.('user-agent') || '')
+      && event === EVENTS.quoteIssued) return false;
+  if (event !== EVENTS.quoteIssued || paid) return true;
+  const n = sampleRate(env);
+  if (n === 1) return true;
+  const random = typeof env?.__sampleRandom === 'function' ? env.__sampleRandom : Math.random;
+  if (!(random() < 1 / n)) return false;
+  if (properties && typeof properties === 'object') properties.sample_rate = n;
   return true;
 }
 

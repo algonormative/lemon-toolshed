@@ -1915,6 +1915,16 @@ That is the whole switch, and it takes effect on the next request. There is
 nothing to add to `wrangler.toml`: the token is a credential, and
 `POSTHOG_HOST` has no non-test reason to move.
 
+### Sampling
+
+`ANALYTICS_SAMPLE_RATE` (a `[vars]` entry in `wrangler.toml`, currently `"10"`)
+keeps 1 in N unpaid `x402 quote issued` events and drops the rest before any
+hashing or network call. Each kept event carries `sample_rate: N`. Nothing else
+is sampled: events on requests that present a payment header, refusals,
+settlements and served events are always sent. Unset, empty or below 1 means no
+sampling, and an active `analytics:firehose` window turns sampling off. Count
+quotes with `sum(coalesce(toFloat(properties.sample_rate), 1))`, not `count()`.
+
 ### Timed full capture across the fleet
 
 Routine known-monitor traffic is filtered from the high-volume analytics

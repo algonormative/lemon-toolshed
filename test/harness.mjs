@@ -297,7 +297,9 @@ export async function bootWorker({ vars = {} } = {}) {
   // 4.42.2) — so local dev is indistinguishable from production-over-http
   // inside the Worker. A suite that wants the redirect ON passes
   // `ALLOW_PLAIN_HTTP: ''`, which wins below; see test/surfaces.test.mjs.
-  const bootVars = { PAYTO_SOLANA: '', ALLOW_PLAIN_HTTP: '1', ...vars };
+  // ANALYTICS_SAMPLE_RATE ships "10" in wrangler.toml; tests default it to 1 so
+  // every emitted event is observable. A suite may pass its own value.
+  const bootVars = { PAYTO_SOLANA: '', ALLOW_PLAIN_HTTP: '1', ANALYTICS_SAMPLE_RATE: '1', ...vars };
   for (const [key, value] of Object.entries(bootVars)) args.push('--var', `${key}:${value}`);
 
   const child = spawn(process.execPath, args, {
