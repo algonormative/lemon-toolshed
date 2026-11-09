@@ -147,7 +147,8 @@ if (scripted) {
 
   while (amount === undefined) {
     const raw = await ask(`Amount in USDC [all = ${fmtUsdc(usdc)}]: `);
-    const want = raw === '' || raw.toLowerCase() === 'all' ? usdc : BigInt(Math.round(Number(raw) * 1e6));
+    const n = Number(raw);
+    const want = raw === '' || raw.toLowerCase() === 'all' ? usdc : Number.isFinite(n) ? BigInt(Math.round(n * 1e6)) : 0n;
     if (!(want > 0n) || want > usdc) console.log(`Enter a number between 0 and ${fmtUsdc(usdc)}, or press Enter for all.`);
     else amount = want;
   }
